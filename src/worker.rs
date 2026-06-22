@@ -55,8 +55,15 @@ impl Worker {
                             let attempt = db.mark_attempt(job.run_id).await.unwrap_or(1);
                             metrics::counter!("dokan_run_attempts_total",
                                 "attempt" => attempt.to_string()).increment(1);
-                            exec.run(&db, job.run_id, &job.runtime, &job.source, &job.input)
-                                .await;
+                            exec.run(
+                                &db,
+                                job.run_id,
+                                &job.runtime,
+                                &job.source,
+                                &job.input,
+                                job.agent_id.as_deref(),
+                            )
+                            .await;
                             // Retry ONLY genuine infra/internal failures. A run that
                             // produced an exit_code ran to completion — its nonzero is a
                             // deterministic verdict (a monitor/gate finding), not a crash;

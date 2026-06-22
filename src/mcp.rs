@@ -25,6 +25,13 @@ pub struct Dokan {
     tool_router: rmcp::handler::server::router::tool::ToolRouter<Self>,
 }
 
+/// Default per-agent in-flight (pending+running) cap — backpressure so one agent can't
+/// swamp the shared runtime. Generous; tighten per deployment if needed.
+const AGENT_MAX_CONCURRENT: i64 = 25;
+
+/// Runtimes dokan can execute (reported by whoami so an agent self-configures).
+const SUPPORTED_RUNTIMES: [&str; 3] = ["python", "node", "bash"];
+
 /// Canonicalize a JSON value to a deterministic string (object keys sorted recursively),
 /// so the cache key is stable regardless of input key order.
 fn canonical_json(v: &serde_json::Value) -> String {
@@ -113,6 +120,9 @@ pub struct RunArgs {
     /// (status "recalled"). Opt-in — leave false for monitors/time-sensitive jobs that must
     /// re-execute. Exploits dokan's determinism.
     pub cache: Option<bool>,
+    /// Your agent id. Tags the run for provenance, selects which scoped secrets the job
+    /// sees (global + this agent's), and counts against this agent's concurrency quota.
+    pub agent_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -185,10 +195,19 @@ pub struct DeleteScriptArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SetSecretArgs {
-    /// Env var name injected into every job container, e.g. "OPENAI_API_KEY".
+    /// Env var name injected into a job container, e.g. "OPENAI_API_KEY".
     pub name: String,
     /// Secret value. Write-only — never returned by any tool, never logged.
     pub value: String,
+    /// Scope: omit for a GLOBAL secret (all jobs see it); set to your agent id for a secret
+    /// only this agent's runs see (overrides a global of the same name).
+    pub agent_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WhoamiArgs {
+    /// Your agent id — to report your scoped secrets + quota usage. Optional.
+    pub agent_id: Option<String>,
 }
 
 /// Validate a tokio-cron-scheduler expression: 6 whitespace-separated fields (the leading
@@ -407,10 +426,20 @@ impl Dokan {
         } else {
             None
         };
+        // Per-agent concurrency quota: a runaway agent can't swamp the shared runtime.
+        if let Some(aid) = a.agent_id.as_deref() {
+            let n = self.db.agent_running_count(aid).await.map_err(internal)?;
+            if n >= AGENT_MAX_CONCURRENT {
+                return ok(json!({
+                    "error": "quota_exceeded", "agent_id": aid,
+                    "in_flight": n, "limit": AGENT_MAX_CONCURRENT
+                }));
+            }
+        }
         // Enqueue only — a worker claims it from the queue (FOR UPDATE SKIP LOCKED).
         let run_id = self
             .db
-            .insert_run(a.script_id, &input)
+            .insert_run(a.script_id, &input, a.agent_id.as_deref())
             .await
             .map_err(internal)?;
         if let Some(key) = &cache_key {
@@ -630,14 +659,50 @@ impl Dokan {
         if a.name.trim().is_empty() {
             return ok(json!({"error": "empty_name"}));
         }
-        self.db.upsert_secret(&a.name, &a.value).await.map_err(internal)?;
-        ok(json!({"name": a.name, "status": "set"}))
+        self.db
+            .upsert_secret(&a.name, &a.value, a.agent_id.as_deref())
+            .await
+            .map_err(internal)?;
+        let scope = a.agent_id.as_deref().unwrap_or("global");
+        ok(json!({"name": a.name, "scope": scope, "status": "set"}))
     }
 
     #[tool(description = "List secret names (values are write-only and never returned). Use to check which keys a job will see in its env.")]
-    async fn list_secrets(&self) -> Result<CallToolResult, McpError> {
-        let names = self.db.secret_names().await.map_err(internal)?;
+    async fn list_secrets(
+        &self,
+        Parameters(a): Parameters<WhoamiArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let names = self
+            .db
+            .secret_names(a.agent_id.as_deref())
+            .await
+            .map_err(internal)?;
         ok(json!({"secrets": names}))
+    }
+
+    #[tool(description = "Self-describe the runtime for the calling agent: supported runtimes, per-job mem/cpu caps, secret names you can see (global + your scoped), and your concurrency quota + current in-flight usage. Use to self-configure instead of guessing.")]
+    async fn whoami(
+        &self,
+        Parameters(a): Parameters<WhoamiArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let (mem_bytes, nano_cpus) = self.exec.limits();
+        let secrets = self
+            .db
+            .secret_names(a.agent_id.as_deref())
+            .await
+            .unwrap_or_default();
+        let in_flight = match a.agent_id.as_deref() {
+            Some(aid) => self.db.agent_running_count(aid).await.unwrap_or(0),
+            None => 0,
+        };
+        ok(json!({
+            "agent_id": a.agent_id,
+            "runtimes": SUPPORTED_RUNTIMES,
+            "limits": { "mem_mb": mem_bytes / (1024 * 1024), "cpus": nano_cpus as f64 / 1e9 },
+            "secrets": secrets,
+            "quota": { "max_concurrent": AGENT_MAX_CONCURRENT, "in_flight": in_flight },
+            "input_contract": "job reads DOKAN_INPUT (JSON env), secrets as env vars; emit `::dokan:result:: {json}` for a structured result",
+        }))
     }
 
     #[tool(description = "Stop a cron schedule: removes the live job and disables it so it won't reload. Always unschedule test/temporary crons.")]

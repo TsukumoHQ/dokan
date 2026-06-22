@@ -53,6 +53,8 @@ pub struct ClaimedJob {
     pub runtime: String,
     pub source: String,
     pub input: serde_json::Value,
+    /// The agent that triggered this run — selects which scoped secrets it sees.
+    pub agent_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -313,15 +315,32 @@ impl Db {
 
     // ---- runs ----
 
-    pub async fn insert_run(&self, script_id: i64, input: &serde_json::Value) -> Result<i64> {
+    pub async fn insert_run(
+        &self,
+        script_id: i64,
+        input: &serde_json::Value,
+        agent_id: Option<&str>,
+    ) -> Result<i64> {
         let id: i64 = sqlx::query_scalar(
-            "INSERT INTO runs (script_id, input, status) VALUES ($1, $2, 'pending') RETURNING id",
+            "INSERT INTO runs (script_id, input, status, agent_id) \
+             VALUES ($1, $2, 'pending', $3) RETURNING id",
         )
         .bind(script_id)
         .bind(input)
+        .bind(agent_id)
         .fetch_one(&self.pool)
         .await?;
         Ok(id)
+    }
+
+    /// Count an agent's in-flight runs (pending or running) — the quota enforcement input.
+    pub async fn agent_running_count(&self, agent_id: &str) -> Result<i64> {
+        Ok(sqlx::query_scalar(
+            "SELECT count(*) FROM runs WHERE agent_id = $1 AND status IN ('pending','running')",
+        )
+        .bind(agent_id)
+        .fetch_one(&self.pool)
+        .await?)
     }
 
     pub async fn finish_run(
@@ -476,7 +495,7 @@ impl Db {
              ) \
              UPDATE runs SET status = 'running', started_at = now() \
              FROM c WHERE runs.id = c.id \
-             RETURNING runs.id, runs.script_id, runs.input, \
+             RETURNING runs.id, runs.script_id, runs.input, runs.agent_id, \
                  (SELECT runtime FROM scripts WHERE id = runs.script_id) AS runtime, \
                  (SELECT source  FROM scripts WHERE id = runs.script_id) AS source",
         )
@@ -489,6 +508,7 @@ impl Db {
             runtime: r.get("runtime"),
             source: r.get("source"),
             input: r.get::<Option<serde_json::Value>, _>("input").unwrap_or(serde_json::json!({})),
+            agent_id: r.get("agent_id"),
         }))
     }
 
@@ -611,16 +631,33 @@ impl Db {
 
     // ---- secrets (P3) ----
 
-    pub async fn upsert_secret(&self, name: &str, value: &str) -> Result<()> {
+    /// Set a secret. Global (`agent_id` None) or scoped to one agent. A job sees global +
+    /// its triggering agent's scoped secrets, scoped overriding on name conflict.
+    pub async fn upsert_secret(&self, name: &str, value: &str, agent_id: Option<&str>) -> Result<()> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query(
-            "INSERT INTO secrets (name, value) VALUES ($1, $2) \
-             ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value",
-        )
-        .bind(name)
-        .bind(value)
-        .execute(&mut *tx)
-        .await?;
+        match agent_id {
+            Some(aid) => {
+                sqlx::query(
+                    "INSERT INTO agent_secrets (agent_id, name, value) VALUES ($1, $2, $3) \
+                     ON CONFLICT (agent_id, name) DO UPDATE SET value = EXCLUDED.value",
+                )
+                .bind(aid)
+                .bind(name)
+                .bind(value)
+                .execute(&mut *tx)
+                .await?;
+            }
+            None => {
+                sqlx::query(
+                    "INSERT INTO secrets (name, value) VALUES ($1, $2) \
+                     ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value",
+                )
+                .bind(name)
+                .bind(value)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
         // Invalidate run-or-recall caches that may depend on this env.
         sqlx::query("UPDATE meta SET v = v + 1 WHERE k = 'secrets_generation'")
             .execute(&mut *tx)
@@ -629,21 +666,49 @@ impl Db {
         Ok(())
     }
 
-    pub async fn secret_names(&self) -> Result<Vec<String>> {
-        Ok(sqlx::query_scalar("SELECT name FROM secrets ORDER BY name")
-            .fetch_all(&self.pool)
-            .await?)
-    }
-
-    /// All secrets as (name, value) — injected into job env at execution time.
-    pub async fn all_secrets(&self) -> Result<Vec<(String, String)>> {
-        let rows = sqlx::query("SELECT name, value FROM secrets")
+    /// Secret names visible to `agent_id` (None = global only): global names plus the
+    /// agent's scoped names. Values never returned.
+    pub async fn secret_names(&self, agent_id: Option<&str>) -> Result<Vec<String>> {
+        let mut names: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM secrets ORDER BY name")
+                .fetch_all(&self.pool)
+                .await?;
+        if let Some(aid) = agent_id {
+            let scoped: Vec<String> = sqlx::query_scalar(
+                "SELECT name FROM agent_secrets WHERE agent_id = $1 ORDER BY name",
+            )
+            .bind(aid)
             .fetch_all(&self.pool)
             .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| (r.get::<String, _>("name"), r.get::<String, _>("value")))
-            .collect())
+            for s in scoped {
+                if !names.contains(&s) {
+                    names.push(s);
+                }
+            }
+        }
+        Ok(names)
+    }
+
+    /// (name, value) pairs injected into a job's env: global secrets plus the triggering
+    /// agent's scoped secrets, scoped overriding global on a name clash.
+    pub async fn all_secrets_for(&self, agent_id: Option<&str>) -> Result<Vec<(String, String)>> {
+        let mut map: std::collections::HashMap<String, String> =
+            sqlx::query("SELECT name, value FROM secrets")
+                .fetch_all(&self.pool)
+                .await?
+                .into_iter()
+                .map(|r| (r.get::<String, _>("name"), r.get::<String, _>("value")))
+                .collect();
+        if let Some(aid) = agent_id {
+            let scoped = sqlx::query("SELECT name, value FROM agent_secrets WHERE agent_id = $1")
+                .bind(aid)
+                .fetch_all(&self.pool)
+                .await?;
+            for r in scoped {
+                map.insert(r.get::<String, _>("name"), r.get::<String, _>("value"));
+            }
+        }
+        Ok(map.into_iter().collect())
     }
 
     // ---- flows (P2) ----

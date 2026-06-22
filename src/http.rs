@@ -656,7 +656,7 @@ async fn trigger_run(
     Json(b): Json<TriggerBody>,
 ) -> impl IntoResponse {
     let input = b.input.unwrap_or(json!({}));
-    match s.db.insert_run(b.script_id, &input).await {
+    match s.db.insert_run(b.script_id, &input, None).await {
         Ok(run_id) => {
             metrics::counter!("dokan_runs_enqueued_total").increment(1);
             (StatusCode::OK, Json(json!({"run_id": run_id, "status": "pending"})))
@@ -720,7 +720,7 @@ async fn run_stream(
 
 async fn list_secrets(State(s): State<AppState>) -> impl IntoResponse {
     // Names only — values are write-only over this surface.
-    let names = s.db.secret_names().await.unwrap_or_default();
+    let names = s.db.secret_names(None).await.unwrap_or_default();
     Json(json!({"secrets": names}))
 }
 
@@ -746,7 +746,7 @@ async fn set_secret(
     State(s): State<AppState>,
     Json(b): Json<SecretBody>,
 ) -> impl IntoResponse {
-    match s.db.upsert_secret(&b.name, &b.value).await {
+    match s.db.upsert_secret(&b.name, &b.value, None).await {
         Ok(()) => (StatusCode::OK, Json(json!({"name": b.name, "status": "set"}))),
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))),
     }

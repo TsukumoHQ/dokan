@@ -275,6 +275,39 @@ async fn run_or_recall_recalls_identical() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Secrets scope per agent: a job sees global secrets + ITS agent's scoped secrets, not
+/// another agent's. whoami reports the agent's view. (Moat #2.)
+#[tokio::test]
+async fn agent_scoped_secrets_and_whoami() -> anyhow::Result<()> {
+    let c = spawn().await?;
+    // Global secret + a secret scoped to agent "alpha".
+    call(&c, "set_secret", json!({"name": "DK_GLOB", "value": "g-val"})).await?;
+    call(&c, "set_secret", json!({"name": "DK_SCOPED", "value": "a-val", "agent_id": "alpha"})).await?;
+    let sid = upload(&c, "bash", "echo \"G=${DK_GLOB:-} S=${DK_SCOPED:-}\"\n").await;
+
+    // Run as alpha -> sees both.
+    let ra = call(&c, "run_script", json!({"script_id": sid, "agent_id": "alpha"})).await?;
+    let ida = ra["run_id"].as_i64().unwrap();
+    assert_eq!(wait_status(&c, ida, 60).await, "succeeded", "alpha ran");
+    assert!(logs_text(&c, ida).await.contains("G=g-val S=a-val"), "alpha sees both");
+
+    // Run as beta -> sees global only, NOT alpha's scoped secret.
+    let rb = call(&c, "run_script", json!({"script_id": sid, "agent_id": "beta"})).await?;
+    let idb = rb["run_id"].as_i64().unwrap();
+    assert_eq!(wait_status(&c, idb, 60).await, "succeeded", "beta ran");
+    let tb = logs_text(&c, idb).await;
+    assert!(tb.contains("G=g-val S="), "beta sees global, not alpha scoped: {tb}");
+    assert!(!tb.contains("S=a-val"), "beta must NOT see alpha's secret: {tb}");
+
+    // whoami reflects scope + quota.
+    let w = call(&c, "whoami", json!({"agent_id": "alpha"})).await?;
+    assert!(w["secrets"].as_array().unwrap().iter().any(|s| s == "DK_SCOPED"), "whoami lists scoped: {w}");
+    assert_eq!(w["limits"]["mem_mb"], 1024, "whoami limits: {w}");
+    assert_eq!(w["quota"]["max_concurrent"], 25, "whoami quota: {w}");
+    c.cancel().await?;
+    Ok(())
+}
+
 /// A 5-field crontab (missing the leading SECONDS column) is rejected loudly instead of
 /// being silently accepted and never firing. (Terrain P2.)
 #[tokio::test]

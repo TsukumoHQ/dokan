@@ -131,3 +131,16 @@ ALTER TABLE runs ADD COLUMN IF NOT EXISTS cache_key TEXT;
 CREATE INDEX IF NOT EXISTS idx_runs_cache_key ON runs (cache_key) WHERE cache_key IS NOT NULL;
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v BIGINT NOT NULL);
 INSERT INTO meta (k, v) VALUES ('secrets_generation', 0) ON CONFLICT (k) DO NOTHING;
+
+-- Agent identity (multi-agent fleet on one runtime). Runs carry the triggering agent for
+-- provenance, secret scoping, and quota. Secrets can be global (in `secrets`) or scoped to
+-- one agent (here); a job sees global + its agent's scoped secrets (scoped overrides).
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS agent_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_runs_agent ON runs (agent_id) WHERE agent_id IS NOT NULL;
+CREATE TABLE IF NOT EXISTS agent_secrets (
+    agent_id   TEXT        NOT NULL,
+    name       TEXT        NOT NULL,
+    value      TEXT        NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (agent_id, name)
+);

@@ -150,7 +150,7 @@ impl FlowEngine {
         });
 
         for attempt in 1..=STEP_MAX_ATTEMPTS {
-            let run_id = match self.db.insert_run(step.script_id, &step_input).await {
+            let run_id = match self.db.insert_run(step.script_id, &step_input, None).await {
                 Ok(id) => id,
                 Err(e) => {
                     let _ = self
@@ -163,7 +163,7 @@ impl FlowEngine {
             let _ = self.db.set_step_running(flow_run_id, &step.step_id, run_id).await;
             // Drive the container to completion (this finishes the underlying run).
             self.exec
-                .run(&self.db, run_id, &script.runtime, &script.source, &step_input)
+                .run(&self.db, run_id, &script.runtime, &script.source, &step_input, None)
                 .await;
 
             let status = self

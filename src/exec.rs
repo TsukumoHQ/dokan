@@ -89,6 +89,11 @@ impl Executor {
         self.pool.arm();
     }
 
+    /// Per-job (mem_bytes, nano_cpus) caps — reported by whoami.
+    pub fn limits(&self) -> (i64, i64) {
+        self.pool.limits()
+    }
+
     /// Reclaim warm containers orphaned by a crashed dokan. Run at executor startup.
     pub async fn sweep_orphans(&self) -> usize {
         self.pool.sweep_orphans().await
@@ -111,11 +116,12 @@ impl Executor {
         runtime: &str,
         source: &str,
         input: &serde_json::Value,
+        agent_id: Option<&str>,
     ) {
         let t0 = std::time::Instant::now();
         metrics::gauge!("dokan_runs_active").increment(1.0);
         let mut terminal = "succeeded";
-        if let Err(e) = self.run_inner(db, run_id, runtime, source, input).await {
+        if let Err(e) = self.run_inner(db, run_id, runtime, source, input, agent_id).await {
             // Err here = dokan-side failure (could not execute) — distinct from a script
             // that ran and exited nonzero, which finishes inside exec_job.
             metrics::counter!("dokan_run_internal_errors_total").increment(1);
@@ -148,6 +154,7 @@ impl Executor {
         runtime: &str,
         source: &str,
         input: &serde_json::Value,
+        agent_id: Option<&str>,
     ) -> Result<()> {
         let (image, interp) =
             runtime_spec(runtime).ok_or_else(|| anyhow!("unknown runtime: {runtime}"))?;
@@ -155,7 +162,9 @@ impl Executor {
         let cid = self.pool.acquire(image).await?;
         self.active.lock().unwrap().insert(run_id, cid.clone());
 
-        let result = self.exec_job(db, run_id, &cid, interp, source, input).await;
+        let result = self
+            .exec_job(db, run_id, &cid, interp, source, input, agent_id)
+            .await;
 
         // Run clean, discard — never reuse a dirty container.
         self.pool.discard(&cid).await;
@@ -170,6 +179,7 @@ impl Executor {
         interp: &str,
         source: &str,
         input: &serde_json::Value,
+        agent_id: Option<&str>,
     ) -> Result<()> {
         let src_b64 = base64::engine::general_purpose::STANDARD.encode(source);
         let bootstrap = format!(
@@ -182,7 +192,7 @@ impl Executor {
             format!("DOKAN_INPUT={input}"),
             format!("DOKAN_RUN_ID={run_id}"),
         ];
-        if let Ok(secrets) = db.all_secrets().await {
+        if let Ok(secrets) = db.all_secrets_for(agent_id).await {
             for (k, v) in secrets {
                 env.push(format!("{k}={v}"));
             }

@@ -51,6 +51,11 @@ impl WarmPool {
         self.clone().spawn_filler();
     }
 
+    /// Per-job (mem_bytes, nano_cpus) caps applied to every container.
+    pub fn limits(&self) -> (i64, i64) {
+        (self.mem_bytes, self.nano_cpus)
+    }
+
     /// Remove warm containers left behind by a previously-crashed dokan (labeled
     /// `dokan.role=warm`). Run at executor startup: in the single-executor model these are
     /// always orphans, so reclaiming them stops the slow Docker-host saturation that caused

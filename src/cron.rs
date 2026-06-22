@@ -49,7 +49,7 @@ impl Cron {
             let db = db.clone();
             let input = input.clone();
             Box::pin(async move {
-                match db.insert_run(script_id, &input).await {
+                match db.insert_run(script_id, &input, None).await {
                     Ok(run_id) => {
                         metrics::counter!("dokan_cron_runs_enqueued_total").increment(1);
                         tracing::info!(script_id, run_id, "cron enqueued run");
