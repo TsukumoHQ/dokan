@@ -163,7 +163,15 @@ impl FlowEngine {
             let _ = self.db.set_step_running(flow_run_id, &step.step_id, run_id).await;
             // Drive the container to completion (this finishes the underlying run).
             self.exec
-                .run(&self.db, run_id, &script.runtime, &script.source, &step_input, None)
+                .run(
+                    &self.db,
+                    run_id,
+                    &script.runtime,
+                    &script.source,
+                    &step_input,
+                    None,
+                    script.network,
+                )
                 .await;
 
             let status = self

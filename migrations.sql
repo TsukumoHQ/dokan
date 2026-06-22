@@ -123,6 +123,13 @@ CREATE INDEX IF NOT EXISTS idx_scripts_name_trgm ON scripts USING gin (name gin_
 -- and the relay egress carries it for event-driven alerting.
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS result JSONB;
 
+-- Determinism: a script declared network=false runs in a network-disabled container, so its
+-- result is a pure function of (image digest, source, input, secrets) — soundly cacheable.
+-- Default true keeps existing monitors (which hit APIs) working.
+ALTER TABLE scripts ADD COLUMN IF NOT EXISTS network BOOLEAN NOT NULL DEFAULT true;
+-- Signed reproducibility receipt: proof of what produced a run's output.
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS receipt JSONB;
+
 -- Run-or-recall: content-addressed cache. cache_key = hash(runtime+source+input+secrets
 -- generation). A cache:true run recalls a prior succeeded run with the same key instead of
 -- spawning a container — exploits dokan's determinism. Bump secrets_generation on any secret

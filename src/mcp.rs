@@ -55,10 +55,18 @@ fn canonical_json(v: &serde_json::Value) -> String {
 
 /// Content-address a run: hash(runtime + source + canonical(input) + secrets generation).
 /// Same inputs ⇒ same key ⇒ recallable (dokan jobs are deterministic).
-fn run_cache_key(runtime: &str, source: &str, input: &serde_json::Value, secrets_gen: i64) -> String {
+fn run_cache_key(
+    runtime: &str,
+    image_digest: &str,
+    source: &str,
+    input: &serde_json::Value,
+    secrets_gen: i64,
+) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(runtime.as_bytes());
+    h.update([0x1f]);
+    h.update(image_digest.as_bytes()); // an image update invalidates the cache
     h.update([0x1f]);
     h.update(source.as_bytes());
     h.update([0x1f]);
@@ -107,6 +115,10 @@ pub struct UploadArgs {
     /// or no-op when the source is identical) and return its id instead of creating a
     /// duplicate. Default false. Use it so a respawned agent can safely re-upload.
     pub upsert: Option<bool>,
+    /// Network access for the job. Default true (monitors that hit APIs need it). Set FALSE
+    /// for a pure-compute script: it runs network-disabled, making its output a deterministic
+    /// function of its inputs — soundly cacheable (cache:true) and provable via its receipt.
+    pub network: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -224,6 +236,11 @@ pub struct SetSecretArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetReceiptArgs {
+    pub run_id: i64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct WhoamiArgs {
     /// Your agent id — to report your scoped secrets + quota usage. Optional.
     pub agent_id: Option<String>,
@@ -306,7 +323,7 @@ impl Dokan {
         let mut v = json!({
             "id": s.id, "name": s.name, "runtime": s.runtime,
             "desc": s.description, "created_by": s.created_by, "version": s.version,
-            "created_at": s.created_at.to_rfc3339(),
+            "network": s.network, "created_at": s.created_at.to_rfc3339(),
         });
         if a.include_source.unwrap_or(false) {
             v["source"] = json!(s.source);
@@ -340,6 +357,7 @@ impl Dokan {
                         &a.source,
                         a.description.as_deref(),
                         a.created_by.as_deref(),
+                        a.network.unwrap_or(true),
                         embedding,
                     )
                     .await
@@ -358,6 +376,7 @@ impl Dokan {
                 &a.source,
                 a.description.as_deref(),
                 a.created_by.as_deref(),
+                a.network.unwrap_or(true),
                 embedding,
             )
             .await
@@ -471,7 +490,8 @@ impl Dokan {
         // so a secret change invalidates env-dependent recalls.
         let cache_key = if a.cache.unwrap_or(false) {
             let secrets_gen = self.db.secrets_generation().await.map_err(internal)?;
-            let key = run_cache_key(&script.runtime, &script.source, &input, secrets_gen);
+            let digest = self.exec.image_digest(&script.runtime).unwrap_or_default();
+            let key = run_cache_key(&script.runtime, &digest, &script.source, &input, secrets_gen);
             if let Some((run_id, exit, result)) =
                 self.db.find_cached_run(&key).await.map_err(internal)?
             {
@@ -726,6 +746,17 @@ impl Dokan {
             .map_err(internal)?;
         let scope = a.agent_id.as_deref().unwrap_or("global");
         ok(json!({"name": a.name, "scope": scope, "status": "set"}))
+    }
+
+    #[tool(description = "Fetch a run's signed reproducibility receipt: the image digest, source/input/output hashes, secrets generation, exit, and an HMAC signature. Proves what produced the result; for a network=false (deterministic) run it certifies a recall is sound.")]
+    async fn get_receipt(
+        &self,
+        Parameters(a): Parameters<GetReceiptArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        match self.db.run_receipt(a.run_id).await.map_err(internal)? {
+            Some(r) => ok(r),
+            None => ok(json!({"error": "no_receipt", "run_id": a.run_id})),
+        }
     }
 
     #[tool(description = "List secret names (values are write-only and never returned). Use to check which keys a job will see in its env.")]

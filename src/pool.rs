@@ -31,6 +31,7 @@ pub struct WarmPool {
     nano_cpus: i64,
     idle: Mutex<HashMap<String, Vec<String>>>, // image -> [container_id]
     known: Mutex<HashSet<String>>,             // images to keep warm
+    digests: Mutex<HashMap<String, String>>,   // image -> resolved content digest
 }
 
 impl WarmPool {
@@ -46,7 +47,69 @@ impl WarmPool {
             nano_cpus,
             idle: Mutex::new(HashMap::new()),
             known: Mutex::new(HashSet::new()),
+            digests: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// The resolved content digest of an image, if known (pinned into the cache key + receipt
+    /// so an image update invalidates recalls). Resolved lazily when containers are created.
+    pub fn digest(&self, image: &str) -> Option<String> {
+        self.digests.lock().unwrap().get(image).cloned()
+    }
+
+    /// Eagerly pull + resolve digests for the given images (boot) so the cache key is stable
+    /// from the first run — a lazily-resolved digest would change the key between calls.
+    pub async fn resolve_all(&self, images: &[&str]) {
+        for img in images {
+            if self.ensure_image(img).await.is_ok() {
+                self.resolve_digest(img).await;
+            }
+        }
+    }
+
+    async fn resolve_digest(&self, image: &str) {
+        if self.digests.lock().unwrap().contains_key(image) {
+            return;
+        }
+        if let Ok(info) = self.docker.inspect_image(image).await {
+            // Prefer a repo digest; fall back to the local image id.
+            let d = info
+                .repo_digests
+                .as_ref()
+                .and_then(|v| v.first().cloned())
+                .or(info.id)
+                .unwrap_or_default();
+            if !d.is_empty() {
+                self.digests.lock().unwrap().insert(image.to_string(), d);
+            }
+        }
+    }
+
+    /// Cold-create a one-off, NETWORK-DISABLED container for a deterministic (network=false)
+    /// job — never warmed/reused. Caller discards it after the run.
+    pub async fn acquire_isolated(&self, image: &str) -> Result<String> {
+        self.ensure_image(image).await?;
+        self.resolve_digest(image).await;
+        let body = ContainerCreateBody {
+            image: Some(image.to_string()),
+            cmd: Some(vec!["sleep".into(), "infinity".into()]),
+            host_config: Some(HostConfig {
+                memory: Some(self.mem_bytes),
+                nano_cpus: Some(self.nano_cpus),
+                pids_limit: Some(PIDS_LIMIT),
+                network_mode: Some("none".to_string()),
+                ..Default::default()
+            }),
+            labels: Some(HashMap::from([("dokan.role".to_string(), "warm".to_string())])),
+            ..Default::default()
+        };
+        let opts = CreateContainerOptionsBuilder::default().build();
+        let created = self.docker.create_container(Some(opts), body).await?;
+        self.docker
+            .start_container(&created.id, None::<StartContainerOptions>)
+            .await?;
+        metrics::counter!("dokan_pool_acquire_total", "result" => "isolated").increment(1);
+        Ok(created.id)
     }
 
     /// Retune the warm depth per image (autoscaler). Returns the value set.
@@ -161,6 +224,7 @@ impl WarmPool {
     async fn create_idle(&self, image: &str) -> Result<String> {
         let t0 = std::time::Instant::now();
         self.ensure_image(image).await?;
+        self.resolve_digest(image).await;
         let body = ContainerCreateBody {
             image: Some(image.to_string()),
             // Idle until we exec the job into it; resource caps applied here.

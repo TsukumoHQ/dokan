@@ -31,6 +31,8 @@ pub struct Script {
     pub source: String,
     pub description: Option<String>,
     pub created_by: Option<String>,
+    /// false = run network-disabled → soundly deterministic/cacheable.
+    pub network: bool,
     pub version: i32,
     pub created_at: DateTime<Utc>,
 }
@@ -67,6 +69,8 @@ pub struct ClaimedJob {
     pub input: serde_json::Value,
     /// The agent that triggered this run — selects which scoped secrets it sees.
     pub agent_id: Option<String>,
+    /// false = run network-disabled (deterministic script).
+    pub network: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -138,6 +142,7 @@ impl Db {
 
     // ---- scripts ----
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn insert_script(
         &self,
         name: &str,
@@ -145,18 +150,20 @@ impl Db {
         source: &str,
         description: Option<&str>,
         created_by: Option<&str>,
+        network: bool,
         embedding: Option<Vec<f32>>,
     ) -> Result<(i64, i32)> {
         let vec = embedding.map(pgvector::Vector::from);
         let row = sqlx::query(
-            "INSERT INTO scripts (name, runtime, source, description, created_by, embedding) \
-             VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, version",
+            "INSERT INTO scripts (name, runtime, source, description, created_by, network, embedding) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, version",
         )
         .bind(name)
         .bind(runtime)
         .bind(source)
         .bind(description)
         .bind(created_by)
+        .bind(network)
         .bind(vec)
         .fetch_one(&self.pool)
         .await?;
@@ -197,7 +204,7 @@ impl Db {
 
     pub async fn get_script(&self, id: i64) -> Result<Option<Script>> {
         let row = sqlx::query(
-            "SELECT id, name, runtime, source, description, created_by, version, created_at \
+            "SELECT id, name, runtime, source, description, created_by, network, version, created_at \
              FROM scripts WHERE id = $1",
         )
         .bind(id)
@@ -210,6 +217,7 @@ impl Db {
             source: r.get("source"),
             description: r.get("description"),
             created_by: r.get("created_by"),
+            network: r.get("network"),
             version: r.get("version"),
             created_at: r.get("created_at"),
         }))
@@ -314,6 +322,7 @@ impl Db {
 
     /// Update an existing script in place and bump its version. Returns the new version.
     /// Used by upsert-by-name so a respawned agent re-provisions without duplicating rows.
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_script(
         &self,
         id: i64,
@@ -321,22 +330,43 @@ impl Db {
         source: &str,
         description: Option<&str>,
         created_by: Option<&str>,
+        network: bool,
         embedding: Option<Vec<f32>>,
     ) -> Result<i32> {
         let vec = embedding.map(pgvector::Vector::from);
         let version: i32 = sqlx::query_scalar(
             "UPDATE scripts SET runtime = $2, source = $3, description = $4, created_by = $5, \
-                 embedding = $6, version = version + 1 WHERE id = $1 RETURNING version",
+                 network = $6, embedding = $7, version = version + 1 WHERE id = $1 RETURNING version",
         )
         .bind(id)
         .bind(runtime)
         .bind(source)
         .bind(description)
         .bind(created_by)
+        .bind(network)
         .bind(vec)
         .fetch_one(&self.pool)
         .await?;
         Ok(version)
+    }
+
+    /// Store a run's signed reproducibility receipt.
+    pub async fn set_run_receipt(&self, id: i64, receipt: &serde_json::Value) -> Result<()> {
+        sqlx::query("UPDATE runs SET receipt = $2 WHERE id = $1")
+            .bind(id)
+            .bind(receipt)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// A run's receipt, if any.
+    pub async fn run_receipt(&self, id: i64) -> Result<Option<serde_json::Value>> {
+        Ok(sqlx::query_scalar("SELECT receipt FROM runs WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?
+            .flatten())
     }
 
     // ---- runs ----
@@ -555,7 +585,8 @@ impl Db {
              FROM c WHERE runs.id = c.id \
              RETURNING runs.id, runs.script_id, runs.input, runs.agent_id, \
                  (SELECT runtime FROM scripts WHERE id = runs.script_id) AS runtime, \
-                 (SELECT source  FROM scripts WHERE id = runs.script_id) AS source",
+                 (SELECT source  FROM scripts WHERE id = runs.script_id) AS source, \
+                 (SELECT network FROM scripts WHERE id = runs.script_id) AS network",
         )
         .bind(caps)
         .fetch_optional(&self.pool)
@@ -567,6 +598,7 @@ impl Db {
             source: r.get("source"),
             input: r.get::<Option<serde_json::Value>, _>("input").unwrap_or(serde_json::json!({})),
             agent_id: r.get("agent_id"),
+            network: r.get("network"),
         }))
     }
 

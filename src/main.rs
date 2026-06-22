@@ -9,6 +9,7 @@ mod flow;
 mod http;
 mod mcp;
 mod pool;
+mod receipt;
 mod scale;
 mod worker;
 
@@ -190,6 +191,7 @@ async fn main() -> Result<()> {
         }
         exec.arm_pool();
         exec.prewarm(); // pull + warm runtime images now, not on the first job
+        exec.resolve_digests().await; // stable cache key from the first run (T1)
         // Autoscale concurrency + warm depth via Little's Law (L = λW). --concurrency and
         // --warm-idle are the floors; the controller raises both toward L under load.
         let conc = scale::Concurrency::new(cli.concurrency, cli.max_concurrency);

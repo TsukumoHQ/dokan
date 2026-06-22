@@ -29,6 +29,7 @@ pub struct Executor {
     /// Optional relay endpoint: job results POSTed here for the mesh (PRD §5).
     relay: Option<String>,
     http: reqwest::Client,
+    signer: crate::receipt::Signer,
 }
 
 /// Maps a declared runtime to its base image and in-container interpreter.
@@ -61,6 +62,7 @@ impl Executor {
             active: Arc::new(Mutex::new(HashMap::new())),
             relay,
             http: reqwest::Client::new(),
+            signer: crate::receipt::Signer::from_env(),
         })
     }
 
@@ -99,15 +101,73 @@ impl Executor {
         self.pool.set_target_idle(n)
     }
 
+    /// Resolved content digest for a runtime's image (for the cache key / receipt). None
+    /// until the pool has created at least one container of that image.
+    pub fn image_digest(&self, runtime: &str) -> Option<String> {
+        let (image, _) = runtime_spec(runtime)?;
+        self.pool.digest(image)
+    }
+
     /// Pre-pull + pre-warm the known runtime images at startup so the first job of each
     /// runtime doesn't eat the image-pull / cold-create tail. (Perf #3.)
     pub fn prewarm(&self) {
         self.pool.prewarm(&["python:3.12-slim", "node:22-slim", "alpine:3.20"]);
     }
 
+    /// Eagerly resolve image digests at boot so the run-cache key is stable from the first
+    /// run (T1 — a lazily-resolved digest would shift the key between calls).
+    pub async fn resolve_digests(&self) {
+        self.pool
+            .resolve_all(&["python:3.12-slim", "node:22-slim", "alpine:3.20"])
+            .await;
+    }
+
     /// Reclaim warm containers orphaned by a crashed dokan. Run at executor startup.
     pub async fn sweep_orphans(&self) -> usize {
         self.pool.sweep_orphans().await
+    }
+
+    /// Build the signed receipt for a finished run.
+    async fn build_receipt(
+        &self,
+        db: &Db,
+        image: &str,
+        source: &str,
+        input: &serde_json::Value,
+        result: &Option<serde_json::Value>,
+        exit_code: i64,
+        network: bool,
+    ) -> serde_json::Value {
+        use crate::receipt::sha256_hex;
+        let digest = self.pool.digest(image).unwrap_or_else(|| image.to_string());
+        let secrets_gen = db.secrets_generation().await.unwrap_or(0);
+        let output_hash = sha256_hex(
+            result
+                .as_ref()
+                .map(|r| r.to_string())
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+        // The signed payload is a canonical, order-stable string of the binding.
+        let payload = format!(
+            "v1|{digest}|{}|{}|{secrets_gen}|{output_hash}|{exit_code}|{network}",
+            sha256_hex(source.as_bytes()),
+            sha256_hex(input.to_string().as_bytes()),
+        );
+        let sig = self.signer.sign(&payload);
+        serde_json::json!({
+            "v": 1,
+            "image_digest": digest,
+            "source_sha256": sha256_hex(source.as_bytes()),
+            "input_sha256": sha256_hex(input.to_string().as_bytes()),
+            "secrets_generation": secrets_gen,
+            "output_sha256": output_hash,
+            "exit": exit_code,
+            "network": network,
+            "deterministic": !network,
+            "alg": "hmac-sha256",
+            "sig": sig,
+        })
     }
 
     /// Kill a running job's container (best-effort).
@@ -128,11 +188,15 @@ impl Executor {
         source: &str,
         input: &serde_json::Value,
         agent_id: Option<&str>,
+        network: bool,
     ) {
         let t0 = std::time::Instant::now();
         metrics::gauge!("dokan_runs_active").increment(1.0);
         let mut terminal = "succeeded";
-        if let Err(e) = self.run_inner(db, run_id, runtime, source, input, agent_id).await {
+        if let Err(e) = self
+            .run_inner(db, run_id, runtime, source, input, agent_id, network)
+            .await
+        {
             // Err here = dokan-side failure (could not execute) — distinct from a script
             // that ran and exited nonzero, which finishes inside exec_job.
             metrics::counter!("dokan_run_internal_errors_total").increment(1);
@@ -166,15 +230,22 @@ impl Executor {
         source: &str,
         input: &serde_json::Value,
         agent_id: Option<&str>,
+        network: bool,
     ) -> Result<()> {
         let (image, interp) =
             runtime_spec(runtime).ok_or_else(|| anyhow!("unknown runtime: {runtime}"))?;
 
-        let cid = self.pool.acquire(image).await?;
+        // network=false → isolated, network-disabled container (deterministic). Else a warm
+        // container (the fast path; monitors that hit APIs use this).
+        let cid = if network {
+            self.pool.acquire(image).await?
+        } else {
+            self.pool.acquire_isolated(image).await?
+        };
         self.active.lock().unwrap().insert(run_id, cid.clone());
 
         let result = self
-            .exec_job(db, run_id, &cid, interp, source, input, agent_id)
+            .exec_job(db, run_id, &cid, image, interp, source, input, agent_id, network)
             .await;
 
         // Run clean, discard — never reuse a dirty container.
@@ -182,15 +253,18 @@ impl Executor {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn exec_job(
         &self,
         db: &Db,
         run_id: i64,
         cid: &str,
+        image: &str,
         interp: &str,
         source: &str,
         input: &serde_json::Value,
         agent_id: Option<&str>,
+        network: bool,
     ) -> Result<()> {
         let src_b64 = base64::engine::general_purpose::STANDARD.encode(source);
         let bootstrap = format!(
@@ -281,6 +355,12 @@ impl Executor {
         let status = if exit_code == 0 { "succeeded" } else { "failed" };
         db.finish_run(run_id, status, Some(exit_code as i32), None)
             .await?;
+        // Signed reproducibility receipt: binds (image digest, source, input, secrets gen) to
+        // (output, exit). Sound proof for network=false runs; advisory for networked ones.
+        let receipt = self
+            .build_receipt(db, image, source, input, &result, exit_code, network)
+            .await;
+        let _ = db.set_run_receipt(run_id, &receipt).await;
         if let Some(r) = &result {
             let _ = db.set_run_result(run_id, r).await;
             // Reactive composition: fire agent-defined triggers whose predicate the result

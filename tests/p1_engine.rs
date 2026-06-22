@@ -344,6 +344,34 @@ async fn on_result_fires_target() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// network=false runs network-disabled (deterministic), gets a signed receipt, and is
+/// soundly recallable. (T1.)
+#[tokio::test]
+async fn deterministic_network_off_receipt_and_recall() -> anyhow::Result<()> {
+    let c = spawn().await?;
+    let src = "wget -q -T 2 -O /dev/null http://1.1.1.1 2>/dev/null && echo NET || echo NO_NET\n\
+               echo '::dokan:result:: {\"x\":1}'\n";
+    let sid = call(&c, "upload_script",
+        json!({"name": "det-probe", "runtime": "bash", "source": src, "network": false}))
+        .await?["script_id"].as_i64().unwrap();
+    let r1 = call(&c, "run_script", json!({"script_id": sid, "cache": true})).await?;
+    let id1 = r1["run_id"].as_i64().unwrap();
+    assert_eq!(wait_status(&c, id1, 60).await, "succeeded", "ran");
+    // Network was disabled.
+    assert!(logs_text(&c, id1).await.contains("NO_NET"), "no network in deterministic run");
+    // Signed receipt, marked deterministic.
+    let rec = call(&c, "get_receipt", json!({"run_id": id1})).await?;
+    assert_eq!(rec["deterministic"], true, "receipt deterministic: {rec}");
+    assert!(rec["sig"].as_str().map(|s| !s.is_empty()).unwrap_or(false), "signed: {rec}");
+    assert!(rec["output_sha256"].as_str().is_some(), "binds output: {rec}");
+    // Recall: identical inputs → recalled without re-running.
+    let r2 = call(&c, "run_script", json!({"script_id": sid, "cache": true})).await?;
+    assert_eq!(r2["status"], "recalled", "recalled: {r2}");
+    assert_eq!(r2["run_id"].as_i64().unwrap(), id1, "same run recalled");
+    c.cancel().await?;
+    Ok(())
+}
+
 /// A 5-field crontab (missing the leading SECONDS column) is rejected loudly instead of
 /// being silently accepted and never firing. (Terrain P2.)
 #[tokio::test]
