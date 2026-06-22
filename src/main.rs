@@ -1,9 +1,12 @@
 //! dokan — agent-operated runtime for deterministic scripts in Docker.
 //! MCP-first control plane. Zero LLM inside.
 
+mod cron;
 mod db;
 mod exec;
 mod mcp;
+mod pool;
+mod worker;
 
 use std::sync::Arc;
 
@@ -11,9 +14,11 @@ use anyhow::Result;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
+use crate::cron::Cron;
 use crate::db::Db;
 use crate::exec::Executor;
 use crate::mcp::Dokan;
+use crate::worker::Worker;
 
 #[derive(Parser, Debug)]
 #[command(name = "dokan", version, about = "Agent-operated script runtime (MCP-first)")]
@@ -33,6 +38,18 @@ struct Cli {
         env = "DATABASE_URL"
     )]
     database_url: String,
+
+    /// Runtimes this process's worker advertises (comma-separated). Empty = no worker.
+    #[arg(long, default_value = "python,node,bash", env = "DOKAN_CAPS", value_delimiter = ',')]
+    caps: Vec<String>,
+
+    /// Max concurrent jobs per worker.
+    #[arg(long, default_value_t = 8, env = "DOKAN_CONCURRENCY")]
+    concurrency: usize,
+
+    /// Warm idle containers to keep per image.
+    #[arg(long, default_value_t = 2, env = "DOKAN_WARM_IDLE")]
+    warm_idle: usize,
 }
 
 #[tokio::main]
@@ -49,32 +66,42 @@ async fn main() -> Result<()> {
     db.migrate().await?;
     tracing::info!("db connected + migrated");
 
-    let exec = Arc::new(Executor::connect()?);
-    tracing::info!("docker connected");
+    let exec = Arc::new(Executor::connect(cli.warm_idle)?);
+    tracing::info!(warm_idle = cli.warm_idle, "docker connected, warm pool armed");
+
+    // Cron scheduler: ticks enqueue runs the workers then claim.
+    let cron = Cron::start(db.clone()).await?;
+    tracing::info!("cron scheduler started");
+
+    // In-process worker. Multi-host scale = run more dokan processes against the same
+    // Postgres; SKIP LOCKED keeps claims disjoint.
+    if !cli.caps.is_empty() {
+        Worker::new(db.clone(), exec.clone(), cli.caps.clone(), cli.concurrency).spawn();
+    }
 
     match cli.transport.as_str() {
-        "stdio" => serve_stdio(db, exec).await,
-        "http" => serve_http(db, exec, &cli.addr).await,
+        "stdio" => serve_stdio(db, exec, cron).await,
+        "http" => serve_http(db, exec, cron, &cli.addr).await,
         other => anyhow::bail!("unknown transport: {other} (use stdio|http)"),
     }
 }
 
-async fn serve_stdio(db: Db, exec: Arc<Executor>) -> Result<()> {
+async fn serve_stdio(db: Db, exec: Arc<Executor>, cron: Arc<Cron>) -> Result<()> {
     use rmcp::transport::stdio;
     use rmcp::ServiceExt;
 
-    let server = Dokan::new(db, exec);
+    let server = Dokan::new(db, exec, Some(cron));
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
 }
 
-async fn serve_http(db: Db, exec: Arc<Executor>, addr: &str) -> Result<()> {
+async fn serve_http(db: Db, exec: Arc<Executor>, cron: Arc<Cron>, addr: &str) -> Result<()> {
     use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
     use rmcp::transport::streamable_http_server::StreamableHttpService;
 
     let service = StreamableHttpService::new(
-        move || Ok(Dokan::new(db.clone(), exec.clone())),
+        move || Ok(Dokan::new(db.clone(), exec.clone(), Some(cron.clone()))),
         LocalSessionManager::default().into(),
         Default::default(),
     );

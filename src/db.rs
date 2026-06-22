@@ -41,6 +41,24 @@ pub struct Run {
 }
 
 #[derive(Debug, Clone)]
+pub struct ClaimedJob {
+    pub run_id: i64,
+    #[allow(dead_code)]
+    pub script_id: i64,
+    pub runtime: String,
+    pub source: String,
+    pub input: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct Schedule {
+    pub id: i64,
+    pub script_id: i64,
+    pub cron: String,
+    pub input: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
 pub struct LogLine {
     pub seq: i64,
     pub stream: String,
@@ -149,14 +167,6 @@ impl Db {
         Ok(id)
     }
 
-    pub async fn mark_running(&self, run_id: i64) -> Result<()> {
-        sqlx::query("UPDATE runs SET status = 'running', started_at = now() WHERE id = $1")
-            .bind(run_id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
     pub async fn finish_run(
         &self,
         run_id: i64,
@@ -213,6 +223,107 @@ impl Db {
                 exit_code: r.get("exit_code"),
                 error: r.get("error"),
                 created_at: r.get("created_at"),
+            })
+            .collect())
+    }
+
+    /// Atomically claim the oldest pending run whose runtime a worker can serve.
+    /// `FOR UPDATE SKIP LOCKED` makes this safe across N concurrent workers — the
+    /// hand-rolled queue (PRD §9: <100 LOC, no apalis).
+    pub async fn claim_run(&self, caps: &[String]) -> Result<Option<ClaimedJob>> {
+        let row = sqlx::query(
+            "WITH c AS ( \
+                 SELECT r.id FROM runs r JOIN scripts s ON s.id = r.script_id \
+                 WHERE r.status = 'pending' AND s.runtime = ANY($1) \
+                 ORDER BY r.id FOR UPDATE OF r SKIP LOCKED LIMIT 1 \
+             ) \
+             UPDATE runs SET status = 'running', started_at = now() \
+             FROM c WHERE runs.id = c.id \
+             RETURNING runs.id, runs.script_id, runs.input, \
+                 (SELECT runtime FROM scripts WHERE id = runs.script_id) AS runtime, \
+                 (SELECT source  FROM scripts WHERE id = runs.script_id) AS source",
+        )
+        .bind(caps)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| ClaimedJob {
+            run_id: r.get("id"),
+            script_id: r.get("script_id"),
+            runtime: r.get("runtime"),
+            source: r.get("source"),
+            input: r.get::<Option<serde_json::Value>, _>("input").unwrap_or(serde_json::json!({})),
+        }))
+    }
+
+    pub async fn mark_attempt(&self, run_id: i64) -> Result<i32> {
+        let n: i32 = sqlx::query_scalar(
+            "UPDATE runs SET attempts = attempts + 1 WHERE id = $1 RETURNING attempts",
+        )
+        .bind(run_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(n)
+    }
+
+    /// Requeue a failed run for retry (back to pending).
+    pub async fn requeue(&self, run_id: i64) -> Result<()> {
+        sqlx::query("UPDATE runs SET status = 'pending', started_at = NULL WHERE id = $1")
+            .bind(run_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    // ---- schedules (cron) ----
+
+    pub async fn insert_schedule(
+        &self,
+        script_id: i64,
+        cron: &str,
+        input: &serde_json::Value,
+    ) -> Result<i64> {
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO schedules (script_id, cron, input) VALUES ($1, $2, $3) RETURNING id",
+        )
+        .bind(script_id)
+        .bind(cron)
+        .bind(input)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    pub async fn enabled_schedules(&self) -> Result<Vec<Schedule>> {
+        let rows = sqlx::query(
+            "SELECT id, script_id, cron, input FROM schedules WHERE enabled = true ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| Schedule {
+                id: r.get("id"),
+                script_id: r.get("script_id"),
+                cron: r.get("cron"),
+                input: r.get::<Option<serde_json::Value>, _>("input")
+                    .unwrap_or(serde_json::json!({})),
+            })
+            .collect())
+    }
+
+    pub async fn list_schedules(&self) -> Result<Vec<Schedule>> {
+        let rows =
+            sqlx::query("SELECT id, script_id, cron, input FROM schedules ORDER BY id DESC LIMIT 50")
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| Schedule {
+                id: r.get("id"),
+                script_id: r.get("script_id"),
+                cron: r.get("cron"),
+                input: r.get::<Option<serde_json::Value>, _>("input")
+                    .unwrap_or(serde_json::json!({})),
             })
             .collect())
     }

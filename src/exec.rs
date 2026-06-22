@@ -1,31 +1,33 @@
-//! Docker execution: one job = one clean container run, then discard.
-//! "Pool warm, run clean, discard" — the warm pool is a later phase; v1 creates
-//! a fresh container per run. Code is trusted, so raw containers suffice.
+//! Docker execution: one job = one clean container, then discard.
+//! Jobs run by `docker exec` into a warm pooled container; code is trusted, so raw
+//! containers suffice (no gVisor/Firecracker). Resource caps live on the container.
 
 use anyhow::{anyhow, Result};
 use base64::Engine;
-use bollard::models::{ContainerCreateBody, HostConfig};
-use bollard::query_parameters::{
-    CreateContainerOptionsBuilder, CreateImageOptionsBuilder, LogsOptionsBuilder,
-    RemoveContainerOptionsBuilder, StartContainerOptions, WaitContainerOptions,
-};
+use bollard::container::LogOutput;
+use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
 use bollard::Docker;
+use futures_util::Stream;
 use futures_util::StreamExt;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::db::Db;
+use crate::pool::WarmPool;
 
-const MEM_LIMIT_BYTES: i64 = 512 * 1024 * 1024; // 512 MiB
-const NANO_CPUS: i64 = 1_000_000_000; // 1.0 CPU
 const DEFAULT_TIMEOUT_SECS: u64 = 300;
 
 #[derive(Clone)]
 pub struct Executor {
     docker: Docker,
+    pool: Arc<WarmPool>,
+    /// run_id -> container_id for in-flight jobs, so `cancel` can kill the right one.
+    active: Arc<Mutex<HashMap<i64, String>>>,
 }
 
 /// Maps a declared runtime to its base image and in-container interpreter.
-fn runtime_spec(runtime: &str) -> Option<(&'static str, &'static str)> {
+pub fn runtime_spec(runtime: &str) -> Option<(&'static str, &'static str)> {
     match runtime {
         "python" | "python3" | "python3.12" => Some(("python:3.12-slim", "python")),
         "node" | "nodejs" | "javascript" => Some(("node:22-slim", "node")),
@@ -35,40 +37,31 @@ fn runtime_spec(runtime: &str) -> Option<(&'static str, &'static str)> {
 }
 
 impl Executor {
-    pub fn connect() -> Result<Self> {
-        // Honor DOCKER_HOST (Colima/Docker Desktop sockets live outside /var/run);
-        // fall back to the local default socket otherwise.
+    pub fn connect(warm_idle: usize) -> Result<Self> {
+        // Honor DOCKER_HOST (Colima/Docker Desktop sockets live outside /var/run).
         let docker = if std::env::var("DOCKER_HOST").is_ok() {
             Docker::connect_with_defaults()?
         } else {
             Docker::connect_with_local_defaults()?
         };
-        Ok(Self { docker })
+        let pool = WarmPool::new(docker.clone(), warm_idle);
+        Ok(Self {
+            docker,
+            pool,
+            active: Arc::new(Mutex::new(HashMap::new())),
+        })
     }
 
     /// Kill a running job's container (best-effort).
     pub async fn cancel(&self, run_id: i64) {
-        let name = format!("dokan-run-{run_id}");
-        let _ = self.docker.kill_container(&name, None).await;
+        let cid = self.active.lock().unwrap().get(&run_id).cloned();
+        if let Some(cid) = cid {
+            let _ = self.docker.kill_container(&cid, None).await;
+        }
     }
 
-    /// Pull the base image if it is not already present locally.
-    async fn ensure_image(&self, image: &str) -> Result<()> {
-        if self.docker.inspect_image(image).await.is_ok() {
-            return Ok(());
-        }
-        let opts = CreateImageOptionsBuilder::default()
-            .from_image(image)
-            .build();
-        let mut stream = self.docker.create_image(Some(opts), None, None);
-        while let Some(item) = stream.next().await {
-            item.map_err(|e| anyhow!("pull {image}: {e}"))?;
-        }
-        Ok(())
-    }
-
-    /// Full lifecycle: pull → create → start → stream logs to DB → wait → finish → remove.
-    /// Runs to completion; the caller spawns this so `run_script` can return immediately.
+    /// Full lifecycle: acquire warm container → exec → stream logs → exit code → discard.
+    /// Drives to completion; the worker spawns this. Failures are recorded against the run.
     pub async fn run(
         &self,
         db: &Db,
@@ -77,14 +70,13 @@ impl Executor {
         source: &str,
         input: &serde_json::Value,
     ) {
-        if let Err(e) = self
-            .run_inner(db, run_id, runtime, source, input)
-            .await
-        {
+        if let Err(e) = self.run_inner(db, run_id, runtime, source, input).await {
             let msg = e.to_string();
-            let _ = db.append_log(run_id, db.max_log_seq(run_id).await.unwrap_or(0) + 1, "stderr", &format!("dokan: {msg}")).await;
+            let seq = db.max_log_seq(run_id).await.unwrap_or(0) + 1;
+            let _ = db.append_log(run_id, seq, "stderr", &format!("dokan: {msg}")).await;
             let _ = db.finish_run(run_id, "failed", None, Some(&msg)).await;
         }
+        self.active.lock().unwrap().remove(&run_id);
     }
 
     async fn run_inner(
@@ -98,127 +90,119 @@ impl Executor {
         let (image, interp) =
             runtime_spec(runtime).ok_or_else(|| anyhow!("unknown runtime: {runtime}"))?;
 
-        db.mark_running(run_id).await?;
-        self.ensure_image(image).await?;
+        let cid = self.pool.acquire(image).await?;
+        self.active.lock().unwrap().insert(run_id, cid.clone());
 
+        let result = self.exec_job(db, run_id, &cid, interp, source, input).await;
+
+        // Run clean, discard — never reuse a dirty container.
+        self.pool.discard(&cid).await;
+        result
+    }
+
+    async fn exec_job(
+        &self,
+        db: &Db,
+        run_id: i64,
+        cid: &str,
+        interp: &str,
+        source: &str,
+        input: &serde_json::Value,
+    ) -> Result<()> {
         let src_b64 = base64::engine::general_purpose::STANDARD.encode(source);
-        // Decode the source inside the container, then exec the interpreter on it.
         let bootstrap = format!(
             "printf '%s' \"$DOKAN_SRC\" | base64 -d > /tmp/dokan_script && exec {interp} /tmp/dokan_script"
         );
 
-        let body = ContainerCreateBody {
-            image: Some(image.to_string()),
-            cmd: Some(vec!["sh".into(), "-c".into(), bootstrap]),
-            env: Some(vec![
-                format!("DOKAN_SRC={src_b64}"),
-                format!("DOKAN_INPUT={}", input),
-                format!("DOKAN_RUN_ID={run_id}"),
-            ]),
-            host_config: Some(HostConfig {
-                memory: Some(MEM_LIMIT_BYTES),
-                nano_cpus: Some(NANO_CPUS),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        let name = format!("dokan-run-{run_id}");
-        let opts = CreateContainerOptionsBuilder::default().name(&name).build();
-        let created = self.docker.create_container(Some(opts), body).await?;
-        let cid = created.id;
-
-        // Ensure cleanup even on early return.
-        let result = self.run_streaming(db, run_id, &cid).await;
-
-        let _ = self
+        let exec = self
             .docker
-            .remove_container(
-                &cid,
-                Some(RemoveContainerOptionsBuilder::default().force(true).build()),
+            .create_exec(
+                cid,
+                CreateExecOptions {
+                    cmd: Some(vec!["sh".into(), "-c".into(), bootstrap]),
+                    env: Some(vec![
+                        format!("DOKAN_SRC={src_b64}"),
+                        format!("DOKAN_INPUT={input}"),
+                        format!("DOKAN_RUN_ID={run_id}"),
+                    ]),
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    ..Default::default()
+                },
             )
-            .await;
+            .await?;
+        let exec_id = exec.id;
 
-        result
-    }
-
-    async fn run_streaming(&self, db: &Db, run_id: i64, cid: &str) -> Result<()> {
-        self.docker
-            .start_container(cid, None::<StartContainerOptions>)
+        let started = self
+            .docker
+            .start_exec(&exec_id, None::<StartExecOptions>)
             .await?;
 
-        // Stream logs concurrently with the wait, capping total runtime.
-        let log_opts = LogsOptionsBuilder::default()
-            .stdout(true)
-            .stderr(true)
-            .follow(true)
-            .build();
-        let mut logs = self.docker.logs(cid, Some(log_opts));
-
-        let mut seq: i64 = 0;
-        let mut buf_out = String::new();
-        let mut buf_err = String::new();
-
-        let pump = async {
-            while let Some(item) = logs.next().await {
-                let out = item.map_err(|e| anyhow!("log stream: {e}"))?;
-                let (stream, bytes) = match out {
-                    bollard::container::LogOutput::StdOut { message } => ("stdout", message),
-                    bollard::container::LogOutput::StdErr { message } => ("stderr", message),
-                    bollard::container::LogOutput::Console { message } => ("stdout", message),
-                    bollard::container::LogOutput::StdIn { message } => ("stdout", message),
-                };
-                let text = String::from_utf8_lossy(&bytes);
-                let buf = if stream == "stderr" { &mut buf_err } else { &mut buf_out };
-                buf.push_str(&text);
-                while let Some(nl) = buf.find('\n') {
-                    let line: String = buf.drain(..=nl).collect();
-                    let line = line.trim_end_matches('\n').trim_end_matches('\r');
-                    seq += 1;
-                    db.append_log(run_id, seq, stream, line).await?;
-                }
-            }
-            // Flush any trailing partial lines.
-            for (stream, buf) in [("stdout", &buf_out), ("stderr", &buf_err)] {
-                if !buf.is_empty() {
-                    seq += 1;
-                    db.append_log(run_id, seq, stream, buf).await?;
-                }
-            }
-            Ok::<(), anyhow::Error>(())
+        let output = match started {
+            StartExecResults::Attached { output, .. } => output,
+            StartExecResults::Detached => return Err(anyhow!("exec detached unexpectedly")),
         };
 
-        match tokio::time::timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS), pump).await {
+        let last_seq = match tokio::time::timeout(
+            Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+            pump_logs(db, run_id, output),
+        )
+        .await
+        {
             Ok(r) => r?,
             Err(_) => {
                 let _ = self.docker.kill_container(cid, None).await;
-                let s = db.max_log_seq(run_id).await.unwrap_or(seq) + 1;
+                let s = db.max_log_seq(run_id).await.unwrap_or(0) + 1;
                 db.append_log(run_id, s, "stderr", "dokan: timeout, container killed")
                     .await?;
                 db.finish_run(run_id, "failed", None, Some("timeout")).await?;
                 return Ok(());
             }
-        }
+        };
+        let _ = last_seq;
 
-        // Container has produced all logs; collect exit code.
-        let mut wait = self
-            .docker
-            .wait_container(cid, None::<WaitContainerOptions>);
-        let mut exit_code: i64 = 0;
-        while let Some(item) = wait.next().await {
-            match item {
-                Ok(resp) => exit_code = resp.status_code,
-                // wait errors with the non-zero code as part of the message on some daemons.
-                Err(bollard::errors::Error::DockerContainerWaitError { code, .. }) => {
-                    exit_code = code;
-                }
-                Err(e) => return Err(anyhow!("wait: {e}")),
-            }
-        }
-
+        let inspect = self.docker.inspect_exec(&exec_id).await?;
+        let exit_code = inspect.exit_code.unwrap_or(0);
         let status = if exit_code == 0 { "succeeded" } else { "failed" };
         db.finish_run(run_id, status, Some(exit_code as i32), None)
             .await?;
         Ok(())
     }
+}
+
+/// Stream container output line-by-line into the DB. Returns the last seq written.
+async fn pump_logs(
+    db: &Db,
+    run_id: i64,
+    mut stream: impl Stream<Item = Result<LogOutput, bollard::errors::Error>> + Unpin,
+) -> Result<i64> {
+    let mut seq = db.max_log_seq(run_id).await.unwrap_or(0);
+    let mut buf_out = String::new();
+    let mut buf_err = String::new();
+
+    while let Some(item) = stream.next().await {
+        let out = item.map_err(|e| anyhow!("log stream: {e}"))?;
+        let (stream_name, bytes) = match out {
+            LogOutput::StdOut { message } => ("stdout", message),
+            LogOutput::StdErr { message } => ("stderr", message),
+            LogOutput::Console { message } => ("stdout", message),
+            LogOutput::StdIn { message } => ("stdout", message),
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        let buf = if stream_name == "stderr" { &mut buf_err } else { &mut buf_out };
+        buf.push_str(&text);
+        while let Some(nl) = buf.find('\n') {
+            let line: String = buf.drain(..=nl).collect();
+            let line = line.trim_end_matches('\n').trim_end_matches('\r');
+            seq += 1;
+            db.append_log(run_id, seq, stream_name, line).await?;
+        }
+    }
+    for (stream_name, buf) in [("stdout", &buf_out), ("stderr", &buf_err)] {
+        if !buf.is_empty() {
+            seq += 1;
+            db.append_log(run_id, seq, stream_name, buf).await?;
+        }
+    }
+    Ok(seq)
 }

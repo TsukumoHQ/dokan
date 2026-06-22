@@ -9,6 +9,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
 
+use crate::cron::Cron;
 use crate::db::Db;
 use crate::exec::Executor;
 
@@ -16,6 +17,7 @@ use crate::exec::Executor;
 pub struct Dokan {
     db: Db,
     exec: Arc<Executor>,
+    cron: Option<Arc<Cron>>,
     // Populated by #[tool_router]; read by the generated ServerHandler glue.
     #[allow(dead_code)]
     tool_router: rmcp::handler::server::router::tool::ToolRouter<Self>,
@@ -93,12 +95,22 @@ pub struct CancelArgs {
     pub run_id: i64,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ScheduleArgs {
+    pub script_id: i64,
+    /// 6-field cron with leading seconds, e.g. "0 */5 * * * *" = every 5 min.
+    pub cron: String,
+    /// JSON input passed to each scheduled run. Optional.
+    pub input: Option<serde_json::Value>,
+}
+
 #[tool_router]
 impl Dokan {
-    pub fn new(db: Db, exec: Arc<Executor>) -> Self {
+    pub fn new(db: Db, exec: Arc<Executor>, cron: Option<Arc<Cron>>) -> Self {
         Self {
             db,
             exec,
+            cron,
             tool_router: Self::tool_router(),
         }
     }
@@ -168,22 +180,14 @@ impl Dokan {
         let Some(script) = script else {
             return ok(json!({"error": "script_not_found", "id": a.script_id}));
         };
+        let _ = &script; // existence checked above; worker reloads it on claim.
         let input = a.input.unwrap_or(json!({}));
+        // Enqueue only — a worker claims it from the queue (FOR UPDATE SKIP LOCKED).
         let run_id = self
             .db
             .insert_run(a.script_id, &input)
             .await
             .map_err(internal)?;
-
-        // Fire-and-forget: the executor drives the container to completion.
-        let db = self.db.clone();
-        let exec = self.exec.clone();
-        let runtime = script.runtime.clone();
-        let source = script.source.clone();
-        tokio::spawn(async move {
-            exec.run(&db, run_id, &runtime, &source, &input).await;
-        });
-
         ok(json!({"run_id": run_id, "status": "pending"}))
     }
 
@@ -288,6 +292,39 @@ impl Dokan {
             })
             .collect();
         ok(json!({"counts": counts_obj, "recent": items}))
+    }
+
+    #[tool(description = "Schedule a script on a cron (6-field, leading seconds). Each tick enqueues a run. Returns schedule_id.")]
+    async fn schedule(
+        &self,
+        Parameters(a): Parameters<ScheduleArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let Some(cron) = &self.cron else {
+            return ok(json!({"error": "scheduler_disabled"}));
+        };
+        if self.db.get_script(a.script_id).await.map_err(internal)?.is_none() {
+            return ok(json!({"error": "script_not_found", "id": a.script_id}));
+        }
+        let input = a.input.unwrap_or(json!({}));
+        let id = self
+            .db
+            .insert_schedule(a.script_id, &a.cron, &input)
+            .await
+            .map_err(internal)?;
+        cron.add_job(a.script_id, &a.cron, input)
+            .await
+            .map_err(internal)?;
+        ok(json!({"schedule_id": id, "cron": a.cron, "status": "scheduled"}))
+    }
+
+    #[tool(description = "List cron schedules: id, script_id, cron expression.")]
+    async fn list_schedules(&self) -> Result<CallToolResult, McpError> {
+        let rows = self.db.list_schedules().await.map_err(internal)?;
+        let items: Vec<_> = rows
+            .iter()
+            .map(|s| json!({"schedule_id": s.id, "script_id": s.script_id, "cron": s.cron}))
+            .collect();
+        ok(json!({"schedules": items}))
     }
 
     #[tool(description = "Cancel a run: kill its container and mark it canceled. Compact ack.")]

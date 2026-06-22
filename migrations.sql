@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS runs (
     input        JSONB,
     exit_code    INT,
     error        TEXT,
+    attempts     INT         NOT NULL DEFAULT 0,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     started_at   TIMESTAMPTZ,
     finished_at  TIMESTAMPTZ
@@ -38,3 +39,19 @@ CREATE TABLE IF NOT EXISTS logs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_logs_err ON logs (run_id, seq) WHERE stream = 'stderr';
+
+-- Backfill for DBs created before `attempts` existed.
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS attempts INT NOT NULL DEFAULT 0;
+
+-- Cron schedules: each tick inserts a pending run for script_id.
+CREATE TABLE IF NOT EXISTS schedules (
+    id         BIGSERIAL PRIMARY KEY,
+    script_id  BIGINT      NOT NULL REFERENCES scripts (id),
+    cron       TEXT        NOT NULL,   -- 6-field (leading seconds) per tokio-cron-scheduler
+    input      JSONB,
+    enabled    BOOLEAN     NOT NULL DEFAULT true,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Pending-run claim path; partial index keeps the queue scan tight.
+CREATE INDEX IF NOT EXISTS idx_runs_pending ON runs (id) WHERE status = 'pending';
