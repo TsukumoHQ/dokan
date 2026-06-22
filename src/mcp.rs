@@ -118,6 +118,11 @@ pub struct FlowRunArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct UnscheduleArgs {
+    pub schedule_id: i64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ScheduleArgs {
     pub script_id: i64,
     /// 6-field cron with leading seconds, e.g. "0 */5 * * * *" = every 5 min.
@@ -412,13 +417,13 @@ impl Dokan {
             .insert_schedule(a.script_id, &a.cron, &input)
             .await
             .map_err(internal)?;
-        cron.add_job(a.script_id, &a.cron, input)
+        cron.add_job(id, a.script_id, &a.cron, input)
             .await
             .map_err(internal)?;
         ok(json!({"schedule_id": id, "cron": a.cron, "status": "scheduled"}))
     }
 
-    #[tool(description = "List cron schedules: id, script_id, cron expression.")]
+    #[tool(description = "List active cron schedules: id, script_id, cron expression.")]
     async fn list_schedules(&self) -> Result<CallToolResult, McpError> {
         let rows = self.db.list_schedules().await.map_err(internal)?;
         let items: Vec<_> = rows
@@ -426,6 +431,18 @@ impl Dokan {
             .map(|s| json!({"schedule_id": s.id, "script_id": s.script_id, "cron": s.cron}))
             .collect();
         ok(json!({"schedules": items}))
+    }
+
+    #[tool(description = "Stop a cron schedule: removes the live job and disables it so it won't reload. Always unschedule test/temporary crons.")]
+    async fn unschedule(
+        &self,
+        Parameters(a): Parameters<UnscheduleArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let Some(cron) = &self.cron else {
+            return ok(json!({"error": "scheduler_disabled"}));
+        };
+        let removed = cron.remove(a.schedule_id).await.map_err(internal)?;
+        ok(json!({"schedule_id": a.schedule_id, "status": if removed {"unscheduled"} else {"not_found"}}))
     }
 
     #[tool(description = "Cancel a run: kill its container and mark it canceled. Compact ack.")]

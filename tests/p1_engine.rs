@@ -107,7 +107,7 @@ async fn cron_enqueues_runs() -> anyhow::Result<()> {
         json!({"script_id": sid, "cron": "* * * * * *"}),
     )
     .await?;
-    assert!(s["schedule_id"].as_i64().is_some(), "scheduled: {s}");
+    let schedule_id = s["schedule_id"].as_i64().expect(&format!("scheduled: {s}"));
 
     // Let it tick a few times, then confirm a run for this script materialized.
     tokio::time::sleep(std::time::Duration::from_secs(4)).await;
@@ -126,6 +126,17 @@ async fn cron_enqueues_runs() -> anyhow::Result<()> {
             .unwrap_or(false),
         "list_schedules non-empty"
     );
+
+    // Clean up: stop the per-second cron so it doesn't flood the shared DB forever.
+    let un = call(&c, "unschedule", json!({"schedule_id": schedule_id})).await?;
+    assert_eq!(un["status"], "unscheduled", "cron stopped: {un}");
+    let after = call(&c, "list_schedules", json!({})).await?;
+    let still = after["schedules"]
+        .as_array()
+        .map(|a| a.iter().any(|s| s["schedule_id"].as_i64() == Some(schedule_id)))
+        .unwrap_or(false);
+    assert!(!still, "unscheduled cron gone from list");
+
     c.cancel().await?;
     Ok(())
 }

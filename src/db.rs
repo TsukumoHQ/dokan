@@ -356,11 +356,23 @@ impl Db {
             .collect())
     }
 
+    /// Enable/disable a schedule. Returns rows affected (0 = not found).
+    pub async fn set_schedule_enabled(&self, id: i64, enabled: bool) -> Result<u64> {
+        let r = sqlx::query("UPDATE schedules SET enabled = $2 WHERE id = $1")
+            .bind(id)
+            .bind(enabled)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected())
+    }
+
     pub async fn list_schedules(&self) -> Result<Vec<Schedule>> {
-        let rows =
-            sqlx::query("SELECT id, script_id, cron, input FROM schedules ORDER BY id DESC LIMIT 50")
-                .fetch_all(&self.pool)
-                .await?;
+        let rows = sqlx::query(
+            "SELECT id, script_id, cron, input FROM schedules \
+             WHERE enabled = true ORDER BY id DESC LIMIT 50",
+        )
+        .fetch_all(&self.pool)
+        .await?;
         Ok(rows
             .into_iter()
             .map(|r| Schedule {
