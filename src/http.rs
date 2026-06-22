@@ -35,6 +35,7 @@ pub fn operator_router(state: AppState) -> Router {
         .route("/api/runs/{id}/cancel", post(cancel_run))
         .route("/api/runs/{id}/logs", get(run_logs))
         .route("/api/runs/{id}/stream", get(run_stream))
+        .route("/api/schedules", get(list_schedules))
         .route("/api/secrets", get(list_secrets).post(set_secret))
         .with_state(state)
 }
@@ -256,8 +257,34 @@ const INDEX_HTML: &str = r#"<!doctype html>
   .toast.ok{border-color:color-mix(in srgb,var(--succeeded) 50%,transparent); color:var(--succeeded)}
   .toast.err{border-color:color-mix(in srgb,var(--failed) 50%,transparent); color:var(--failed)}
   @keyframes toastin{from{opacity:0; transform:translateY(6px)}to{opacity:1; transform:none}}
+  /* cockpit: system ribbon — read-only at-a-glance pulse */
+  .ribbon{display:flex; flex-wrap:wrap; gap:0; margin:1.5rem 0 .25rem;
+    background:var(--panel); border:1px solid var(--line); border-radius:var(--radius);
+    box-shadow:var(--shadow); overflow:hidden}
+  .kpi{flex:1 1 0; min-width:7.5rem; padding:.7rem 1rem; border-right:1px solid var(--line-soft);
+    display:flex; flex-direction:column; gap:.15rem}
+  .kpi:last-child{border-right:0}
+  .kpi .v{font-family:var(--mono); font-size:1.25rem; font-weight:600; line-height:1.1;
+    font-variant-numeric:tabular-nums; color:var(--fg)}
+  .kpi .l{font-size:.68rem; text-transform:uppercase; letter-spacing:.07em; color:var(--fg-faint)}
+  .kpi.live-k .v{color:var(--running)} .kpi.ok-k .v{color:var(--succeeded)}
+  .kpi .v.zero{color:var(--fg-faint)}
+  /* cockpit grid: runs (main) + schedules (rail) */
+  .cockpit{display:grid; grid-template-columns:minmax(0,2.2fr) minmax(15rem,1fr); gap:1rem;
+    align-items:start; margin-top:1.25rem}
+  @media (max-width:900px){ .cockpit{grid-template-columns:1fr} }
+  /* schedules rail */
+  .sched-list{display:flex; flex-direction:column}
+  .sched{display:flex; align-items:baseline; gap:.5rem; padding:.6rem 1.1rem;
+    border-bottom:1px solid var(--line-soft)}
+  .sched:last-child{border-bottom:0}
+  .sched .nm{font-weight:550; font-size:.84rem; color:var(--fg); flex:1; min-width:0;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+  .sched .cr{font-family:var(--mono); font-size:.72rem; color:var(--accent);
+    background:color-mix(in srgb,var(--accent) 12%,transparent); padding:.1rem .4rem; border-radius:6px}
+  .sched .sid{font-family:var(--mono); font-size:.7rem; color:var(--fg-faint)}
   @media (max-width:560px){ td.exit,th.exit,td.when,th.when{display:none} .wrap{padding:1.5rem 1rem 3rem}
-    .composer .grid{grid-template-columns:1fr} .rowbtns{opacity:1} }
+    .composer .grid{grid-template-columns:1fr} .rowbtns{opacity:1} .kpi{min-width:5.5rem} }
   @media (prefers-reduced-motion:reduce){ *{animation:none!important; transition:none!important} }
 </style>
 </head>
@@ -299,18 +326,30 @@ const INDEX_HTML: &str = r#"<!doctype html>
     </div>
   </div>
 
+  <div class=ribbon id=ribbon aria-label="system pulse"></div>
+
   <div class=stats id=stats aria-label="run status counts"></div>
 
-  <section class=card>
-    <div class=card-h>
-      <h2>Recent runs</h2>
-      <span class=filter-tag id=filterTag></span>
-    </div>
-    <table>
-      <thead><tr><th>Run</th><th>Script</th><th>Status</th><th class=when>When</th><th class=exit>Exit</th><th class=act></th></tr></thead>
-      <tbody id=rows></tbody>
-    </table>
-  </section>
+  <div class=cockpit>
+    <section class=card>
+      <div class=card-h>
+        <h2>Recent runs</h2>
+        <span class=filter-tag id=filterTag></span>
+      </div>
+      <table>
+        <thead><tr><th>Run</th><th>Script</th><th>Status</th><th class=when>When</th><th class=exit>Exit</th><th class=act></th></tr></thead>
+        <tbody id=rows></tbody>
+      </table>
+    </section>
+
+    <section class=card>
+      <div class=card-h>
+        <h2>Schedules</h2>
+        <span class=filter-tag id=schedCount></span>
+      </div>
+      <div class=sched-list id=sched></div>
+    </section>
+  </div>
 </div>
 
 <div class=toasts id=toasts aria-live=polite></div>
@@ -434,8 +473,46 @@ function renderRows(recent){
     };
 }
 
-let last={counts:{},recent:[]};
-function render(d){ last=d; renderStats(d.counts||{}); renderRows(d.recent||[]); }
+let last={counts:{},recent:[]}, schedules=[];
+function render(d){ last=d; renderRibbon(); renderStats(d.counts||{}); renderRows(d.recent||[]); }
+
+/* system ribbon: read-only at-a-glance pulse derived from status counts + schedules */
+function renderRibbon(){
+  const c=last.counts||{};
+  const run=c.running||0, pend=c.pending||0, ok=c.succeeded||0, fail=c.failed||0;
+  const total=Object.values(c).reduce((a,b)=>a+b,0);
+  const rate=(ok+fail)?Math.round(ok/(ok+fail)*100):null;
+  const tile=(v,l,cls)=>
+    `<div class="kpi ${cls||''}"><div class="v ${(v===0||v==='—')?'zero':''}">${v}</div>`
+    +`<div class=l>${l}</div></div>`;
+  $('ribbon').innerHTML=
+    tile(run,'active',run?'live-k':'')
+    +tile(pend,'queued')
+    +tile(rate===null?'—':rate+'%','success',(rate!==null&&rate>=90)?'ok-k':'')
+    +tile(total,'total runs')
+    +tile(schedules.length,'schedules');
+}
+
+/* schedules rail — live crons (name · cron · script id) */
+function renderSchedules(){
+  $('schedCount').innerHTML=schedules.length?`<b>${schedules.length}</b> active`:'';
+  const el=$('sched');
+  if(!schedules.length){
+    el.innerHTML=`<div class=empty><div class=big>No schedules</div>`
+      +`<div>Cron a script to see it here.</div></div>`;
+    return;
+  }
+  el.innerHTML=schedules.map(s=>
+    `<div class=sched><span class=nm title="${esc(s.script_name||'')}">`
+    +`${esc(s.script_name||('script '+s.script_id))}</span>`
+    +`<span class=cr>${esc(s.cron)}</span><span class=sid>#${s.script_id}</span></div>`).join('');
+}
+async function fetchSchedules(){
+  try{
+    const d=await fetch('/api/schedules').then(x=>x.json());
+    schedules=d.schedules||[]; renderSchedules(); renderRibbon();
+  }catch(e){ /* keep last good frame */ }
+}
 
 async function tick(){
   try{
@@ -520,7 +597,9 @@ $('composer').addEventListener('keydown',e=>{
 });
 
 $('rows').innerHTML='<tr><td colspan=6 style="padding:1.1rem"><div class=skel></div></td></tr>';
+renderRibbon();
 tick(); setInterval(tick,1500);
+fetchSchedules(); setInterval(fetchSchedules,5000);
 </script>
 </body>
 </html>"#;
@@ -643,6 +722,18 @@ async fn list_secrets(State(s): State<AppState>) -> impl IntoResponse {
     // Names only — values are write-only over this surface.
     let names = s.db.secret_names().await.unwrap_or_default();
     Json(json!({"secrets": names}))
+}
+
+async fn list_schedules(State(s): State<AppState>) -> impl IntoResponse {
+    let rows = s.db.list_schedules().await.unwrap_or_default();
+    let items: Vec<_> = rows
+        .iter()
+        .map(|sc| json!({
+            "schedule_id": sc.id, "script_id": sc.script_id,
+            "script_name": sc.script_name, "cron": sc.cron,
+        }))
+        .collect();
+    Json(json!({"schedules": items}))
 }
 
 #[derive(Deserialize)]
