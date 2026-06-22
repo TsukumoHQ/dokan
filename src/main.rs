@@ -3,6 +3,7 @@
 
 mod cron;
 mod db;
+mod embed;
 mod exec;
 mod flow;
 mod mcp;
@@ -51,6 +52,14 @@ struct Cli {
     /// Warm idle containers to keep per image.
     #[arg(long, default_value_t = 2, env = "DOKAN_WARM_IDLE")]
     warm_idle: usize,
+
+    /// Enable local semantic search (loads the BGE embedding model).
+    #[arg(long, env = "DOKAN_EMBED")]
+    embed: bool,
+
+    /// Embedding model cache directory.
+    #[arg(long, default_value = ".fastembed_cache", env = "DOKAN_EMBED_CACHE")]
+    embed_cache: String,
 }
 
 #[tokio::main]
@@ -70,6 +79,22 @@ async fn main() -> Result<()> {
     let exec = Arc::new(Executor::connect(cli.warm_idle)?);
     tracing::info!(warm_idle = cli.warm_idle, "docker connected, warm pool armed");
 
+    // Optional local embeddings for semantic search.
+    let embedder = if cli.embed {
+        match crate::embed::Embedder::try_load(&cli.embed_cache) {
+            Ok(e) => {
+                tracing::info!("semantic search enabled (BGE-small)");
+                Some(e)
+            }
+            Err(e) => {
+                tracing::warn!("embedder load failed, falling back to substring: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Cron scheduler: ticks enqueue runs the workers then claim.
     let cron = Cron::start(db.clone()).await?;
     tracing::info!("cron scheduler started");
@@ -84,28 +109,39 @@ async fn main() -> Result<()> {
     }
 
     match cli.transport.as_str() {
-        "stdio" => serve_stdio(db, exec, cron).await,
-        "http" => serve_http(db, exec, cron, &cli.addr).await,
+        "stdio" => serve_stdio(db, exec, cron, embedder).await,
+        "http" => serve_http(db, exec, cron, embedder, &cli.addr).await,
         other => anyhow::bail!("unknown transport: {other} (use stdio|http)"),
     }
 }
 
-async fn serve_stdio(db: Db, exec: Arc<Executor>, cron: Arc<Cron>) -> Result<()> {
+async fn serve_stdio(
+    db: Db,
+    exec: Arc<Executor>,
+    cron: Arc<Cron>,
+    embedder: Option<crate::embed::Embedder>,
+) -> Result<()> {
     use rmcp::transport::stdio;
     use rmcp::ServiceExt;
 
-    let server = Dokan::new(db, exec, Some(cron));
+    let server = Dokan::new(db, exec, Some(cron), embedder);
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
 }
 
-async fn serve_http(db: Db, exec: Arc<Executor>, cron: Arc<Cron>, addr: &str) -> Result<()> {
+async fn serve_http(
+    db: Db,
+    exec: Arc<Executor>,
+    cron: Arc<Cron>,
+    embedder: Option<crate::embed::Embedder>,
+    addr: &str,
+) -> Result<()> {
     use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
     use rmcp::transport::streamable_http_server::StreamableHttpService;
 
     let service = StreamableHttpService::new(
-        move || Ok(Dokan::new(db.clone(), exec.clone(), Some(cron.clone()))),
+        move || Ok(Dokan::new(db.clone(), exec.clone(), Some(cron.clone()), embedder.clone())),
         LocalSessionManager::default().into(),
         Default::default(),
     );

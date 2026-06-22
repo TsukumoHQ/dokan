@@ -101,18 +101,53 @@ impl Db {
         runtime: &str,
         source: &str,
         description: Option<&str>,
+        embedding: Option<Vec<f32>>,
     ) -> Result<(i64, i32)> {
+        let vec = embedding.map(pgvector::Vector::from);
         let row = sqlx::query(
-            "INSERT INTO scripts (name, runtime, source, description) \
-             VALUES ($1, $2, $3, $4) RETURNING id, version",
+            "INSERT INTO scripts (name, runtime, source, description, embedding) \
+             VALUES ($1, $2, $3, $4, $5) RETURNING id, version",
         )
         .bind(name)
         .bind(runtime)
         .bind(source)
         .bind(description)
+        .bind(vec)
         .fetch_one(&self.pool)
         .await?;
         Ok((row.get("id"), row.get("version")))
+    }
+
+    /// Semantic ranking by cosine distance over embeddings. Returns (summaries, total
+    /// embedded). Caller falls back to `search_scripts` when no embedder is available.
+    pub async fn semantic_search(
+        &self,
+        query_vec: Vec<f32>,
+        limit: i64,
+    ) -> Result<(Vec<ScriptSummary>, i64)> {
+        let v = pgvector::Vector::from(query_vec);
+        let total: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM scripts WHERE embedding IS NOT NULL")
+                .fetch_one(&self.pool)
+                .await?;
+        let rows = sqlx::query(
+            "SELECT id, name, runtime, description FROM scripts \
+             WHERE embedding IS NOT NULL ORDER BY embedding <=> $1 LIMIT $2",
+        )
+        .bind(&v)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        let out = rows
+            .into_iter()
+            .map(|r| ScriptSummary {
+                id: r.get("id"),
+                name: r.get("name"),
+                runtime: r.get("runtime"),
+                description: r.get("description"),
+            })
+            .collect();
+        Ok((out, total))
     }
 
     pub async fn get_script(&self, id: i64) -> Result<Option<Script>> {

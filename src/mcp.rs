@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use crate::cron::Cron;
 use crate::db::Db;
+use crate::embed::Embedder;
 use crate::exec::Executor;
 
 #[derive(Clone)]
@@ -18,6 +19,7 @@ pub struct Dokan {
     db: Db,
     exec: Arc<Executor>,
     cron: Option<Arc<Cron>>,
+    embedder: Option<Embedder>,
     // Populated by #[tool_router]; read by the generated ServerHandler glue.
     #[allow(dead_code)]
     tool_router: rmcp::handler::server::router::tool::ToolRouter<Self>,
@@ -126,11 +128,17 @@ pub struct ScheduleArgs {
 
 #[tool_router]
 impl Dokan {
-    pub fn new(db: Db, exec: Arc<Executor>, cron: Option<Arc<Cron>>) -> Self {
+    pub fn new(
+        db: Db,
+        exec: Arc<Executor>,
+        cron: Option<Arc<Cron>>,
+        embedder: Option<Embedder>,
+    ) -> Self {
         Self {
             db,
             exec,
             cron,
+            embedder,
             tool_router: Self::tool_router(),
         }
     }
@@ -141,17 +149,30 @@ impl Dokan {
         Parameters(a): Parameters<SearchArgs>,
     ) -> Result<CallToolResult, McpError> {
         let limit = a.limit.unwrap_or(10).clamp(1, 100);
-        let (rows, total) = self
-            .db
-            .search_scripts(&a.query, limit)
-            .await
-            .map_err(internal)?;
+        // Semantic ranking when an embedder is loaded; substring fallback otherwise.
+        let (rows, total, mode) = match &self.embedder {
+            Some(emb) => match emb.embed(a.query.clone()).await {
+                Ok(qv) => {
+                    let (r, t) = self.db.semantic_search(qv, limit).await.map_err(internal)?;
+                    (r, t, "semantic")
+                }
+                Err(_) => {
+                    let (r, t) = self.db.search_scripts(&a.query, limit).await.map_err(internal)?;
+                    (r, t, "substring")
+                }
+            },
+            None => {
+                let (r, t) = self.db.search_scripts(&a.query, limit).await.map_err(internal)?;
+                (r, t, "substring")
+            }
+        };
         let items: Vec<_> = rows
             .iter()
             .map(|s| json!({"id": s.id, "name": s.name, "runtime": s.runtime, "desc": s.description}))
             .collect();
         ok(json!({
             "results": items,
+            "mode": mode,
             "note": format!("showing {} of {}", rows.len(), total),
         }))
     }
@@ -183,9 +204,17 @@ impl Dokan {
         &self,
         Parameters(a): Parameters<UploadArgs>,
     ) -> Result<CallToolResult, McpError> {
+        // Embed name + description for semantic search (best-effort).
+        let embedding = match &self.embedder {
+            Some(emb) => {
+                let text = format!("{} {}", a.name, a.description.clone().unwrap_or_default());
+                emb.embed(text).await.ok()
+            }
+            None => None,
+        };
         let (id, version) = self
             .db
-            .insert_script(&a.name, &a.runtime, &a.source, a.description.as_deref())
+            .insert_script(&a.name, &a.runtime, &a.source, a.description.as_deref(), embedding)
             .await
             .map_err(internal)?;
         ok(json!({"script_id": id, "version": version, "status": "uploaded"}))

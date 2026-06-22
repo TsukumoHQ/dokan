@@ -12,6 +12,10 @@ CREATE TABLE IF NOT EXISTS scripts (
 
 CREATE INDEX IF NOT EXISTS idx_scripts_name ON scripts (name);
 
+-- Semantic search (P3): local BGE-small embeddings, 384-dim. pgvector cosine.
+CREATE EXTENSION IF NOT EXISTS vector;
+ALTER TABLE scripts ADD COLUMN IF NOT EXISTS embedding vector(384);
+
 CREATE TABLE IF NOT EXISTS runs (
     id           BIGSERIAL PRIMARY KEY,
     script_id    BIGINT      NOT NULL REFERENCES scripts (id),
