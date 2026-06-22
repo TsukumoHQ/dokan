@@ -94,6 +94,11 @@ impl Executor {
         self.pool.limits()
     }
 
+    /// Retune warm-pool depth per image (autoscaler). Returns the value set.
+    pub fn set_warm_target(&self, n: usize) -> usize {
+        self.pool.set_target_idle(n)
+    }
+
     /// Pre-pull + pre-warm the known runtime images at startup so the first job of each
     /// runtime doesn't eat the image-pull / cold-create tail. (Perf #3.)
     pub fn prewarm(&self) {

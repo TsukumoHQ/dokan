@@ -9,6 +9,7 @@ mod flow;
 mod http;
 mod mcp;
 mod pool;
+mod scale;
 mod worker;
 
 use std::sync::Arc;
@@ -46,13 +47,21 @@ struct Cli {
     #[arg(long, default_value = "python,node,bash", env = "DOKAN_CAPS", value_delimiter = ',')]
     caps: Vec<String>,
 
-    /// Max concurrent jobs per worker.
+    /// Min concurrent jobs (autoscale floor; the controller raises it under load).
     #[arg(long, default_value_t = 8, env = "DOKAN_CONCURRENCY")]
     concurrency: usize,
 
-    /// Warm idle containers to keep per image.
+    /// Max concurrent jobs (autoscale ceiling; host-safety cap on parallel containers).
+    #[arg(long, default_value_t = 32, env = "DOKAN_MAX_CONCURRENCY")]
+    max_concurrency: usize,
+
+    /// Min warm idle containers per image (autoscale floor).
     #[arg(long, default_value_t = 2, env = "DOKAN_WARM_IDLE")]
     warm_idle: usize,
+
+    /// Max warm idle containers per image (autoscale ceiling).
+    #[arg(long, default_value_t = 16, env = "DOKAN_MAX_WARM")]
+    max_warm: usize,
 
     /// Per-job memory cap (MiB). The cgroup OOM-kills a job that exceeds it (exit 137).
     #[arg(long, default_value_t = 1024, env = "DOKAN_MEM_LIMIT_MB")]
@@ -181,7 +190,22 @@ async fn main() -> Result<()> {
         }
         exec.arm_pool();
         exec.prewarm(); // pull + warm runtime images now, not on the first job
-        Worker::new(db.clone(), exec.clone(), cli.caps.clone(), cli.concurrency).spawn();
+        // Autoscale concurrency + warm depth via Little's Law (L = λW). --concurrency and
+        // --warm-idle are the floors; the controller raises both toward L under load.
+        let conc = scale::Concurrency::new(cli.concurrency, cli.max_concurrency);
+        Worker::new(db.clone(), exec.clone(), cli.caps.clone(), conc.clone()).spawn();
+        scale::spawn_autoscaler(
+            db.clone(),
+            exec.clone(),
+            conc,
+            scale::ScaleCfg {
+                conc_floor: cli.concurrency,
+                conc_max: cli.max_concurrency,
+                warm_floor: cli.warm_idle,
+                warm_max: cli.max_warm,
+                headroom: 1.3,
+            },
+        );
         // Flow engine drives DAGs by enqueuing each step as a normal run.
         flow::FlowEngine::new(db.clone(), exec.clone()).start().await?;
         tracing::info!("flow engine started");

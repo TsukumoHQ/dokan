@@ -368,6 +368,29 @@ impl Db {
             .await;
     }
 
+    /// Arrival count over the last `secs` seconds — the autoscaler's λ numerator.
+    pub async fn arrivals_last_secs(&self, secs: i64) -> Result<i64> {
+        Ok(sqlx::query_scalar(
+            "SELECT count(*) FROM runs WHERE created_at > now() - make_interval(secs => $1)",
+        )
+        .bind(secs as f64)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
+    /// Mean run service time (seconds) over recently-finished runs — the autoscaler's W.
+    /// None when there's no recent sample.
+    pub async fn mean_run_duration_secs(&self, window_secs: i64) -> Result<Option<f64>> {
+        Ok(sqlx::query_scalar(
+            "SELECT avg(extract(epoch FROM (finished_at - started_at))) \
+             FROM runs WHERE finished_at > now() - make_interval(secs => $1) \
+               AND started_at IS NOT NULL AND finished_at IS NOT NULL",
+        )
+        .bind(window_secs as f64)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
     /// Count an agent's in-flight runs (pending or running) — the quota enforcement input.
     pub async fn agent_running_count(&self, agent_id: &str) -> Result<i64> {
         Ok(sqlx::query_scalar(

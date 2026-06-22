@@ -9,10 +9,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::Semaphore;
-
 use crate::db::Db;
 use crate::exec::Executor;
+use crate::scale::Concurrency;
 
 const MAX_ATTEMPTS: i32 = 3;
 const IDLE_POLL: Duration = Duration::from_millis(300);
@@ -25,16 +24,17 @@ pub struct Worker {
     db: Db,
     exec: Arc<Executor>,
     caps: Vec<String>,
-    slots: Arc<Semaphore>,
+    /// Resizable by the autoscaler (Little's Law).
+    slots: Arc<Concurrency>,
 }
 
 impl Worker {
-    pub fn new(db: Db, exec: Arc<Executor>, caps: Vec<String>, concurrency: usize) -> Self {
+    pub fn new(db: Db, exec: Arc<Executor>, caps: Vec<String>, slots: Arc<Concurrency>) -> Self {
         Self {
             db,
             exec,
             caps,
-            slots: Arc::new(Semaphore::new(concurrency)),
+            slots,
         }
     }
 
@@ -54,9 +54,9 @@ impl Worker {
             };
             loop {
                 // Block until a slot is free, then try to claim work.
-                let permit = match self.slots.clone().acquire_owned().await {
-                    Ok(p) => p,
-                    Err(_) => break,
+                let permit = match self.slots.acquire().await {
+                    Some(p) => p,
+                    None => break,
                 };
                 match self.db.claim_run(&self.caps).await {
                     Ok(Some(job)) => {

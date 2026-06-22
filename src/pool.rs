@@ -14,8 +14,9 @@ use bollard::query_parameters::{CreateContainerOptionsBuilder, CreateImageOption
 use bollard::Docker;
 use futures_util::StreamExt;
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 /// Hard guard against a fork bomb / runaway thread count inside a job.
@@ -23,7 +24,9 @@ const PIDS_LIMIT: i64 = 512;
 
 pub struct WarmPool {
     docker: Docker,
-    target_idle: usize,
+    /// Warm containers to keep ready per image. Atomic so the autoscaler can retune it live
+    /// from Little's Law (L = λW).
+    target_idle: AtomicUsize,
     mem_bytes: i64,
     nano_cpus: i64,
     idle: Mutex<HashMap<String, Vec<String>>>, // image -> [container_id]
@@ -38,12 +41,18 @@ impl WarmPool {
         // the same Docker host, so they must not each spin up their own warm containers.
         Arc::new(Self {
             docker,
-            target_idle,
+            target_idle: AtomicUsize::new(target_idle),
             mem_bytes,
             nano_cpus,
             idle: Mutex::new(HashMap::new()),
             known: Mutex::new(HashSet::new()),
         })
+    }
+
+    /// Retune the warm depth per image (autoscaler). Returns the value set.
+    pub fn set_target_idle(&self, n: usize) -> usize {
+        self.target_idle.store(n, Ordering::Relaxed);
+        n
     }
 
     /// Start the background filler. Call once, only on the executor process.
@@ -177,17 +186,21 @@ impl WarmPool {
     }
 
     fn spawn_filler(self: Arc<Self>) {
+        // Per tick, create up to this many containers per image — fast enough to refill
+        // after a burst (autoscaler raises target_idle), bounded to avoid a create storm.
+        const BURST: usize = 4;
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                tokio::time::sleep(Duration::from_millis(750)).await;
+                let target = self.target_idle.load(Ordering::Relaxed);
                 let images: Vec<String> = self.known.lock().unwrap().iter().cloned().collect();
                 for image in images {
                     let have = {
                         let idle = self.idle.lock().unwrap();
                         idle.get(&image).map(|v| v.len()).unwrap_or(0)
                     };
-                    // Top up one per tick per image — gentle, avoids create storms.
-                    if have < self.target_idle {
+                    let deficit = target.saturating_sub(have).min(BURST);
+                    for _ in 0..deficit {
                         if let Ok(id) = self.create_idle(&image).await {
                             let n = {
                                 let mut idle = self.idle.lock().unwrap();
@@ -195,7 +208,7 @@ impl WarmPool {
                                 v.push(id);
                                 v.len()
                             };
-                            metrics::gauge!("dokan_pool_idle_containers", "image" => image)
+                            metrics::gauge!("dokan_pool_idle_containers", "image" => image.clone())
                                 .set(n as f64);
                         }
                     }
