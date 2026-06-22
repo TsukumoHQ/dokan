@@ -60,6 +60,10 @@ pub struct UploadArgs {
     pub description: Option<String>,
     /// Free-text creator/owner tag (e.g. agent name or human). Shown in the operator UI.
     pub created_by: Option<String>,
+    /// Idempotent re-provision: if a script of this name exists, update it (version bump,
+    /// or no-op when the source is identical) and return its id instead of creating a
+    /// duplicate. Default false. Use it so a respawned agent can safely re-upload.
+    pub upsert: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -187,12 +191,12 @@ impl Dokan {
                 }
                 Err(_) => {
                     let (r, t) = self.db.search_scripts(&a.query, limit).await.map_err(internal)?;
-                    (r, t, "substring")
+                    (r, t, "fuzzy")
                 }
             },
             None => {
                 let (r, t) = self.db.search_scripts(&a.query, limit).await.map_err(internal)?;
-                (r, t, "substring")
+                (r, t, "fuzzy")
             }
         };
         let items: Vec<_> = rows
@@ -228,19 +232,38 @@ impl Dokan {
         ok(v)
     }
 
-    #[tool(description = "Upload a script. Returns script_id + version. Runtime: python|node|bash. INPUT CONTRACT: the script reads its input from the DOKAN_INPUT env var (a JSON string) — NOT stdin or argv. Secrets set via set_secret arrive as their own env vars (e.g. $OPENAI_API_KEY). A nonzero exit is treated as the script's own deterministic verdict (e.g. a monitor finding) and is NOT retried; only a container/infra failure retries.")]
+    #[tool(description = "Upload a script. Returns script_id + version. Runtime: python|node|bash. INPUT CONTRACT: the script reads its input from the DOKAN_INPUT env var (a JSON string) — NOT stdin or argv. Secrets set via set_secret arrive as their own env vars (e.g. $OPENAI_API_KEY). A nonzero exit is treated as the script's own deterministic verdict (e.g. a monitor finding) and is NOT retried; only a container/infra failure retries. Pass upsert=true to re-provision by name idempotently (no duplicate rows on respawn).")]
     async fn upload_script(
         &self,
         Parameters(a): Parameters<UploadArgs>,
     ) -> Result<CallToolResult, McpError> {
-        // Embed name + description for semantic search (best-effort).
-        let embedding = match &self.embedder {
-            Some(emb) => {
-                let text = format!("{} {}", a.name, a.description.clone().unwrap_or_default());
-                emb.embed(text).await.ok()
+        // Idempotent re-provision: with upsert, reuse the script of the same name. No-op
+        // when the source is unchanged (a respawned agent re-uploading the same thing),
+        // update + version bump when it changed — never a duplicate row.
+        if a.upsert.unwrap_or(false) {
+            if let Some((id, source, version)) =
+                self.db.find_script_by_name(&a.name).await.map_err(internal)?
+            {
+                if source == a.source {
+                    return ok(json!({"script_id": id, "version": version, "status": "unchanged"}));
+                }
+                let embedding = self.embed_script(&a.name, &a.description).await;
+                let version = self
+                    .db
+                    .update_script(
+                        id,
+                        &a.runtime,
+                        &a.source,
+                        a.description.as_deref(),
+                        a.created_by.as_deref(),
+                        embedding,
+                    )
+                    .await
+                    .map_err(internal)?;
+                return ok(json!({"script_id": id, "version": version, "status": "updated"}));
             }
-            None => None,
-        };
+        }
+        let embedding = self.embed_script(&a.name, &a.description).await;
         let (id, version) = self
             .db
             .insert_script(
@@ -254,6 +277,17 @@ impl Dokan {
             .await
             .map_err(internal)?;
         ok(json!({"script_id": id, "version": version, "status": "uploaded"}))
+    }
+
+    /// Embed name + description for semantic search (best-effort; None when no embedder).
+    async fn embed_script(&self, name: &str, description: &Option<String>) -> Option<Vec<f32>> {
+        match &self.embedder {
+            Some(emb) => {
+                let text = format!("{} {}", name, description.clone().unwrap_or_default());
+                emb.embed(text).await.ok()
+            }
+            None => None,
+        }
     }
 
     #[tool(description = "Trigger a script run. Returns run_id immediately; never blocks. Poll with read_logs or wait_for.")]

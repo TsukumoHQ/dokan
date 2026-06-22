@@ -178,21 +178,31 @@ impl Db {
         }))
     }
 
-    /// Substring ranking over name+description. Real semantic search (fastembed+pgvector)
-    /// is a later phase; this keeps the tool contract stable in the meantime.
+    /// Substring OR trigram-similarity ranking over name+description — the fallback when
+    /// no embedder is loaded. pg_trgm makes it typo-tolerant (the old substring-only path
+    /// returned nothing on a fuzzy query). similarity() is in [0,1]; 0.2 is a permissive
+    /// floor so near-misses surface without flooding on noise.
     pub async fn search_scripts(&self, query: &str, limit: i64) -> Result<(Vec<ScriptSummary>, i64)> {
         let pattern = format!("%{}%", query);
         let total: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM scripts WHERE name ILIKE $1 OR description ILIKE $1",
+            "SELECT count(*) FROM scripts \
+             WHERE name ILIKE $1 OR description ILIKE $1 \
+                OR similarity(name, $2) > 0.2 OR similarity(coalesce(description, ''), $2) > 0.2",
         )
         .bind(&pattern)
+        .bind(query)
         .fetch_one(&self.pool)
         .await?;
         let rows = sqlx::query(
-            "SELECT id, name, runtime, description FROM scripts \
-             WHERE name ILIKE $1 OR description ILIKE $1 ORDER BY id DESC LIMIT $2",
+            "SELECT id, name, runtime, description, \
+                GREATEST(similarity(name, $2), similarity(coalesce(description, ''), $2)) AS sim \
+             FROM scripts \
+             WHERE name ILIKE $1 OR description ILIKE $1 \
+                OR similarity(name, $2) > 0.2 OR similarity(coalesce(description, ''), $2) > 0.2 \
+             ORDER BY sim DESC, id DESC LIMIT $3",
         )
         .bind(&pattern)
+        .bind(query)
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
@@ -206,6 +216,45 @@ impl Db {
             })
             .collect();
         Ok((out, total))
+    }
+
+    /// Look up a script by exact name (newest first) for idempotent re-provisioning.
+    /// Returns (id, source, version) so upload can no-op when nothing changed.
+    pub async fn find_script_by_name(&self, name: &str) -> Result<Option<(i64, String, i32)>> {
+        let row = sqlx::query(
+            "SELECT id, source, version FROM scripts WHERE name = $1 ORDER BY id DESC LIMIT 1",
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| (r.get("id"), r.get("source"), r.get("version"))))
+    }
+
+    /// Update an existing script in place and bump its version. Returns the new version.
+    /// Used by upsert-by-name so a respawned agent re-provisions without duplicating rows.
+    pub async fn update_script(
+        &self,
+        id: i64,
+        runtime: &str,
+        source: &str,
+        description: Option<&str>,
+        created_by: Option<&str>,
+        embedding: Option<Vec<f32>>,
+    ) -> Result<i32> {
+        let vec = embedding.map(pgvector::Vector::from);
+        let version: i32 = sqlx::query_scalar(
+            "UPDATE scripts SET runtime = $2, source = $3, description = $4, created_by = $5, \
+                 embedding = $6, version = version + 1 WHERE id = $1 RETURNING version",
+        )
+        .bind(id)
+        .bind(runtime)
+        .bind(source)
+        .bind(description)
+        .bind(created_by)
+        .bind(vec)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(version)
     }
 
     // ---- runs ----

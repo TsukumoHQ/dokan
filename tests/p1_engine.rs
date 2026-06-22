@@ -156,6 +156,60 @@ async fn secret_injected_into_job_env() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// upsert=true re-provisions a script by name: same id back, no duplicate rows, no-op
+/// when the source is unchanged, version bump when it changes. (Terrain P2.)
+#[tokio::test]
+async fn upsert_dedups_by_name() -> anyhow::Result<()> {
+    let c = spawn().await?;
+    let name = "p2-upsert-probe";
+    let up = |src: &'static str| {
+        call(
+            &c,
+            "upload_script",
+            json!({"name": name, "runtime": "bash", "source": src, "upsert": true}),
+        )
+    };
+    let a = up("echo v1\n").await?;
+    let id = a["script_id"].as_i64().unwrap();
+    // Same source -> unchanged, same id.
+    let b = up("echo v1\n").await?;
+    assert_eq!(b["script_id"].as_i64().unwrap(), id, "same id on re-upload");
+    assert_eq!(b["status"], "unchanged", "no-op when source identical: {b}");
+    // Changed source -> updated, same id, bumped version.
+    let d = up("echo v2\n").await?;
+    assert_eq!(d["script_id"].as_i64().unwrap(), id, "still same id after change");
+    assert_eq!(d["status"], "updated", "updated when source differs: {d}");
+    assert!(
+        d["version"].as_i64().unwrap() > a["version"].as_i64().unwrap(),
+        "version bumped: {d}"
+    );
+    c.cancel().await?;
+    Ok(())
+}
+
+/// search_script tolerates typos via pg_trgm (the substring-only fallback returned 0 on
+/// fuzzy queries). (Terrain P2.)
+#[tokio::test]
+async fn fuzzy_search_finds_typo() -> anyhow::Result<()> {
+    let c = spawn().await?;
+    let name = "citation-monitor-fuzztest";
+    call(
+        &c,
+        "upload_script",
+        json!({"name": name, "runtime": "bash", "source": "echo hi\n", "upsert": true}),
+    )
+    .await?;
+    // Misspelled query — substring ILIKE would miss this; trigram similarity catches it.
+    let r = call(&c, "search_script", json!({"query": "citaton-moniter-fuzztst"})).await?;
+    let hit = r["results"]
+        .as_array()
+        .map(|a| a.iter().any(|s| s["name"].as_str() == Some(name)))
+        .unwrap_or(false);
+    assert!(hit, "fuzzy query found the script (mode {}): {r}", r["mode"]);
+    c.cancel().await?;
+    Ok(())
+}
+
 /// A 5-field crontab (missing the leading SECONDS column) is rejected loudly instead of
 /// being silently accepted and never firing. (Terrain P2.)
 #[tokio::test]

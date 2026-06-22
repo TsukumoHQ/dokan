@@ -111,3 +111,9 @@ ALTER TABLE scripts ADD COLUMN IF NOT EXISTS created_by TEXT;
 -- flows can be reclaimed by a healthy one WITHOUT yanking live work (replaces the old
 -- blunt "reset every running flow_run" boot reset). `runs` already has started_at.
 ALTER TABLE flow_runs ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ;
+
+-- Typo-tolerant script search: pg_trgm powers similarity() so search_script catches
+-- near-misses (the substring-only fallback returned 0 on fuzzy queries). GIN trigram
+-- index keeps it cheap as the registry grows.
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE INDEX IF NOT EXISTS idx_scripts_name_trgm ON scripts USING gin (name gin_trgm_ops);
