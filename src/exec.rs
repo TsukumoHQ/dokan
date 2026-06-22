@@ -210,8 +210,22 @@ impl Executor {
         };
         let _ = last_seq;
 
-        let inspect = self.docker.inspect_exec(&exec_id).await?;
-        let exit_code = inspect.exit_code.unwrap_or(0);
+        let exit_code = match self.docker.inspect_exec(&exec_id).await {
+            Ok(inspect) => inspect.exit_code.unwrap_or(0),
+            // Container vanished before we could read the exit code (teardown race / host
+            // resource pressure under many concurrent jobs). Don't dump a raw Docker 404
+            // into the run's stderr tail — record a clean line and finish as a NULL-exit
+            // failure, which the worker treats as a transient infra error worth retrying.
+            Err(bollard::errors::Error::DockerResponseServerError { status_code: 404, .. }) => {
+                let s = db.max_log_seq(run_id).await.unwrap_or(0) + 1;
+                db.append_log(run_id, s, "stderr", "dokan: container vanished before exit code; marking failed")
+                    .await?;
+                db.finish_run(run_id, "failed", None, Some("container vanished")).await?;
+                self.finalize(run_id, "failed", None).await;
+                return Ok(());
+            }
+            Err(e) => return Err(e.into()),
+        };
         let status = if exit_code == 0 { "succeeded" } else { "failed" };
         db.finish_run(run_id, status, Some(exit_code as i32), None)
             .await?;
@@ -231,7 +245,17 @@ async fn pump_logs(
     let mut buf_err = String::new();
 
     while let Some(item) = stream.next().await {
-        let out = item.map_err(|e| anyhow!("log stream: {e}"))?;
+        let out = match item {
+            Ok(o) => o,
+            // Container torn down mid-stream (warm-pool discard / teardown race): Docker
+            // answers the in-flight read with 404 "no such container". The job already
+            // produced its output and exit code, so this is an expected end-of-stream, not
+            // a failure — stop reading cleanly instead of surfacing a scary `dokan:` line.
+            Err(bollard::errors::Error::DockerResponseServerError { status_code: 404, .. }) => {
+                break
+            }
+            Err(e) => return Err(anyhow!("log stream: {e}")),
+        };
         let (stream_name, bytes) = match out {
             LogOutput::StdOut { message } => ("stdout", message),
             LogOutput::StdErr { message } => ("stderr", message),

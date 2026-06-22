@@ -69,6 +69,7 @@ pub struct FlowStep {
 pub struct Schedule {
     pub id: i64,
     pub script_id: i64,
+    pub script_name: String,
     pub cron: String,
     pub input: serde_json::Value,
 }
@@ -247,6 +248,18 @@ impl Db {
             .await?)
     }
 
+    /// (status, exit_code) — the retry decision input. A present exit_code means the
+    /// script ran to completion, so a `failed` status is its own deterministic verdict
+    /// (exit≠0), NOT a transient infra failure: retrying it just burns compute and
+    /// reprints findings. Only a NULL exit_code (couldn't execute / timeout) is retryable.
+    pub async fn run_outcome(&self, id: i64) -> Result<Option<(String, Option<i32>)>> {
+        let row = sqlx::query("SELECT status, exit_code FROM runs WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| (r.get("status"), r.get("exit_code"))))
+    }
+
     /// Recent runs, newest first, optionally filtered by status.
     pub async fn list_runs(&self, status: Option<&str>, limit: i64) -> Result<Vec<Run>> {
         let rows = if let Some(st) = status {
@@ -373,7 +386,9 @@ impl Db {
 
     pub async fn enabled_schedules(&self) -> Result<Vec<Schedule>> {
         let rows = sqlx::query(
-            "SELECT id, script_id, cron, input FROM schedules WHERE enabled = true ORDER BY id",
+            "SELECT sc.id, sc.script_id, s.name AS script_name, sc.cron, sc.input \
+             FROM schedules sc JOIN scripts s ON s.id = sc.script_id \
+             WHERE sc.enabled = true ORDER BY sc.id",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -382,6 +397,7 @@ impl Db {
             .map(|r| Schedule {
                 id: r.get("id"),
                 script_id: r.get("script_id"),
+                script_name: r.get("script_name"),
                 cron: r.get("cron"),
                 input: r.get::<Option<serde_json::Value>, _>("input")
                     .unwrap_or(serde_json::json!({})),
@@ -401,8 +417,9 @@ impl Db {
 
     pub async fn list_schedules(&self) -> Result<Vec<Schedule>> {
         let rows = sqlx::query(
-            "SELECT id, script_id, cron, input FROM schedules \
-             WHERE enabled = true ORDER BY id DESC LIMIT 50",
+            "SELECT sc.id, sc.script_id, s.name AS script_name, sc.cron, sc.input \
+             FROM schedules sc JOIN scripts s ON s.id = sc.script_id \
+             WHERE sc.enabled = true ORDER BY sc.id DESC LIMIT 50",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -411,6 +428,7 @@ impl Db {
             .map(|r| Schedule {
                 id: r.get("id"),
                 script_id: r.get("script_id"),
+                script_name: r.get("script_name"),
                 cron: r.get("cron"),
                 input: r.get::<Option<serde_json::Value>, _>("input")
                     .unwrap_or(serde_json::json!({})),

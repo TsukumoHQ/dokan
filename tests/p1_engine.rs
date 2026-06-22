@@ -96,6 +96,79 @@ async fn unroutable_runtime_stays_pending() -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn logs_text(c: &RunningService<RoleClient, ()>, run_id: i64) -> String {
+    let r = call(c, "read_logs", json!({"run_id": run_id, "after_cursor": 0, "limit": 500}))
+        .await
+        .unwrap();
+    r["lines"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|l| l.as_str()).collect::<Vec<_>>().join("\n"))
+        .unwrap_or_default()
+}
+
+/// A script that runs to completion and exits nonzero is a deterministic verdict (a
+/// monitor/gate finding), NOT a transient crash. It must execute exactly once — no 3x
+/// auto-retry that reprints the verdict and burns compute. (Terrain P0, 2 leads.)
+#[tokio::test]
+async fn nonzero_exit_is_not_retried() -> anyhow::Result<()> {
+    let c = spawn().await?;
+    let sid = upload(&c, "bash", "echo VERDICT-LINE\nexit 2\n").await;
+    let run = call(&c, "run_script", json!({"script_id": sid})).await?;
+    let run_id = run["run_id"].as_i64().unwrap();
+    assert_eq!(wait_status(&c, run_id, 60).await, "failed", "nonzero exit -> failed");
+    // Give any (wrongly-scheduled) retry time to fire before counting the verdict.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    let text = logs_text(&c, run_id).await;
+    assert_eq!(
+        text.matches("VERDICT-LINE").count(),
+        1,
+        "verdict printed exactly once, not retried: {text}"
+    );
+    c.cancel().await?;
+    Ok(())
+}
+
+/// Secrets set over MCP are injected as env vars into the job container. (Terrain P0:
+/// leads had no way to provision API keys for monitors.)
+#[tokio::test]
+async fn secret_injected_into_job_env() -> anyhow::Result<()> {
+    let c = spawn().await?;
+    // Unique name so concurrent/other runs against the shared DB can't collide.
+    let set = call(
+        &c,
+        "set_secret",
+        json!({"name": "DOKAN_TEST_KEY", "value": "sekret-42"}),
+    )
+    .await?;
+    assert_eq!(set["status"], "set", "secret set: {set}");
+    let names = call(&c, "list_secrets", json!({})).await?;
+    assert!(
+        names["secrets"].as_array().map(|a| a.iter().any(|n| n == "DOKAN_TEST_KEY")).unwrap_or(false),
+        "secret name listed (value never returned): {names}"
+    );
+    let sid = upload(&c, "bash", "echo KEY=$DOKAN_TEST_KEY\n").await;
+    let run = call(&c, "run_script", json!({"script_id": sid})).await?;
+    let run_id = run["run_id"].as_i64().unwrap();
+    assert_eq!(wait_status(&c, run_id, 60).await, "succeeded", "ran");
+    let text = logs_text(&c, run_id).await;
+    assert!(text.contains("KEY=sekret-42"), "secret reached job env: {text}");
+    c.cancel().await?;
+    Ok(())
+}
+
+/// A 5-field crontab (missing the leading SECONDS column) is rejected loudly instead of
+/// being silently accepted and never firing. (Terrain P2.)
+#[tokio::test]
+async fn invalid_cron_is_rejected() -> anyhow::Result<()> {
+    let c = spawn().await?;
+    let sid = upload(&c, "bash", "echo hi\n").await;
+    let r = call(&c, "schedule", json!({"script_id": sid, "cron": "*/5 * * * *"})).await?;
+    assert_eq!(r["error"], "invalid_cron", "5-field cron rejected: {r}");
+    assert!(r.get("schedule_id").is_none(), "no schedule created: {r}");
+    c.cancel().await?;
+    Ok(())
+}
+
 /// A cron schedule ticking every second enqueues runs that the worker executes.
 #[tokio::test]
 async fn cron_enqueues_runs() -> anyhow::Result<()> {

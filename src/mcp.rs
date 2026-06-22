@@ -133,6 +133,28 @@ pub struct ScheduleArgs {
     pub input: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SetSecretArgs {
+    /// Env var name injected into every job container, e.g. "OPENAI_API_KEY".
+    pub name: String,
+    /// Secret value. Write-only — never returned by any tool, never logged.
+    pub value: String,
+}
+
+/// Validate a tokio-cron-scheduler expression: 6 whitespace-separated fields (the leading
+/// column is SECONDS, unlike standard 5-field crontab). The scheduler silently rejects a
+/// 5-field string by simply never firing, so catch the common mistake loudly up front.
+fn validate_cron(expr: &str) -> std::result::Result<(), String> {
+    let n = expr.split_whitespace().count();
+    if n != 6 {
+        return Err(format!(
+            "cron must be 6 fields (leading SECONDS): `sec min hour day month weekday` — \
+             got {n}. A standard 5-field crontab needs a leading `0 ` (e.g. `0 {expr}`)."
+        ));
+    }
+    Ok(())
+}
+
 #[tool_router]
 impl Dokan {
     pub fn new(
@@ -206,7 +228,7 @@ impl Dokan {
         ok(v)
     }
 
-    #[tool(description = "Upload a script. Returns script_id + version. Runtime: python|node|bash.")]
+    #[tool(description = "Upload a script. Returns script_id + version. Runtime: python|node|bash. INPUT CONTRACT: the script reads its input from the DOKAN_INPUT env var (a JSON string) — NOT stdin or argv. Secrets set via set_secret arrive as their own env vars (e.g. $OPENAI_API_KEY). A nonzero exit is treated as the script's own deterministic verdict (e.g. a monitor finding) and is NOT retried; only a container/infra failure retries.")]
     async fn upload_script(
         &self,
         Parameters(a): Parameters<UploadArgs>,
@@ -417,6 +439,9 @@ impl Dokan {
         let Some(cron) = &self.cron else {
             return ok(json!({"error": "scheduler_disabled"}));
         };
+        if let Err(e) = validate_cron(&a.cron) {
+            return ok(json!({"error": "invalid_cron", "detail": e}));
+        }
         if self.db.get_script(a.script_id).await.map_err(internal)?.is_none() {
             return ok(json!({"error": "script_not_found", "id": a.script_id}));
         }
@@ -432,14 +457,32 @@ impl Dokan {
         ok(json!({"schedule_id": id, "cron": a.cron, "status": "scheduled"}))
     }
 
-    #[tool(description = "List active cron schedules: id, script_id, cron expression.")]
+    #[tool(description = "List active cron schedules: id, script_id, script name, cron expression.")]
     async fn list_schedules(&self) -> Result<CallToolResult, McpError> {
         let rows = self.db.list_schedules().await.map_err(internal)?;
         let items: Vec<_> = rows
             .iter()
-            .map(|s| json!({"schedule_id": s.id, "script_id": s.script_id, "cron": s.cron}))
+            .map(|s| json!({"schedule_id": s.id, "script_id": s.script_id, "script": s.script_name, "cron": s.cron}))
             .collect();
         ok(json!({"schedules": items}))
+    }
+
+    #[tool(description = "Set a secret, injected as an env var into every job container (e.g. OPENAI_API_KEY). Write-only: values are never returned or logged. Upsert by name.")]
+    async fn set_secret(
+        &self,
+        Parameters(a): Parameters<SetSecretArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        if a.name.trim().is_empty() {
+            return ok(json!({"error": "empty_name"}));
+        }
+        self.db.upsert_secret(&a.name, &a.value).await.map_err(internal)?;
+        ok(json!({"name": a.name, "status": "set"}))
+    }
+
+    #[tool(description = "List secret names (values are write-only and never returned). Use to check which keys a job will see in its env.")]
+    async fn list_secrets(&self) -> Result<CallToolResult, McpError> {
+        let names = self.db.secret_names().await.map_err(internal)?;
+        ok(json!({"secrets": names}))
     }
 
     #[tool(description = "Stop a cron schedule: removes the live job and disables it so it won't reload. Always unschedule test/temporary crons.")]

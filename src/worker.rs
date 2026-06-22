@@ -57,10 +57,19 @@ impl Worker {
                                 "attempt" => attempt.to_string()).increment(1);
                             exec.run(&db, job.run_id, &job.runtime, &job.source, &job.input)
                                 .await;
-                            // Retry transient failures up to MAX_ATTEMPTS.
-                            if let Ok(Some(status)) = db.run_status(job.run_id).await {
-                                if status == "failed" && attempt < MAX_ATTEMPTS {
-                                    tracing::warn!(run_id = job.run_id, attempt, "retrying");
+                            // Retry ONLY genuine infra/internal failures. A run that
+                            // produced an exit_code ran to completion — its nonzero is a
+                            // deterministic verdict (a monitor/gate finding), not a crash;
+                            // retrying would reprint findings and waste compute. Only a
+                            // NULL exit_code (couldn't execute / timeout) is transient.
+                            if let Ok(Some((status, exit_code))) =
+                                db.run_outcome(job.run_id).await
+                            {
+                                if status == "failed"
+                                    && exit_code.is_none()
+                                    && attempt < MAX_ATTEMPTS
+                                {
+                                    tracing::warn!(run_id = job.run_id, attempt, "retrying (infra failure)");
                                     metrics::counter!("dokan_runs_retried_total").increment(1);
                                     let _ = db.requeue(job.run_id).await;
                                 }
