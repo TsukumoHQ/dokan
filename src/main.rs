@@ -6,6 +6,7 @@ mod db;
 mod embed;
 mod exec;
 mod flow;
+mod http;
 mod mcp;
 mod pool;
 mod worker;
@@ -60,6 +61,14 @@ struct Cli {
     /// Embedding model cache directory.
     #[arg(long, default_value = ".fastembed_cache", env = "DOKAN_EMBED_CACHE")]
     embed_cache: String,
+
+    /// Relay endpoint: job results POSTed here for the mesh. Optional.
+    #[arg(long, env = "DOKAN_RELAY_URL")]
+    relay_url: Option<String>,
+
+    /// Bearer token required on the HTTP surface (MCP + UI). Unset = open.
+    #[arg(long, env = "DOKAN_TOKEN")]
+    token: Option<String>,
 }
 
 #[tokio::main]
@@ -76,7 +85,11 @@ async fn main() -> Result<()> {
     db.migrate().await?;
     tracing::info!("db connected + migrated");
 
-    let exec = Arc::new(Executor::connect(cli.warm_idle)?);
+    // Prometheus recorder (global). /metrics renders from this handle.
+    let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .install_recorder()?;
+
+    let exec = Arc::new(Executor::connect(cli.warm_idle, cli.relay_url.clone())?);
     tracing::info!(warm_idle = cli.warm_idle, "docker connected, warm pool armed");
 
     // Optional local embeddings for semantic search.
@@ -110,7 +123,7 @@ async fn main() -> Result<()> {
 
     match cli.transport.as_str() {
         "stdio" => serve_stdio(db, exec, cron, embedder).await,
-        "http" => serve_http(db, exec, cron, embedder, &cli.addr).await,
+        "http" => serve_http(db, exec, cron, embedder, metrics_handle, cli.token, &cli.addr).await,
         other => anyhow::bail!("unknown transport: {other} (use stdio|http)"),
     }
 }
@@ -135,20 +148,39 @@ async fn serve_http(
     exec: Arc<Executor>,
     cron: Arc<Cron>,
     embedder: Option<crate::embed::Embedder>,
+    metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
+    token: Option<String>,
     addr: &str,
 ) -> Result<()> {
     use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
     use rmcp::transport::streamable_http_server::StreamableHttpService;
 
+    let db_for_mcp = db.clone();
     let service = StreamableHttpService::new(
-        move || Ok(Dokan::new(db.clone(), exec.clone(), Some(cron.clone()), embedder.clone())),
+        move || {
+            Ok(Dokan::new(
+                db_for_mcp.clone(),
+                exec.clone(),
+                Some(cron.clone()),
+                embedder.clone(),
+            ))
+        },
         LocalSessionManager::default().into(),
         Default::default(),
     );
 
-    let app = axum::Router::new().nest_service("/mcp", service);
+    let state = http::AppState {
+        db,
+        metrics: metrics_handle,
+    };
+    // MCP control plane + thin operator UI, behind one bearer-token gate.
+    let app = axum::Router::new()
+        .nest_service("/mcp", service)
+        .merge(http::operator_router(state))
+        .layer(axum::middleware::from_fn_with_state(token, http::auth));
+
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!("dokan MCP listening on http://{addr}/mcp");
+    tracing::info!("dokan listening: MCP http://{addr}/mcp · UI http://{addr}/");
     axum::serve(listener, app).await?;
     Ok(())
 }

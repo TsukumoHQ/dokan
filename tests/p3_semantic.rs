@@ -39,20 +39,19 @@ async fn semantic_ranks_without_lexical_overlap() -> anyhow::Result<()> {
         )?)
         .await?;
 
-    // Distinct intents, each as a description.
-    let mut ids = std::collections::HashMap::new();
+    // Distinct intents, each as a description. (DB is shared across runs, so assert on
+    // the matched *description*, not a per-run id — duplicates may exist.)
     for (name, desc) in [
         ("a", "back up the production database and store the dump in s3"),
         ("b", "post a chat message to the team messaging channel"),
         ("c", "generate small preview thumbnails from uploaded photos"),
     ] {
-        let r = call(
+        call(
             &c,
             "upload_script",
             json!({"name": name, "runtime":"bash", "source":"echo hi\n", "description": desc}),
         )
         .await;
-        ids.insert(name, r["script_id"].as_i64().unwrap());
     }
 
     // Query shares NO words with description "a" (no "backup"/"database"/"s3"/"dump").
@@ -67,8 +66,11 @@ async fn semantic_ranks_without_lexical_overlap() -> anyhow::Result<()> {
     assert_eq!(res["mode"], "semantic", "embedder active");
     let results = res["results"].as_array().expect("results");
     assert!(!results.is_empty(), "semantic returned candidates");
-    let top = results[0]["id"].as_i64().unwrap();
-    assert_eq!(top, ids["a"], "backup/db script ranked first semantically");
+    let top_desc = results[0]["desc"].as_str().unwrap_or("");
+    assert!(
+        top_desc.contains("back up") && top_desc.contains("database"),
+        "backup/db intent ranked first semantically, got: {top_desc}"
+    );
 
     c.cancel().await?;
     Ok(())

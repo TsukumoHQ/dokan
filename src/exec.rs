@@ -24,6 +24,9 @@ pub struct Executor {
     pool: Arc<WarmPool>,
     /// run_id -> container_id for in-flight jobs, so `cancel` can kill the right one.
     active: Arc<Mutex<HashMap<i64, String>>>,
+    /// Optional relay endpoint: job results POSTed here for the mesh (PRD §5).
+    relay: Option<String>,
+    http: reqwest::Client,
 }
 
 /// Maps a declared runtime to its base image and in-container interpreter.
@@ -37,7 +40,7 @@ pub fn runtime_spec(runtime: &str) -> Option<(&'static str, &'static str)> {
 }
 
 impl Executor {
-    pub fn connect(warm_idle: usize) -> Result<Self> {
+    pub fn connect(warm_idle: usize, relay: Option<String>) -> Result<Self> {
         // Honor DOCKER_HOST (Colima/Docker Desktop sockets live outside /var/run).
         let docker = if std::env::var("DOCKER_HOST").is_ok() {
             Docker::connect_with_defaults()?
@@ -49,7 +52,21 @@ impl Executor {
             docker,
             pool,
             active: Arc::new(Mutex::new(HashMap::new())),
+            relay,
+            http: reqwest::Client::new(),
         })
+    }
+
+    /// Record terminal metrics and POST the result to the relay (mesh egress).
+    async fn finalize(&self, run_id: i64, status: &str, exit_code: Option<i32>) {
+        metrics::counter!("dokan_runs_finished_total", "status" => status.to_string())
+            .increment(1);
+        if let Some(url) = &self.relay {
+            let body = serde_json::json!({
+                "run_id": run_id, "status": status, "exit_code": exit_code,
+            });
+            let _ = self.http.post(url).json(&body).send().await;
+        }
     }
 
     /// Kill a running job's container (best-effort).
@@ -75,6 +92,7 @@ impl Executor {
             let seq = db.max_log_seq(run_id).await.unwrap_or(0) + 1;
             let _ = db.append_log(run_id, seq, "stderr", &format!("dokan: {msg}")).await;
             let _ = db.finish_run(run_id, "failed", None, Some(&msg)).await;
+            self.finalize(run_id, "failed", None).await;
         }
         self.active.lock().unwrap().remove(&run_id);
     }
@@ -114,17 +132,25 @@ impl Executor {
             "printf '%s' \"$DOKAN_SRC\" | base64 -d > /tmp/dokan_script && exec {interp} /tmp/dokan_script"
         );
 
+        // Inject configured secrets as env vars (best-effort; never logged).
+        let mut env = vec![
+            format!("DOKAN_SRC={src_b64}"),
+            format!("DOKAN_INPUT={input}"),
+            format!("DOKAN_RUN_ID={run_id}"),
+        ];
+        if let Ok(secrets) = db.all_secrets().await {
+            for (k, v) in secrets {
+                env.push(format!("{k}={v}"));
+            }
+        }
+
         let exec = self
             .docker
             .create_exec(
                 cid,
                 CreateExecOptions {
                     cmd: Some(vec!["sh".into(), "-c".into(), bootstrap]),
-                    env: Some(vec![
-                        format!("DOKAN_SRC={src_b64}"),
-                        format!("DOKAN_INPUT={input}"),
-                        format!("DOKAN_RUN_ID={run_id}"),
-                    ]),
+                    env: Some(env),
                     attach_stdout: Some(true),
                     attach_stderr: Some(true),
                     ..Default::default()
@@ -156,6 +182,7 @@ impl Executor {
                 db.append_log(run_id, s, "stderr", "dokan: timeout, container killed")
                     .await?;
                 db.finish_run(run_id, "failed", None, Some("timeout")).await?;
+                self.finalize(run_id, "failed", None).await;
                 return Ok(());
             }
         };
@@ -166,6 +193,7 @@ impl Executor {
         let status = if exit_code == 0 { "succeeded" } else { "failed" };
         db.finish_run(run_id, status, Some(exit_code as i32), None)
             .await?;
+        self.finalize(run_id, status, Some(exit_code as i32)).await;
         Ok(())
     }
 }

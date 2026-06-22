@@ -96,3 +96,10 @@ CREATE TABLE IF NOT EXISTS flow_steps (
 );
 
 CREATE INDEX IF NOT EXISTS idx_flow_steps_run ON flow_steps (flow_run_id);
+
+-- Secrets (P3): injected as env vars into every job. Values masked in the UI/API.
+CREATE TABLE IF NOT EXISTS secrets (
+    name       TEXT PRIMARY KEY,
+    value      TEXT        NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);

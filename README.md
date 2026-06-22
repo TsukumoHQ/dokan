@@ -6,11 +6,16 @@ Your coding agent uploads, runs, and reads logs over MCP. No UI clicks. The plat
 
 ## Status
 
-**P0 — Proof shipped.** The wedge (PRD §11 step 4) is implemented and passing end-to-end: an MCP client stands up a script and runs it with zero human interaction.
+**P0–P3 shipped and tested** (8 integration tests, all green against live Postgres + Docker).
 
 ```
 ✅ WEDGE PROVEN: agent uploaded + ran + read logs over MCP, zero UI.
 ```
+
+- **P0 Proof** — agent uploads + runs + reads logs over MCP, zero UI.
+- **P1 Engine** — SKIP LOCKED queue, warm pool, capability routing, cron, retries.
+- **P2 Flows** — declarative `compose_flow` DAG, step-boundary durability, dep passing.
+- **P3 Scale/ops** — semantic search (fastembed+pgvector), Prometheus metrics, thin UI + SSE tail, secrets, relay egress, bearer auth.
 
 ## Architecture (this slice)
 
@@ -31,8 +36,26 @@ Your coding agent uploads, runs, and reads logs over MCP. No UI clicks. The plat
 | `wait_for` | long-poll to terminal status + tail |
 | `list_runs` | server-side status counts + recent rows |
 | `cancel` | kill container + mark canceled |
+| `compose_flow` | declarative DAG spec → `flow_id` (validated acyclic) — wire-over-MCP |
+| `run_flow` / `get_flow_run` | run a DAG; poll overall + per-step status/output |
+| `schedule` / `list_schedules` | cron a script (6-field, leading seconds) |
 
-Server instructions ship in-band so the agent self-limits (paginate, project fields, don't fetch bodies).
+Server instructions ship in-band so the agent self-limits (paginate, project fields, don't fetch bodies). Semantic ranking via local embeddings (`--embed`), substring fallback otherwise.
+
+## Operator surface (HTTP, humans)
+
+`dokan --transport http` also serves a thin UI + API behind an optional bearer token (`DOKAN_TOKEN`):
+
+| Route | Purpose |
+|---|---|
+| `GET /` | self-refreshing run list |
+| `GET/POST /api/runs` | list / trigger a run |
+| `GET /api/runs/{id}/logs` | cursor logs |
+| `GET /api/runs/{id}/stream` | live SSE log tail |
+| `GET/POST /api/secrets` | write-only secrets (injected as job env) |
+| `GET /metrics` | Prometheus (`dokan_runs_*`) → Grafana |
+
+Job results POST to `DOKAN_RELAY_URL` on completion (mesh egress).
 
 ## Quickstart
 
@@ -67,13 +90,24 @@ dokan --transport http --addr 127.0.0.1:8088   # MCP at http://127.0.0.1:8088/mc
 | `--database-url` / `DATABASE_URL` | `postgres://dokan:dokan@127.0.0.1:5499/dokan` |
 | `DOCKER_HOST` | local socket if unset |
 
+## Worker / semantic / ops config (P1–P3)
+
+| Flag / env | Purpose |
+|---|---|
+| `--caps` / `DOKAN_CAPS` | runtimes this worker serves (routing) |
+| `--concurrency` / `DOKAN_CONCURRENCY` | max concurrent jobs |
+| `--warm-idle` / `DOKAN_WARM_IDLE` | warm containers kept per image |
+| `--embed` / `DOKAN_EMBED` | enable semantic search |
+| `--relay-url` / `DOKAN_RELAY_URL` | mesh egress endpoint |
+| `--token` / `DOKAN_TOKEN` | bearer token for the HTTP surface |
+
 ## Roadmap (per PRD §12)
 
-- **P0 — Proof** ✅ single-host, one runtime, agent-operated run+logs over MCP.
-- **P1 — Engine** — `SKIP LOCKED` queue, warm pool (deadpool/bollard), multi-worker capability routing, cron, resource caps.
-- **P2 — Flows** — declarative `compose_flow`, DAG, step-boundary durability, retries.
-- **P3 — Scale/ops** — N workers, semantic registry (fastembed+pgvector), Grafana/Loki, thin UI, relay egress, OAuth/RBAC.
-- **P4 — Enterprise** — SSO, audit, HA, persistent-service engine, micro-VM isolation for untrusted code.
+- **P0 — Proof** ✅ agent-operated run+logs over MCP.
+- **P1 — Engine** ✅ `SKIP LOCKED` queue, warm pool, capability routing, cron, retries, resource caps.
+- **P2 — Flows** ✅ declarative `compose_flow`, DAG, step-boundary durability, retries.
+- **P3 — Scale/ops** ✅ semantic registry (fastembed+pgvector), Prometheus metrics, thin UI + SSE, secrets, relay egress, bearer auth. Multi-worker = run more processes vs the same Postgres.
+- **P4 — Enterprise** (next) — SSO/OAuth 2.1 (available via rmcp), audit, HA, persistent-service engine, micro-VM isolation, Loki shipping + Grafana dashboards.
 
 ## License
 

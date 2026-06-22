@@ -384,6 +384,37 @@ impl Db {
             .collect())
     }
 
+    // ---- secrets (P3) ----
+
+    pub async fn upsert_secret(&self, name: &str, value: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO secrets (name, value) VALUES ($1, $2) \
+             ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value",
+        )
+        .bind(name)
+        .bind(value)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn secret_names(&self) -> Result<Vec<String>> {
+        Ok(sqlx::query_scalar("SELECT name FROM secrets ORDER BY name")
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
+    /// All secrets as (name, value) — injected into job env at execution time.
+    pub async fn all_secrets(&self) -> Result<Vec<(String, String)>> {
+        let rows = sqlx::query("SELECT name, value FROM secrets")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.get::<String, _>("name"), r.get::<String, _>("value")))
+            .collect())
+    }
+
     // ---- flows (P2) ----
 
     pub async fn insert_flow(&self, name: &str, spec: &serde_json::Value) -> Result<i64> {

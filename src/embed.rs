@@ -8,6 +8,8 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 
+/// Embedding dimensionality (BGE-small) — must match `scripts.embedding vector(384)`.
+#[allow(dead_code)]
 pub const DIM: usize = 384;
 
 #[derive(Clone)]
