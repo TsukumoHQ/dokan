@@ -180,6 +180,7 @@ async fn main() -> Result<()> {
             tracing::info!(containers = swept, "swept orphaned warm containers at startup");
         }
         exec.arm_pool();
+        exec.prewarm(); // pull + warm runtime images now, not on the first job
         Worker::new(db.clone(), exec.clone(), cli.caps.clone(), cli.concurrency).spawn();
         // Flow engine drives DAGs by enqueuing each step as a normal run.
         flow::FlowEngine::new(db.clone(), exec.clone()).start().await?;

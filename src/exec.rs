@@ -94,6 +94,12 @@ impl Executor {
         self.pool.limits()
     }
 
+    /// Pre-pull + pre-warm the known runtime images at startup so the first job of each
+    /// runtime doesn't eat the image-pull / cold-create tail. (Perf #3.)
+    pub fn prewarm(&self) {
+        self.pool.prewarm(&["python:3.12-slim", "node:22-slim", "alpine:3.20"]);
+    }
+
     /// Reclaim warm containers orphaned by a crashed dokan. Run at executor startup.
     pub async fn sweep_orphans(&self) -> usize {
         self.pool.sweep_orphans().await
@@ -317,6 +323,23 @@ async fn pump_logs(
     let mut buf_out = String::new();
     let mut buf_err = String::new();
     let mut result: Option<String> = None;
+    // Accumulate lines and write them in batches (one INSERT per chunk, not per line).
+    let mut batch: Vec<(i64, &'static str, String)> = Vec::new();
+
+    async fn flush(
+        db: &Db,
+        run_id: i64,
+        batch: &mut Vec<(i64, &'static str, String)>,
+    ) -> Result<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let rows: Vec<(i64, &str, &str)> =
+            batch.iter().map(|(s, st, l)| (*s, *st, l.as_str())).collect();
+        db.append_logs_batch(run_id, &rows).await?;
+        batch.clear();
+        Ok(())
+    }
 
     while let Some(item) = stream.next().await {
         let out = match item {
@@ -330,7 +353,7 @@ async fn pump_logs(
             }
             Err(e) => return Err(anyhow!("log stream: {e}")),
         };
-        let (stream_name, bytes) = match out {
+        let (stream_name, bytes): (&'static str, _) = match out {
             LogOutput::StdOut { message } => ("stdout", message),
             LogOutput::StdErr { message } => ("stderr", message),
             LogOutput::Console { message } => ("stdout", message),
@@ -349,9 +372,14 @@ async fn pump_logs(
                 }
             }
             seq += 1;
-            db.append_log(run_id, seq, stream_name, line).await?;
+            batch.push((seq, stream_name, line.to_string()));
             metrics::counter!("dokan_log_lines_total", "stream" => stream_name).increment(1);
+            if batch.len() >= 256 {
+                flush(db, run_id, &mut batch).await?;
+            }
         }
+        // Flush at chunk boundaries so the live tail stays fresh.
+        flush(db, run_id, &mut batch).await?;
     }
     for (stream_name, buf) in [("stdout", &buf_out), ("stderr", &buf_err)] {
         if buf.is_empty() {
@@ -364,8 +392,9 @@ async fn pump_logs(
             }
         }
         seq += 1;
-        db.append_log(run_id, seq, stream_name, buf).await?;
+        batch.push((seq, stream_name, buf.clone()));
         metrics::counter!("dokan_log_lines_total", "stream" => stream_name).increment(1);
     }
+    flush(db, run_id, &mut batch).await?;
     Ok((seq, result))
 }

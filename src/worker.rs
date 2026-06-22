@@ -16,6 +16,9 @@ use crate::exec::Executor;
 
 const MAX_ATTEMPTS: i32 = 3;
 const IDLE_POLL: Duration = Duration::from_millis(300);
+/// Fallback re-check window when waiting on LISTEN/NOTIFY — bounds the cost of a missed
+/// notification without the constant churn of tight polling.
+const FALLBACK_POLL: Duration = Duration::from_secs(3);
 
 #[derive(Clone)]
 pub struct Worker {
@@ -39,6 +42,16 @@ impl Worker {
     pub fn spawn(self) {
         tokio::spawn(async move {
             tracing::info!(caps = ?self.caps, "worker started");
+            // Wake on enqueue via LISTEN/NOTIFY instead of polling; the fallback timeout
+            // covers any missed notify (and cron/other inserts). Degrades to polling if the
+            // listener can't connect. (Perf #1.)
+            let mut listener = match self.db.run_queue_listener().await {
+                Ok(l) => Some(l),
+                Err(e) => {
+                    tracing::warn!("run-queue listener unavailable, polling: {e}");
+                    None
+                }
+            };
             loop {
                 // Block until a slot is free, then try to claim work.
                 let permit = match self.slots.clone().acquire_owned().await {
@@ -85,7 +98,14 @@ impl Worker {
                     }
                     Ok(None) => {
                         drop(permit);
-                        tokio::time::sleep(IDLE_POLL).await;
+                        // Idle: wait for an enqueue notification, or wake after a short
+                        // fallback to re-check (covers missed notifies + already-pending rows).
+                        match &mut listener {
+                            Some(l) => {
+                                let _ = tokio::time::timeout(FALLBACK_POLL, l.recv()).await;
+                            }
+                            None => tokio::time::sleep(IDLE_POLL).await,
+                        }
                     }
                     Err(e) => {
                         drop(permit);

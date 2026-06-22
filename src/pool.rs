@@ -56,6 +56,15 @@ impl WarmPool {
         (self.mem_bytes, self.nano_cpus)
     }
 
+    /// Mark images as wanted so the filler pulls + warms them now (instead of lazily on the
+    /// first acquire). Call once on the executor after arm().
+    pub fn prewarm(&self, images: &[&str]) {
+        let mut known = self.known.lock().unwrap();
+        for img in images {
+            known.insert(img.to_string());
+        }
+    }
+
     /// Remove warm containers left behind by a previously-crashed dokan (labeled
     /// `dokan.role=warm`). Run at executor startup: in the single-executor model these are
     /// always orphans, so reclaiming them stops the slow Docker-host saturation that caused

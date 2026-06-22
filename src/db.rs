@@ -1,6 +1,9 @@
 //! Postgres-backed state: scripts, runs, logs. Plain runtime queries (no compile-time
 //! macros) so the build needs no live DB or offline `.sqlx` cache.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use sqlx::postgres::{PgPool, PgPoolOptions};
@@ -9,6 +12,15 @@ use sqlx::Row;
 #[derive(Clone)]
 pub struct Db {
     pub pool: PgPool,
+    /// Per-run secret injection is hot; cache the merged secrets per agent, keyed by the
+    /// secrets generation so a change invalidates it. Avoids scanning the secret tables on
+    /// every job. (Perf #4.)
+    secrets_cache: Arc<Mutex<SecretsCache>>,
+}
+
+struct SecretsCache {
+    generation: i64,
+    by_agent: HashMap<Option<String>, Vec<(String, String)>>,
 }
 
 #[derive(Debug, Clone)]
@@ -95,10 +107,24 @@ pub struct LogLine {
 impl Db {
     pub async fn connect(url: &str) -> Result<Self> {
         let pool = PgPoolOptions::new()
-            .max_connections(20)
+            .max_connections(32)
             .connect(url)
             .await?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            secrets_cache: Arc::new(Mutex::new(SecretsCache {
+                generation: -1, // sentinel: first lookup misses
+                by_agent: HashMap::new(),
+            })),
+        })
+    }
+
+    /// A dedicated Postgres listener on the run-queue channel — lets a worker wake on
+    /// enqueue instead of polling. (Perf #1.)
+    pub async fn run_queue_listener(&self) -> Result<sqlx::postgres::PgListener> {
+        let mut l = sqlx::postgres::PgListener::connect_with(&self.pool).await?;
+        l.listen("dokan_runs").await?;
+        Ok(l)
     }
 
     pub async fn migrate(&self) -> Result<()> {
@@ -330,7 +356,16 @@ impl Db {
         .bind(agent_id)
         .fetch_one(&self.pool)
         .await?;
+        self.notify_runs().await;
         Ok(id)
+    }
+
+    /// Wake any listening worker (Perf #1). Best-effort — a missed notify is covered by the
+    /// worker's fallback timeout.
+    async fn notify_runs(&self) {
+        let _ = sqlx::query("SELECT pg_notify('dokan_runs', '')")
+            .execute(&self.pool)
+            .await;
     }
 
     /// Count an agent's in-flight runs (pending or running) — the quota enforcement input.
@@ -690,9 +725,32 @@ impl Db {
     }
 
     /// (name, value) pairs injected into a job's env: global secrets plus the triggering
-    /// agent's scoped secrets, scoped overriding global on a name clash.
+    /// agent's scoped secrets, scoped overriding global on a name clash. Cached per agent
+    /// and keyed by the secrets generation (a tiny PK lookup), so the value scan is skipped
+    /// on hits.
     pub async fn all_secrets_for(&self, agent_id: Option<&str>) -> Result<Vec<(String, String)>> {
-        let mut map: std::collections::HashMap<String, String> =
+        let secrets_gen = self.secrets_generation().await?;
+        let key = agent_id.map(String::from);
+        {
+            let c = self.secrets_cache.lock().unwrap();
+            if c.generation == secrets_gen {
+                if let Some(v) = c.by_agent.get(&key) {
+                    return Ok(v.clone());
+                }
+            }
+        }
+        let merged = self.load_secrets_for(agent_id).await?;
+        let mut c = self.secrets_cache.lock().unwrap();
+        if c.generation != secrets_gen {
+            c.generation = secrets_gen;
+            c.by_agent.clear();
+        }
+        c.by_agent.insert(key, merged.clone());
+        Ok(merged)
+    }
+
+    async fn load_secrets_for(&self, agent_id: Option<&str>) -> Result<Vec<(String, String)>> {
+        let mut map: HashMap<String, String> =
             sqlx::query("SELECT name, value FROM secrets")
                 .fetch_all(&self.pool)
                 .await?
@@ -786,6 +844,9 @@ impl Db {
         .bind(result)
         .fetch_all(&self.pool)
         .await?;
+        if !ids.is_empty() {
+            self.notify_runs().await; // wake a worker for the freshly-enqueued target runs
+        }
         Ok(ids)
     }
 
@@ -983,6 +1044,29 @@ impl Db {
         .bind(seq)
         .bind(stream)
         .bind(line)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Batch-insert log lines in ONE round-trip via UNNEST — a chatty job no longer pays a
+    /// query per line. (Perf #2.) `rows` is (seq, stream, line).
+    pub async fn append_logs_batch(&self, run_id: i64, rows: &[(i64, &str, &str)]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let seqs: Vec<i64> = rows.iter().map(|r| r.0).collect();
+        let streams: Vec<String> = rows.iter().map(|r| r.1.to_string()).collect();
+        let lines: Vec<String> = rows.iter().map(|r| r.2.to_string()).collect();
+        sqlx::query(
+            "INSERT INTO logs (run_id, seq, stream, line) \
+             SELECT $1, s, st, ln FROM unnest($2::bigint[], $3::text[], $4::text[]) AS t(s, st, ln) \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(run_id)
+        .bind(&seqs)
+        .bind(&streams)
+        .bind(&lines)
         .execute(&self.pool)
         .await?;
         Ok(())
