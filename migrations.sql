@@ -144,3 +144,17 @@ CREATE TABLE IF NOT EXISTS agent_secrets (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (agent_id, name)
 );
+
+-- Agent-defined triggers: reactive composition without an external orchestrator. When a
+-- run of source_script emits a structured result that CONTAINS `predicate` (JSONB @>),
+-- the executor enqueues target_script. Fires server-side in one query at result time.
+CREATE TABLE IF NOT EXISTS triggers (
+    id               BIGSERIAL PRIMARY KEY,
+    source_script_id BIGINT      NOT NULL REFERENCES scripts (id),
+    predicate        JSONB       NOT NULL DEFAULT '{}',
+    target_script_id BIGINT      NOT NULL REFERENCES scripts (id),
+    agent_id         TEXT,
+    enabled          BOOLEAN     NOT NULL DEFAULT true,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_triggers_source ON triggers (source_script_id) WHERE enabled;

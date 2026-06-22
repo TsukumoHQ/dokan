@@ -194,6 +194,25 @@ pub struct DeleteScriptArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct OnResultArgs {
+    /// Watch runs of this script.
+    pub source_script_id: i64,
+    /// Fire when the run's structured result CONTAINS this object (JSONB superset match),
+    /// e.g. {"alert": true}. Empty {} fires on any result.
+    pub predicate: Option<serde_json::Value>,
+    /// Script to enqueue when the predicate matches. It receives
+    /// {trigger_result, source_run_id} as DOKAN_INPUT.
+    pub target_script_id: i64,
+    /// Your agent id — the enqueued run inherits it (provenance + scoped secrets + quota).
+    pub agent_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DeleteTriggerArgs {
+    pub trigger_id: i64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SetSecretArgs {
     /// Env var name injected into a job container, e.g. "OPENAI_API_KEY".
     pub name: String,
@@ -354,6 +373,48 @@ impl Dokan {
             ));
         }
         ok(out)
+    }
+
+    #[tool(description = "Register a reactive trigger: when a run of source_script emits a result CONTAINING predicate (e.g. {\"alert\":true}), enqueue target_script with {trigger_result, source_run_id} as input. Event-driven composition with no external orchestrator. Returns trigger_id.")]
+    async fn on_result(
+        &self,
+        Parameters(a): Parameters<OnResultArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        for id in [a.source_script_id, a.target_script_id] {
+            if self.db.get_script(id).await.map_err(internal)?.is_none() {
+                return ok(json!({"error": "script_not_found", "id": id}));
+            }
+        }
+        let predicate = a.predicate.unwrap_or(json!({}));
+        if !predicate.is_object() {
+            return ok(json!({"error": "predicate_must_be_object"}));
+        }
+        let id = self
+            .db
+            .insert_trigger(
+                a.source_script_id,
+                &predicate,
+                a.target_script_id,
+                a.agent_id.as_deref(),
+            )
+            .await
+            .map_err(internal)?;
+        ok(json!({"trigger_id": id, "status": "armed"}))
+    }
+
+    #[tool(description = "List active reactive triggers (on/when/run + agent).")]
+    async fn list_triggers(&self) -> Result<CallToolResult, McpError> {
+        let items = self.db.list_triggers().await.map_err(internal)?;
+        ok(json!({"triggers": items}))
+    }
+
+    #[tool(description = "Delete a reactive trigger by id.")]
+    async fn delete_trigger(
+        &self,
+        Parameters(a): Parameters<DeleteTriggerArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let removed = self.db.delete_trigger(a.trigger_id).await.map_err(internal)?;
+        ok(json!({"trigger_id": a.trigger_id, "status": if removed {"deleted"} else {"not_found"}}))
     }
 
     /// Embed name + description for semantic search (best-effort; None when no embedder).

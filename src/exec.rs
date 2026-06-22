@@ -272,6 +272,16 @@ impl Executor {
             .await?;
         if let Some(r) = &result {
             let _ = db.set_run_result(run_id, r).await;
+            // Reactive composition: fire agent-defined triggers whose predicate the result
+            // matches, enqueuing their target scripts. No external orchestrator.
+            match db.fire_triggers(run_id, r).await {
+                Ok(fired) if !fired.is_empty() => {
+                    metrics::counter!("dokan_triggers_fired_total").increment(fired.len() as u64);
+                    tracing::info!(run_id, fired = ?fired, "result matched triggers");
+                }
+                Err(e) => tracing::error!(run_id, "fire_triggers: {e}"),
+                _ => {}
+            }
         }
         self.finalize(run_id, status, Some(exit_code as i32), result).await;
         Ok(())

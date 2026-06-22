@@ -711,6 +711,84 @@ impl Db {
         Ok(map.into_iter().collect())
     }
 
+    // ---- triggers (reactive composition) ----
+
+    pub async fn insert_trigger(
+        &self,
+        source_script_id: i64,
+        predicate: &serde_json::Value,
+        target_script_id: i64,
+        agent_id: Option<&str>,
+    ) -> Result<i64> {
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO triggers (source_script_id, predicate, target_script_id, agent_id) \
+             VALUES ($1, $2, $3, $4) RETURNING id",
+        )
+        .bind(source_script_id)
+        .bind(predicate)
+        .bind(target_script_id)
+        .bind(agent_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    pub async fn list_triggers(&self) -> Result<Vec<serde_json::Value>> {
+        let rows = sqlx::query(
+            "SELECT t.id, t.source_script_id, ss.name AS source_name, t.predicate, \
+                    t.target_script_id, ts.name AS target_name, t.agent_id \
+             FROM triggers t \
+             JOIN scripts ss ON ss.id = t.source_script_id \
+             JOIN scripts ts ON ts.id = t.target_script_id \
+             WHERE t.enabled ORDER BY t.id DESC LIMIT 100",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                serde_json::json!({
+                    "trigger_id": r.get::<i64, _>("id"),
+                    "on": { "script_id": r.get::<i64, _>("source_script_id"), "name": r.get::<String, _>("source_name") },
+                    "when": r.get::<serde_json::Value, _>("predicate"),
+                    "run": { "script_id": r.get::<i64, _>("target_script_id"), "name": r.get::<String, _>("target_name") },
+                    "agent_id": r.get::<Option<String>, _>("agent_id"),
+                })
+            })
+            .collect())
+    }
+
+    pub async fn delete_trigger(&self, id: i64) -> Result<bool> {
+        let r = sqlx::query("DELETE FROM triggers WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// Fire every enabled trigger whose source matches this run's script and whose predicate
+    /// is CONTAINED in the run's result (JSONB `@>`). Each match enqueues its target script,
+    /// passing `{trigger_result, source_run_id}` as input and inheriting the trigger's
+    /// agent. One server-side query; returns the enqueued run ids.
+    pub async fn fire_triggers(&self, run_id: i64, result: &serde_json::Value) -> Result<Vec<i64>> {
+        let ids: Vec<i64> = sqlx::query_scalar(
+            "INSERT INTO runs (script_id, input, status, agent_id) \
+             SELECT t.target_script_id, \
+                    jsonb_build_object('trigger_result', $2::jsonb, 'source_run_id', $1), \
+                    'pending', t.agent_id \
+             FROM triggers t \
+             WHERE t.enabled \
+               AND t.source_script_id = (SELECT script_id FROM runs WHERE id = $1) \
+               AND $2::jsonb @> t.predicate \
+             RETURNING id",
+        )
+        .bind(run_id)
+        .bind(result)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(ids)
+    }
+
     // ---- flows (P2) ----
 
     pub async fn insert_flow(&self, name: &str, spec: &serde_json::Value) -> Result<i64> {

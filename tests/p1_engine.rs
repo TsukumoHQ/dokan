@@ -308,6 +308,42 @@ async fn agent_scoped_secrets_and_whoami() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// on_result reactive trigger: a result containing the predicate enqueues the target with
+/// {trigger_result, source_run_id} as input. No external orchestrator. (Moat #3.)
+#[tokio::test]
+async fn on_result_fires_target() -> anyhow::Result<()> {
+    let c = spawn().await?;
+    let src = upload(&c, "bash", "echo '::dokan:result:: {\"alert\":true,\"sev\":9}'\n").await;
+    let tgt = upload(&c, "bash", "echo \"GOT $DOKAN_INPUT\"\n").await;
+    let t = call(&c, "on_result", json!({
+        "source_script_id": src, "predicate": {"alert": true}, "target_script_id": tgt
+    })).await?;
+    assert_eq!(t["status"], "armed", "trigger armed: {t}");
+
+    let r = call(&c, "run_script", json!({"script_id": src})).await?;
+    assert_eq!(wait_status(&c, r["run_id"].as_i64().unwrap(), 60).await, "succeeded", "source ran");
+
+    // The trigger should enqueue a run of the target script.
+    let mut target_run = None;
+    for _ in 0..24 {
+        let runs = call(&c, "list_runs", json!({"limit": 50})).await?;
+        if let Some(run) = runs["recent"].as_array().unwrap()
+            .iter().find(|x| x["script_id"].as_i64() == Some(tgt))
+        {
+            target_run = run["run_id"].as_i64();
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    let tid = target_run.expect("trigger enqueued a target run");
+    assert_eq!(wait_status(&c, tid, 60).await, "succeeded", "target ran");
+    let logs = logs_text(&c, tid).await;
+    assert!(logs.contains("trigger_result"), "target got the result as input: {logs}");
+    assert!(logs.contains("\"sev\":9"), "result payload passed through: {logs}");
+    c.cancel().await?;
+    Ok(())
+}
+
 /// A 5-field crontab (missing the leading SECONDS column) is rejected loudly instead of
 /// being silently accepted and never firing. (Terrain P2.)
 #[tokio::test]
