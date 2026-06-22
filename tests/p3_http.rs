@@ -113,6 +113,18 @@ async fn operator_surface_and_relay() -> anyhow::Result<()> {
     }
     assert!(succeeded, "triggered run reached succeeded");
 
+    // 5b. Cancel is wired and guards terminal runs: canceling a succeeded run -> 409.
+    let r = cli
+        .post(format!("{base}/api/runs/{run_id}/cancel"))
+        .header("authorization", &auth)
+        .send()
+        .await?;
+    assert_eq!(r.status(), 409, "cancel on terminal run rejected");
+    assert_eq!(
+        r.json::<serde_json::Value>().await?["status"], "succeeded",
+        "409 body reports current status"
+    );
+
     // 6. Relay received the finish notification.
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(hits.load(Ordering::SeqCst) >= 1, "relay egress fired");

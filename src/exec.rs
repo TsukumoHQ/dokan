@@ -87,14 +87,33 @@ impl Executor {
         source: &str,
         input: &serde_json::Value,
     ) {
+        let t0 = std::time::Instant::now();
+        metrics::gauge!("dokan_runs_active").increment(1.0);
+        let mut terminal = "succeeded";
         if let Err(e) = self.run_inner(db, run_id, runtime, source, input).await {
+            // Err here = dokan-side failure (could not execute) — distinct from a script
+            // that ran and exited nonzero, which finishes inside exec_job.
+            metrics::counter!("dokan_run_internal_errors_total").increment(1);
             let msg = e.to_string();
             let seq = db.max_log_seq(run_id).await.unwrap_or(0) + 1;
             let _ = db.append_log(run_id, seq, "stderr", &format!("dokan: {msg}")).await;
             let _ = db.finish_run(run_id, "failed", None, Some(&msg)).await;
             self.finalize(run_id, "failed", None).await;
+            terminal = "failed";
         }
         self.active.lock().unwrap().remove(&run_id);
+        metrics::gauge!("dokan_runs_active").decrement(1.0);
+        // Terminal status for the happy path lives in the DB (exec_job set it); read it so
+        // the duration series is labeled correctly even on script-nonzero exits.
+        let status = db
+            .run_status(run_id)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| terminal.to_string());
+        metrics::histogram!("dokan_run_duration_seconds",
+            "runtime" => runtime.to_string(), "status" => status)
+            .record(t0.elapsed().as_secs_f64());
     }
 
     async fn run_inner(
@@ -177,6 +196,7 @@ impl Executor {
         {
             Ok(r) => r?,
             Err(_) => {
+                metrics::counter!("dokan_run_timeouts_total").increment(1);
                 let _ = self.docker.kill_container(cid, None).await;
                 let s = db.max_log_seq(run_id).await.unwrap_or(0) + 1;
                 db.append_log(run_id, s, "stderr", "dokan: timeout, container killed")
@@ -224,12 +244,14 @@ async fn pump_logs(
             let line = line.trim_end_matches('\n').trim_end_matches('\r');
             seq += 1;
             db.append_log(run_id, seq, stream_name, line).await?;
+            metrics::counter!("dokan_log_lines_total", "stream" => stream_name).increment(1);
         }
     }
     for (stream_name, buf) in [("stdout", &buf_out), ("stderr", &buf_err)] {
         if !buf.is_empty() {
             seq += 1;
             db.append_log(run_id, seq, stream_name, buf).await?;
+            metrics::counter!("dokan_log_lines_total", "stream" => stream_name).increment(1);
         }
     }
     Ok(seq)

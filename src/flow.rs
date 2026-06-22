@@ -40,6 +40,7 @@ impl FlowEngine {
                             if let Err(e) = engine.drive(flow_run_id, input).await {
                                 tracing::error!(flow_run_id, "flow driver error: {e}");
                                 let _ = engine.db.finish_flow_run(flow_run_id, "failed").await;
+                                metrics::counter!("dokan_flow_runs_finished_total", "status" => "failed").increment(1);
                             }
                         });
                     }
@@ -62,10 +63,12 @@ impl FlowEngine {
 
             if steps.iter().any(|s| s.status == "failed") {
                 self.db.finish_flow_run(flow_run_id, "failed").await?;
+                metrics::counter!("dokan_flow_runs_finished_total", "status" => "failed").increment(1);
                 return Ok(());
             }
             if steps.iter().all(|s| s.status == "succeeded") {
                 self.db.finish_flow_run(flow_run_id, "succeeded").await?;
+                metrics::counter!("dokan_flow_runs_finished_total", "status" => "succeeded").increment(1);
                 return Ok(());
             }
 
@@ -168,6 +171,7 @@ impl FlowEngine {
                     .db
                     .finish_step(flow_run_id, &step.step_id, "succeeded", out.as_deref())
                     .await;
+                metrics::counter!("dokan_flow_steps_finished_total", "status" => "succeeded").increment(1);
                 return;
             }
             tracing::warn!(flow_run_id, step = %step.step_id, attempt, "step failed, maybe retry");
@@ -176,6 +180,7 @@ impl FlowEngine {
             .db
             .finish_step(flow_run_id, &step.step_id, "failed", Some("exhausted retries"))
             .await;
+        metrics::counter!("dokan_flow_steps_finished_total", "status" => "failed").increment(1);
     }
 }
 

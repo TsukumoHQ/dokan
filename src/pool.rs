@@ -44,14 +44,32 @@ impl WarmPool {
     /// creates on demand. Caller owns the container and must discard it after use.
     pub async fn acquire(&self, image: &str) -> Result<String> {
         self.known.lock().unwrap().insert(image.to_string());
-        let popped = {
+        let t0 = std::time::Instant::now();
+        let (popped, remaining) = {
             let mut idle = self.idle.lock().unwrap();
-            idle.get_mut(image).and_then(|v| v.pop())
+            let v = idle.get_mut(image);
+            let remaining = v.as_ref().map(|v| v.len()).unwrap_or(0);
+            match v.and_then(|v| v.pop()) {
+                Some(id) => (Some(id), remaining.saturating_sub(1)),
+                None => (None, 0),
+            }
         };
-        match popped {
-            Some(id) => Ok(id),
-            None => self.create_idle(image).await,
-        }
+        let result = match popped {
+            // Warm hit: a pre-started container was ready (the fast path the pool exists for).
+            Some(id) => {
+                metrics::counter!("dokan_pool_acquire_total", "result" => "warm").increment(1);
+                metrics::gauge!("dokan_pool_idle_containers", "image" => image.to_string())
+                    .set(remaining as f64);
+                Ok(id)
+            }
+            // Cold miss: buffer was empty, pay create (+ maybe pull) on the hot path.
+            None => {
+                metrics::counter!("dokan_pool_acquire_total", "result" => "cold").increment(1);
+                self.create_idle(image).await
+            }
+        };
+        metrics::histogram!("dokan_pool_acquire_seconds").record(t0.elapsed().as_secs_f64());
+        result
     }
 
     /// Discard a container (after a run, or a stale idle one). Best-effort.
@@ -64,12 +82,14 @@ impl WarmPool {
                 Some(RemoveContainerOptionsBuilder::default().force(true).build()),
             )
             .await;
+        metrics::counter!("dokan_pool_containers_discarded_total").increment(1);
     }
 
     async fn ensure_image(&self, image: &str) -> Result<()> {
         if self.docker.inspect_image(image).await.is_ok() {
             return Ok(());
         }
+        metrics::counter!("dokan_pool_image_pulls_total").increment(1);
         let opts = CreateImageOptionsBuilder::default().from_image(image).build();
         let mut stream = self.docker.create_image(Some(opts), None, None);
         while let Some(item) = stream.next().await {
@@ -79,6 +99,7 @@ impl WarmPool {
     }
 
     async fn create_idle(&self, image: &str) -> Result<String> {
+        let t0 = std::time::Instant::now();
         self.ensure_image(image).await?;
         let body = ContainerCreateBody {
             image: Some(image.to_string()),
@@ -96,6 +117,8 @@ impl WarmPool {
         self.docker
             .start_container(&created.id, None::<StartContainerOptions>)
             .await?;
+        metrics::counter!("dokan_pool_containers_created_total").increment(1);
+        metrics::histogram!("dokan_pool_create_seconds").record(t0.elapsed().as_secs_f64());
         Ok(created.id)
     }
 
@@ -112,7 +135,14 @@ impl WarmPool {
                     // Top up one per tick per image — gentle, avoids create storms.
                     if have < self.target_idle {
                         if let Ok(id) = self.create_idle(&image).await {
-                            self.idle.lock().unwrap().entry(image).or_default().push(id);
+                            let n = {
+                                let mut idle = self.idle.lock().unwrap();
+                                let v = idle.entry(image.clone()).or_default();
+                                v.push(id);
+                                v.len()
+                            };
+                            metrics::gauge!("dokan_pool_idle_containers", "image" => image)
+                                .set(n as f64);
                         }
                     }
                 }

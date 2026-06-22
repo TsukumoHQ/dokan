@@ -85,9 +85,41 @@ async fn main() -> Result<()> {
     db.migrate().await?;
     tracing::info!("db connected + migrated");
 
-    // Prometheus recorder (global). /metrics renders from this handle.
-    let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
-        .install_recorder()?;
+    // Prometheus recorder (global). /metrics renders from this handle. Latency series get
+    // explicit buckets (default exporter has none → no quantiles), and every metric is
+    // described once so /metrics carries # HELP/# TYPE for scrapers and dashboards.
+    let metrics_handle = {
+        use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
+        PrometheusBuilder::new()
+            .set_buckets_for_metric(
+                Matcher::Suffix("_seconds".to_string()),
+                &[
+                    0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0,
+                ],
+            )?
+            .install_recorder()?
+    };
+    describe_metrics();
+
+    // Sampler: snapshot DB-derived gauges (queue depth by status, enabled schedules) every
+    // few seconds. Cheap, and gives backlog/saturation series the event counters can't.
+    {
+        let db = db.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                tick.tick().await;
+                if let Ok(counts) = db.run_status_counts().await {
+                    for (status, n) in counts {
+                        metrics::gauge!("dokan_runs", "status" => status).set(n as f64);
+                    }
+                }
+                if let Ok(schedules) = db.enabled_schedules().await {
+                    metrics::gauge!("dokan_schedules_enabled").set(schedules.len() as f64);
+                }
+            }
+        });
+    }
 
     let exec = Arc::new(Executor::connect(cli.warm_idle, cli.relay_url.clone())?);
     tracing::info!(warm_idle = cli.warm_idle, "docker connected, warm pool armed");
@@ -156,6 +188,7 @@ async fn serve_http(
     use rmcp::transport::streamable_http_server::StreamableHttpService;
 
     let db_for_mcp = db.clone();
+    let exec_for_ui = exec.clone();
     let service = StreamableHttpService::new(
         move || {
             Ok(Dokan::new(
@@ -171,6 +204,7 @@ async fn serve_http(
 
     let state = http::AppState {
         db,
+        exec: exec_for_ui,
         metrics: metrics_handle,
     };
     // MCP control plane + thin operator UI, behind one bearer-token gate.
@@ -183,4 +217,35 @@ async fn serve_http(
     tracing::info!("dokan listening: MCP http://{addr}/mcp · UI http://{addr}/");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// One-time # HELP/# TYPE descriptions for every metric dokan emits. Kept central so the
+/// `/metrics` surface is self-documenting and units are unambiguous to scrapers.
+fn describe_metrics() {
+    use metrics::Unit;
+    // Run lifecycle.
+    metrics::describe_counter!("dokan_runs_enqueued_total", Unit::Count, "Runs enqueued onto the queue (API trigger or cron)");
+    metrics::describe_counter!("dokan_runs_claimed_total", Unit::Count, "Runs claimed off the queue by a worker");
+    metrics::describe_counter!("dokan_run_attempts_total", Unit::Count, "Execution attempts (includes retries) labeled by attempt number");
+    metrics::describe_counter!("dokan_runs_retried_total", Unit::Count, "Runs requeued for a transient-failure retry");
+    metrics::describe_counter!("dokan_runs_finished_total", Unit::Count, "Runs reaching a terminal status, by status");
+    metrics::describe_counter!("dokan_run_internal_errors_total", Unit::Count, "Runs that failed inside dokan (could not execute) rather than the script exiting nonzero");
+    metrics::describe_counter!("dokan_run_timeouts_total", Unit::Count, "Runs killed for exceeding the execution timeout");
+    metrics::describe_histogram!("dokan_run_duration_seconds", Unit::Seconds, "Wall-clock per run from acquire to discard, by runtime and status");
+    metrics::describe_counter!("dokan_log_lines_total", Unit::Count, "Log lines persisted, by stream (stdout/stderr)");
+    metrics::describe_gauge!("dokan_runs", Unit::Count, "Current run count by status (sampled from the queue)");
+    metrics::describe_gauge!("dokan_runs_active", Unit::Count, "Runs currently executing in a container");
+    metrics::describe_gauge!("dokan_schedules_enabled", Unit::Count, "Enabled cron schedules");
+    // Warm pool.
+    metrics::describe_counter!("dokan_pool_acquire_total", Unit::Count, "Container acquisitions, by result (warm hit / cold create)");
+    metrics::describe_histogram!("dokan_pool_acquire_seconds", Unit::Seconds, "Time to obtain a ready container (warm pop is ~0; cold includes create/pull)");
+    metrics::describe_counter!("dokan_pool_containers_created_total", Unit::Count, "Idle containers created");
+    metrics::describe_histogram!("dokan_pool_create_seconds", Unit::Seconds, "Time to create+start an idle container (includes image pull on first use)");
+    metrics::describe_counter!("dokan_pool_image_pulls_total", Unit::Count, "Container images pulled from the registry");
+    metrics::describe_counter!("dokan_pool_containers_discarded_total", Unit::Count, "Containers removed (after a run or as stale idle)");
+    metrics::describe_gauge!("dokan_pool_idle_containers", Unit::Count, "Warm idle containers currently buffered, by image");
+    // Cron + flows.
+    metrics::describe_counter!("dokan_cron_runs_enqueued_total", Unit::Count, "Runs enqueued by the cron scheduler");
+    metrics::describe_counter!("dokan_flow_runs_finished_total", Unit::Count, "Flow runs reaching a terminal status, by status");
+    metrics::describe_counter!("dokan_flow_steps_finished_total", Unit::Count, "Flow steps reaching a terminal status, by status");
 }

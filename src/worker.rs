@@ -47,17 +47,21 @@ impl Worker {
                 };
                 match self.db.claim_run(&self.caps).await {
                     Ok(Some(job)) => {
+                        metrics::counter!("dokan_runs_claimed_total").increment(1);
                         let db = self.db.clone();
                         let exec = self.exec.clone();
                         tokio::spawn(async move {
                             let _permit = permit; // released on drop
                             let attempt = db.mark_attempt(job.run_id).await.unwrap_or(1);
+                            metrics::counter!("dokan_run_attempts_total",
+                                "attempt" => attempt.to_string()).increment(1);
                             exec.run(&db, job.run_id, &job.runtime, &job.source, &job.input)
                                 .await;
                             // Retry transient failures up to MAX_ATTEMPTS.
                             if let Ok(Some(status)) = db.run_status(job.run_id).await {
                                 if status == "failed" && attempt < MAX_ATTEMPTS {
                                     tracing::warn!(run_id = job.run_id, attempt, "retrying");
+                                    metrics::counter!("dokan_runs_retried_total").increment(1);
                                     let _ = db.requeue(job.run_id).await;
                                 }
                             }
