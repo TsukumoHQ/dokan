@@ -58,6 +58,8 @@ pub struct UploadArgs {
     pub source: String,
     /// One-line description (used by search). Optional but recommended.
     pub description: Option<String>,
+    /// Free-text creator/owner tag (e.g. agent name or human). Shown in the operator UI.
+    pub created_by: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -193,7 +195,7 @@ impl Dokan {
         };
         let mut v = json!({
             "id": s.id, "name": s.name, "runtime": s.runtime,
-            "desc": s.description, "version": s.version,
+            "desc": s.description, "created_by": s.created_by, "version": s.version,
             "created_at": s.created_at.to_rfc3339(),
         });
         if a.include_source.unwrap_or(false) {
@@ -219,7 +221,14 @@ impl Dokan {
         };
         let (id, version) = self
             .db
-            .insert_script(&a.name, &a.runtime, &a.source, a.description.as_deref(), embedding)
+            .insert_script(
+                &a.name,
+                &a.runtime,
+                &a.source,
+                a.description.as_deref(),
+                a.created_by.as_deref(),
+                embedding,
+            )
             .await
             .map_err(internal)?;
         ok(json!({"script_id": id, "version": version, "status": "uploaded"}))
@@ -338,7 +347,7 @@ impl Dokan {
             .iter()
             .map(|r| {
                 // error only when present, to stay token-frugal on the happy path.
-                let mut o = json!({"run_id": r.id, "script_id": r.script_id, "status": r.status, "exit": r.exit_code, "at": r.created_at.to_rfc3339()});
+                let mut o = json!({"run_id": r.id, "script_id": r.script_id, "script": r.script_name, "status": r.status, "exit": r.exit_code, "at": r.created_at.to_rfc3339()});
                 if let Some(e) = &r.error {
                     o["error"] = json!(e);
                 }

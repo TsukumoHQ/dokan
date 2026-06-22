@@ -13,6 +13,10 @@ use crate::exec::{runtime_spec, Executor};
 
 const STEP_MAX_ATTEMPTS: u32 = 2;
 const IDLE_POLL: Duration = Duration::from_millis(400);
+/// Flow-run lease: a driver heartbeats between step batches, but a single in-flight step
+/// can run silent up to the job timeout. Set above that bound so a healthy long step is
+/// never mistaken for a dead engine. Tunable; 2× the job timeout gives comfortable margin.
+const FLOW_LEASE_SECS: f64 = (crate::exec::DEFAULT_TIMEOUT_SECS * 2) as f64;
 
 #[derive(Clone)]
 pub struct FlowEngine {
@@ -27,7 +31,7 @@ impl FlowEngine {
 
     /// Resume orphaned flows, then loop claiming and driving pending flow_runs.
     pub async fn start(self) -> anyhow::Result<()> {
-        let n = self.db.requeue_orphan_flow_runs().await?;
+        let n = self.db.reap_orphan_flow_runs(FLOW_LEASE_SECS).await?;
         if n > 0 {
             tracing::info!(flow_runs = n, "resuming orphaned flows at step boundary");
         }
@@ -59,6 +63,10 @@ impl FlowEngine {
     /// checkpoints each, and repeats until the DAG completes or a step fails.
     async fn drive(&self, flow_run_id: i64, input: serde_json::Value) -> anyhow::Result<()> {
         loop {
+            // Heartbeat: keeps this flow's lease fresh between step batches so the reaper
+            // never reclaims a live driver. A single step can run up to the job timeout
+            // with no beat, hence FLOW_LEASE_SECS sits above that bound.
+            let _ = self.db.touch_flow_run(flow_run_id).await;
             let steps = self.db.flow_steps(flow_run_id).await?;
 
             if steps.iter().any(|s| s.status == "failed") {

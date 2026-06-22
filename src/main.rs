@@ -151,6 +151,37 @@ async fn main() -> Result<()> {
         // Flow engine drives DAGs by enqueuing each step as a normal run.
         flow::FlowEngine::new(db.clone(), exec.clone()).start().await?;
         tracing::info!("flow engine started");
+
+        // Orphan reaper: a worker/engine that dies mid-run leaves rows stuck `running`.
+        // Lease-based reclaim hands them back to `pending` once past a generous lease
+        // (well beyond the hard job timeout), without disturbing healthy concurrent
+        // workers — the safety net that makes multi-worker against one Postgres correct.
+        {
+            let db = db.clone();
+            let lease = (exec::DEFAULT_TIMEOUT_SECS * 2) as f64; // 2× the hard job timeout
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+                loop {
+                    tick.tick().await;
+                    match db.reap_orphan_runs(lease).await {
+                        Ok(n) if n > 0 => {
+                            tracing::warn!(runs = n, "reaped orphaned runs (dead worker)");
+                            metrics::counter!("dokan_runs_reaped_total").increment(n);
+                        }
+                        Err(e) => tracing::error!("reap_orphan_runs: {e}"),
+                        _ => {}
+                    }
+                    match db.reap_orphan_flow_runs(lease).await {
+                        Ok(n) if n > 0 => {
+                            tracing::warn!(flow_runs = n, "reaped orphaned flow_runs (dead engine)");
+                            metrics::counter!("dokan_flow_runs_reaped_total").increment(n);
+                        }
+                        Err(e) => tracing::error!("reap_orphan_flow_runs: {e}"),
+                        _ => {}
+                    }
+                }
+            });
+        }
     }
 
     match cli.transport.as_str() {
@@ -228,6 +259,8 @@ fn describe_metrics() {
     metrics::describe_counter!("dokan_runs_claimed_total", Unit::Count, "Runs claimed off the queue by a worker");
     metrics::describe_counter!("dokan_run_attempts_total", Unit::Count, "Execution attempts (includes retries) labeled by attempt number");
     metrics::describe_counter!("dokan_runs_retried_total", Unit::Count, "Runs requeued for a transient-failure retry");
+    metrics::describe_counter!("dokan_runs_reaped_total", Unit::Count, "Runs reclaimed from a dead worker (stuck running past the lease)");
+    metrics::describe_counter!("dokan_flow_runs_reaped_total", Unit::Count, "Flow runs reclaimed from a dead engine (stale heartbeat past the lease)");
     metrics::describe_counter!("dokan_runs_finished_total", Unit::Count, "Runs reaching a terminal status, by status");
     metrics::describe_counter!("dokan_run_internal_errors_total", Unit::Count, "Runs that failed inside dokan (could not execute) rather than the script exiting nonzero");
     metrics::describe_counter!("dokan_run_timeouts_total", Unit::Count, "Runs killed for exceeding the execution timeout");

@@ -103,3 +103,11 @@ CREATE TABLE IF NOT EXISTS secrets (
     value      TEXT        NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Provenance: free-text creator/owner tag, surfaced in the operator UI.
+ALTER TABLE scripts ADD COLUMN IF NOT EXISTS created_by TEXT;
+
+-- Multi-worker reclaim: lease/heartbeat for flow_runs so a dead engine's in-flight
+-- flows can be reclaimed by a healthy one WITHOUT yanking live work (replaces the old
+-- blunt "reset every running flow_run" boot reset). `runs` already has started_at.
+ALTER TABLE flow_runs ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ;

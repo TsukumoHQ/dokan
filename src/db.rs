@@ -18,6 +18,7 @@ pub struct Script {
     pub runtime: String,
     pub source: String,
     pub description: Option<String>,
+    pub created_by: Option<String>,
     pub version: i32,
     pub created_at: DateTime<Utc>,
 }
@@ -38,6 +39,10 @@ pub struct Run {
     pub exit_code: Option<i32>,
     pub error: Option<String>,
     pub created_at: DateTime<Utc>,
+    // Joined script provenance — for the operator UI (name > bare id).
+    pub script_name: String,
+    pub script_description: Option<String>,
+    pub script_created_by: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -101,17 +106,19 @@ impl Db {
         runtime: &str,
         source: &str,
         description: Option<&str>,
+        created_by: Option<&str>,
         embedding: Option<Vec<f32>>,
     ) -> Result<(i64, i32)> {
         let vec = embedding.map(pgvector::Vector::from);
         let row = sqlx::query(
-            "INSERT INTO scripts (name, runtime, source, description, embedding) \
-             VALUES ($1, $2, $3, $4, $5) RETURNING id, version",
+            "INSERT INTO scripts (name, runtime, source, description, created_by, embedding) \
+             VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, version",
         )
         .bind(name)
         .bind(runtime)
         .bind(source)
         .bind(description)
+        .bind(created_by)
         .bind(vec)
         .fetch_one(&self.pool)
         .await?;
@@ -152,7 +159,7 @@ impl Db {
 
     pub async fn get_script(&self, id: i64) -> Result<Option<Script>> {
         let row = sqlx::query(
-            "SELECT id, name, runtime, source, description, version, created_at \
+            "SELECT id, name, runtime, source, description, created_by, version, created_at \
              FROM scripts WHERE id = $1",
         )
         .bind(id)
@@ -164,6 +171,7 @@ impl Db {
             runtime: r.get("runtime"),
             source: r.get("source"),
             description: r.get("description"),
+            created_by: r.get("created_by"),
             version: r.get("version"),
             created_at: r.get("created_at"),
         }))
@@ -243,8 +251,11 @@ impl Db {
     pub async fn list_runs(&self, status: Option<&str>, limit: i64) -> Result<Vec<Run>> {
         let rows = if let Some(st) = status {
             sqlx::query(
-                "SELECT id, script_id, status, exit_code, error, created_at FROM runs \
-                 WHERE status = $1 ORDER BY id DESC LIMIT $2",
+                "SELECT r.id, r.script_id, r.status, r.exit_code, r.error, r.created_at, \
+                     s.name AS script_name, s.description AS script_description, \
+                     s.created_by AS script_created_by \
+                 FROM runs r JOIN scripts s ON s.id = r.script_id \
+                 WHERE r.status = $1 ORDER BY r.id DESC LIMIT $2",
             )
             .bind(st)
             .bind(limit)
@@ -252,8 +263,11 @@ impl Db {
             .await?
         } else {
             sqlx::query(
-                "SELECT id, script_id, status, exit_code, error, created_at FROM runs \
-                 ORDER BY id DESC LIMIT $1",
+                "SELECT r.id, r.script_id, r.status, r.exit_code, r.error, r.created_at, \
+                     s.name AS script_name, s.description AS script_description, \
+                     s.created_by AS script_created_by \
+                 FROM runs r JOIN scripts s ON s.id = r.script_id \
+                 ORDER BY r.id DESC LIMIT $1",
             )
             .bind(limit)
             .fetch_all(&self.pool)
@@ -268,6 +282,9 @@ impl Db {
                 exit_code: r.get("exit_code"),
                 error: r.get("error"),
                 created_at: r.get("created_at"),
+                script_name: r.get("script_name"),
+                script_description: r.get("script_description"),
+                script_created_by: r.get("script_created_by"),
             })
             .collect())
     }
@@ -317,6 +334,22 @@ impl Db {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// Reclaim runs orphaned by a dead worker: still `running` past `lease_secs`, which is
+    /// set well beyond the hard job timeout — a live worker always kills + finalizes by
+    /// then, so anything still running is owner-less. Lease-based, so concurrent healthy
+    /// workers are never disturbed. `mark_attempt` already counted the attempt, so the
+    /// worker's `MAX_ATTEMPTS` cap still bounds the requeue→fail loop. Returns reclaimed n.
+    pub async fn reap_orphan_runs(&self, lease_secs: f64) -> Result<u64> {
+        let r = sqlx::query(
+            "UPDATE runs SET status = 'pending', started_at = NULL \
+             WHERE status = 'running' AND started_at < now() - make_interval(secs => $1)",
+        )
+        .bind(lease_secs)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected())
     }
 
     // ---- schedules (cron) ----
@@ -497,7 +530,8 @@ impl Db {
                  SELECT id FROM flow_runs WHERE status = 'pending' \
                  ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1 \
              ) \
-             UPDATE flow_runs SET status = 'running' FROM c WHERE flow_runs.id = c.id \
+             UPDATE flow_runs SET status = 'running', started_at = now() FROM c \
+             WHERE flow_runs.id = c.id \
              RETURNING flow_runs.id, flow_runs.input",
         )
         .fetch_optional(&self.pool)
@@ -582,12 +616,30 @@ impl Db {
             .await?)
     }
 
-    /// On engine startup: hand orphaned 'running' flow_runs back to 'pending' so they
-    /// resume. Completed steps persist, so resume continues at the step boundary.
-    pub async fn requeue_orphan_flow_runs(&self) -> Result<u64> {
-        let r = sqlx::query("UPDATE flow_runs SET status = 'pending' WHERE status = 'running'")
+    /// Heartbeat a driving flow_run — the engine bumps this between step batches so the
+    /// reaper can tell "alive but long-running" from "owner died". Cheap single-row update.
+    pub async fn touch_flow_run(&self, id: i64) -> Result<()> {
+        sqlx::query("UPDATE flow_runs SET started_at = now() WHERE id = $1")
+            .bind(id)
             .execute(&self.pool)
             .await?;
+        Ok(())
+    }
+
+    /// Reclaim flow_runs whose driving engine died: `running` with a stale (or absent)
+    /// heartbeat past `lease_secs`. Completed steps persist, so a reclaimed flow resumes at
+    /// the step boundary. Unlike the old blunt "reset every running flow_run", this is
+    /// lease-based — a healthy engine heartbeating its flows is never reclaimed out from
+    /// under itself, which is what makes multi-engine safe. Returns reclaimed n.
+    pub async fn reap_orphan_flow_runs(&self, lease_secs: f64) -> Result<u64> {
+        let r = sqlx::query(
+            "UPDATE flow_runs SET status = 'pending' \
+             WHERE status = 'running' \
+               AND (started_at IS NULL OR started_at < now() - make_interval(secs => $1))",
+        )
+        .bind(lease_secs)
+        .execute(&self.pool)
+        .await?;
         Ok(r.rows_affected())
     }
 

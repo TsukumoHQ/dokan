@@ -16,7 +16,9 @@ use std::time::Duration;
 use crate::db::Db;
 use crate::pool::WarmPool;
 
-const DEFAULT_TIMEOUT_SECS: u64 = 300;
+/// Hard wall-clock ceiling per job. A live worker kills + finalizes at this bound, so a
+/// run still `running` well past it can only mean the worker died — see the lease reaper.
+pub const DEFAULT_TIMEOUT_SECS: u64 = 300;
 
 #[derive(Clone)]
 pub struct Executor {

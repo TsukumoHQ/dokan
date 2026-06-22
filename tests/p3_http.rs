@@ -125,9 +125,17 @@ async fn operator_surface_and_relay() -> anyhow::Result<()> {
         "409 body reports current status"
     );
 
-    // 6. Relay received the finish notification.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(hits.load(Ordering::SeqCst) >= 1, "relay egress fired");
+    // 6. Relay received the finish notification. The POST is fire-and-forget from the
+    //    job task, so poll rather than asserting on a single fixed sleep (flaky under load).
+    let mut relayed = false;
+    for _ in 0..40 {
+        if hits.load(Ordering::SeqCst) >= 1 {
+            relayed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(relayed, "relay egress fired");
 
     // 7. Metrics expose the run counter.
     let metrics = cli
