@@ -25,6 +25,42 @@ pub struct Dokan {
     tool_router: rmcp::handler::server::router::tool::ToolRouter<Self>,
 }
 
+/// Canonicalize a JSON value to a deterministic string (object keys sorted recursively),
+/// so the cache key is stable regardless of input key order.
+fn canonical_json(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Object(m) => {
+            let mut keys: Vec<&String> = m.keys().collect();
+            keys.sort();
+            let inner: Vec<String> = keys
+                .into_iter()
+                .map(|k| format!("{:?}:{}", k, canonical_json(&m[k])))
+                .collect();
+            format!("{{{}}}", inner.join(","))
+        }
+        serde_json::Value::Array(a) => {
+            let inner: Vec<String> = a.iter().map(canonical_json).collect();
+            format!("[{}]", inner.join(","))
+        }
+        other => other.to_string(),
+    }
+}
+
+/// Content-address a run: hash(runtime + source + canonical(input) + secrets generation).
+/// Same inputs ⇒ same key ⇒ recallable (dokan jobs are deterministic).
+fn run_cache_key(runtime: &str, source: &str, input: &serde_json::Value, secrets_gen: i64) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(runtime.as_bytes());
+    h.update([0x1f]);
+    h.update(source.as_bytes());
+    h.update([0x1f]);
+    h.update(canonical_json(input).as_bytes());
+    h.update([0x1f]);
+    h.update(secrets_gen.to_le_bytes());
+    format!("{:x}", h.finalize())
+}
+
 fn ok<T: serde::Serialize>(v: T) -> Result<CallToolResult, McpError> {
     let s = serde_json::to_string(&v)
         .map_err(|e| McpError::internal_error(e.to_string(), None))?;
@@ -72,6 +108,11 @@ pub struct RunArgs {
     pub script_id: i64,
     /// Arbitrary JSON passed to the job as the DOKAN_INPUT env var. Optional.
     pub input: Option<serde_json::Value>,
+    /// Run-or-recall: if true and an identical run (same script source + input + secrets
+    /// generation) already succeeded, return its result WITHOUT spawning a container
+    /// (status "recalled"). Opt-in — leave false for monitors/time-sensitive jobs that must
+    /// re-execute. Exploits dokan's determinism.
+    pub cache: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -344,15 +385,42 @@ impl Dokan {
         let Some(script) = script else {
             return ok(json!({"error": "script_not_found", "id": a.script_id}));
         };
-        let _ = &script; // existence checked above; worker reloads it on claim.
         let input = a.input.unwrap_or(json!({}));
+        // Run-or-recall: if opted in and an identical run already succeeded, return its
+        // result instead of spawning a container. The key folds in the secrets generation,
+        // so a secret change invalidates env-dependent recalls.
+        let cache_key = if a.cache.unwrap_or(false) {
+            let secrets_gen = self.db.secrets_generation().await.map_err(internal)?;
+            let key = run_cache_key(&script.runtime, &script.source, &input, secrets_gen);
+            if let Some((run_id, exit, result)) =
+                self.db.find_cached_run(&key).await.map_err(internal)?
+            {
+                let mut hit = json!({
+                    "run_id": run_id, "status": "recalled", "exit": exit, "cache_key": key,
+                });
+                if let Some(r) = result {
+                    hit["result"] = r;
+                }
+                return ok(hit);
+            }
+            Some(key)
+        } else {
+            None
+        };
         // Enqueue only — a worker claims it from the queue (FOR UPDATE SKIP LOCKED).
         let run_id = self
             .db
             .insert_run(a.script_id, &input)
             .await
             .map_err(internal)?;
-        ok(json!({"run_id": run_id, "status": "pending"}))
+        if let Some(key) = &cache_key {
+            let _ = self.db.set_run_cache_key(run_id, key).await;
+        }
+        let mut out = json!({"run_id": run_id, "status": "pending"});
+        if let Some(key) = cache_key {
+            out["cache_key"] = json!(key);
+        }
+        ok(out)
     }
 
     #[tool(description = "Read logs for a run. Cursor-paginated, error-first. Returns new lines since after_cursor + next_cursor + status.")]

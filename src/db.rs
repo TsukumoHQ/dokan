@@ -361,6 +361,44 @@ impl Db {
         Ok(())
     }
 
+    /// Tag a run with its content-address cache key (set after insert; the worker doesn't
+    /// need it to run — only future recalls query it).
+    pub async fn set_run_cache_key(&self, id: i64, key: &str) -> Result<()> {
+        sqlx::query("UPDATE runs SET cache_key = $2 WHERE id = $1")
+            .bind(id)
+            .bind(key)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Recall a prior SUCCEEDED run with this cache key: (run_id, exit_code, result). Only
+    /// succeeded runs are recallable — a transient failure must never poison the cache.
+    pub async fn find_cached_run(
+        &self,
+        key: &str,
+    ) -> Result<Option<(i64, Option<i32>, Option<serde_json::Value>)>> {
+        let row = sqlx::query(
+            "SELECT id, exit_code, result FROM runs \
+             WHERE cache_key = $1 AND status = 'succeeded' ORDER BY id DESC LIMIT 1",
+        )
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| (r.get("id"), r.get("exit_code"), r.get("result"))))
+    }
+
+    /// Monotonic counter bumped on any secret change; folded into the cache key so an
+    /// env-dependent result is invalidated when secrets change.
+    pub async fn secrets_generation(&self) -> Result<i64> {
+        Ok(
+            sqlx::query_scalar("SELECT v FROM meta WHERE k = 'secrets_generation'")
+                .fetch_optional(&self.pool)
+                .await?
+                .unwrap_or(0),
+        )
+    }
+
     /// A run's structured result, if any.
     pub async fn run_result(&self, id: i64) -> Result<Option<serde_json::Value>> {
         let v: Option<serde_json::Value> =
@@ -574,14 +612,20 @@ impl Db {
     // ---- secrets (P3) ----
 
     pub async fn upsert_secret(&self, name: &str, value: &str) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO secrets (name, value) VALUES ($1, $2) \
              ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value",
         )
         .bind(name)
         .bind(value)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        // Invalidate run-or-recall caches that may depend on this env.
+        sqlx::query("UPDATE meta SET v = v + 1 WHERE k = 'secrets_generation'")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(())
     }
 

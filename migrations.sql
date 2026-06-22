@@ -122,3 +122,12 @@ CREATE INDEX IF NOT EXISTS idx_scripts_name_trgm ON scripts USING gin (name gin_
 -- captures the last one here so monitors return findings without callers parsing stdout,
 -- and the relay egress carries it for event-driven alerting.
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS result JSONB;
+
+-- Run-or-recall: content-addressed cache. cache_key = hash(runtime+source+input+secrets
+-- generation). A cache:true run recalls a prior succeeded run with the same key instead of
+-- spawning a container — exploits dokan's determinism. Bump secrets_generation on any secret
+-- change so env-dependent results invalidate.
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS cache_key TEXT;
+CREATE INDEX IF NOT EXISTS idx_runs_cache_key ON runs (cache_key) WHERE cache_key IS NOT NULL;
+CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v BIGINT NOT NULL);
+INSERT INTO meta (k, v) VALUES ('secrets_generation', 0) ON CONFLICT (k) DO NOTHING;

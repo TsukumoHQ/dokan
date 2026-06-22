@@ -253,6 +253,28 @@ async fn delete_script_cascades() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Run-or-recall: a cache:true run of identical (source+input) returns the prior result
+/// without executing again; a different input is NOT recalled. (Moat #1.)
+#[tokio::test]
+async fn run_or_recall_recalls_identical() -> anyhow::Result<()> {
+    let c = spawn().await?;
+    let sid = upload(&c, "bash", "echo '::dokan:result:: {\"v\":42}'\n").await;
+    // First cached run executes.
+    let r1 = call(&c, "run_script", json!({"script_id": sid, "cache": true})).await?;
+    let run1 = r1["run_id"].as_i64().unwrap();
+    assert_eq!(wait_status(&c, run1, 60).await, "succeeded", "first ran");
+    // Identical cached run is recalled — same run_id, no new execution.
+    let r2 = call(&c, "run_script", json!({"script_id": sid, "cache": true})).await?;
+    assert_eq!(r2["status"], "recalled", "second recalled: {r2}");
+    assert_eq!(r2["run_id"].as_i64().unwrap(), run1, "recalled the same run");
+    assert_eq!(r2["result"]["v"], 42, "recalled result intact: {r2}");
+    // A different input is a different key -> not recalled.
+    let r3 = call(&c, "run_script", json!({"script_id": sid, "cache": true, "input": {"x": 1}})).await?;
+    assert_eq!(r3["status"], "pending", "different input executes fresh: {r3}");
+    c.cancel().await?;
+    Ok(())
+}
+
 /// A 5-field crontab (missing the leading SECONDS column) is rejected loudly instead of
 /// being silently accepted and never firing. (Terrain P2.)
 #[tokio::test]
