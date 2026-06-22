@@ -1,0 +1,13 @@
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    uid: dokan-prom
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      # Match dokan's scrape cadence so $__rate_interval picks a sane window.
+      timeInterval: "5s"
+    editable: false

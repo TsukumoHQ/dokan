@@ -1,0 +1,12 @@
+apiVersion: 1
+
+providers:
+  - name: dokan
+    type: file
+    folder: dokan
+    disableDeletion: false
+    allowUiUpdates: true
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

@@ -1,0 +1,48 @@
+# dokan observability stack: Prometheus scrapes dokan's /metrics, Grafana renders the
+# provisioned dashboard. dokan itself runs on the HOST (cargo run / supervised), so
+# Prometheus reaches it via host.docker.internal. Bring up with:
+#   docker compose -f observability/docker-compose.yml up -d
+# then open Grafana at http://localhost:3000 (anonymous admin, dark) — the "dokan" folder
+# already contains the dashboard. The raw scrape lives at http://localhost:9090.
+name: dokan-observability
+
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: dokan-prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=7d"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - dokan_prom_data:/prometheus
+    ports:
+      # Host 9090/3000 are often already taken (e.g. another Prometheus/Grafana); publish
+      # on 9490/3300 to coexist. Grafana reaches Prometheus over the internal network on
+      # 9090 regardless of the host mapping.
+      - "9490:9090"
+    # Lets the container reach dokan running on the host (Docker Desktop / Colima).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: dokan-grafana
+    depends_on:
+      - prometheus
+    environment:
+      # Local ops convenience: open, read-only-ish, dark. Lock this down for anything shared.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+      GF_USERS_DEFAULT_THEME: "dark"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: "/var/lib/grafana/dashboards/dokan.json"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - dokan_grafana_data:/var/lib/grafana
+    ports:
+      - "3300:3000"
+
+volumes:
+  dokan_prom_data:
+  dokan_grafana_data:
