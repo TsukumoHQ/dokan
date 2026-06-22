@@ -197,6 +197,21 @@ async fn main() -> Result<()> {
         exec.arm_pool();
         exec.prewarm(); // pull + warm runtime images now, not on the first job
         exec.resolve_digests().await; // stable cache key from the first run (T1)
+
+        // Executor registry: heartbeat so the live fleet is observable (T4).
+        {
+            let db = db.clone();
+            let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "local".into());
+            let id = format!("{host}:{}", std::process::id());
+            let caps = cli.caps.join(",");
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
+                loop {
+                    tick.tick().await;
+                    let _ = db.executor_heartbeat(&id, &host, &caps).await;
+                }
+            });
+        }
         // Autoscale concurrency + warm depth via Little's Law (L = λW). --concurrency and
         // --warm-idle are the floors; the controller raises both toward L under load.
         let conc = scale::Concurrency::new(cli.concurrency, cli.max_concurrency);

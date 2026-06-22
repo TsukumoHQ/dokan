@@ -170,3 +170,14 @@ CREATE TABLE IF NOT EXISTS triggers (
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_triggers_source ON triggers (source_script_id) WHERE enabled;
+
+-- Executor registry: each executor heartbeats so the live fleet is observable (the HA
+-- primitive). The orphan reaper already reclaims a dead executor's runs; this shows who's
+-- alive. Multi-node placement/provisioning is a later phase.
+CREATE TABLE IF NOT EXISTS executors (
+    id         TEXT PRIMARY KEY,
+    host       TEXT,
+    caps       TEXT,
+    started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_seen  TIMESTAMPTZ NOT NULL DEFAULT now()
+);

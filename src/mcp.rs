@@ -429,6 +429,12 @@ impl Dokan {
         ok(json!({"trigger_id": id, "status": "armed"}))
     }
 
+    #[tool(description = "List registered executors and whether each is live (heartbeat within 30s). Shows the fleet that runs jobs; a dead executor's runs are reclaimed by the lease reaper.")]
+    async fn list_executors(&self) -> Result<CallToolResult, McpError> {
+        let items = self.db.list_executors(30).await.map_err(internal)?;
+        ok(json!({"executors": items}))
+    }
+
     #[tool(description = "List active reactive triggers (on/when/run + agent).")]
     async fn list_triggers(&self) -> Result<CallToolResult, McpError> {
         let items = self.db.list_triggers().await.map_err(internal)?;

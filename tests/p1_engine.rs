@@ -389,6 +389,20 @@ async fn idempotency_key_dedups() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The executor heartbeats into the registry; list_executors shows it live. (T4.)
+#[tokio::test]
+async fn list_executors_shows_live() -> anyhow::Result<()> {
+    let c = spawn().await?;
+    // First heartbeat fires on the immediate interval tick; give it a moment.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let r = call(&c, "list_executors", json!({})).await?;
+    let execs = r["executors"].as_array().expect("executors array");
+    assert!(!execs.is_empty(), "at least one executor registered: {r}");
+    assert!(execs.iter().any(|e| e["live"] == true), "an executor is live: {r}");
+    c.cancel().await?;
+    Ok(())
+}
+
 /// A 5-field crontab (missing the leading SECONDS column) is rejected loudly instead of
 /// being silently accepted and never firing. (Terrain P2.)
 #[tokio::test]

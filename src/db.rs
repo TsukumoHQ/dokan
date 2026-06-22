@@ -896,6 +896,46 @@ impl Db {
         Ok(map.into_iter().collect())
     }
 
+    // ---- executor registry (T4) ----
+
+    pub async fn executor_heartbeat(&self, id: &str, host: &str, caps: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO executors (id, host, caps) VALUES ($1, $2, $3) \
+             ON CONFLICT (id) DO UPDATE SET last_seen = now(), host = $2, caps = $3",
+        )
+        .bind(id)
+        .bind(host)
+        .bind(caps)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Registered executors with a liveness flag (seen within `live_secs`).
+    pub async fn list_executors(&self, live_secs: i64) -> Result<Vec<serde_json::Value>> {
+        let rows = sqlx::query(
+            "SELECT id, host, caps, started_at, last_seen, \
+                    (last_seen > now() - make_interval(secs => $1)) AS live \
+             FROM executors ORDER BY last_seen DESC",
+        )
+        .bind(live_secs as f64)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.get::<String, _>("id"),
+                    "host": r.get::<Option<String>, _>("host"),
+                    "caps": r.get::<Option<String>, _>("caps"),
+                    "started_at": r.get::<DateTime<Utc>, _>("started_at").to_rfc3339(),
+                    "last_seen": r.get::<DateTime<Utc>, _>("last_seen").to_rfc3339(),
+                    "live": r.get::<bool, _>("live"),
+                })
+            })
+            .collect())
+    }
+
     // ---- triggers (reactive composition) ----
 
     pub async fn insert_trigger(
