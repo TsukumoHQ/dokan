@@ -64,6 +64,10 @@ struct Cli {
     #[arg(long, default_value_t = 16, env = "DOKAN_MAX_WARM")]
     max_warm: usize,
 
+    /// Retention: delete logs + terminal runs older than this many days (0 = keep forever).
+    #[arg(long, default_value_t = 7.0, env = "DOKAN_RETENTION_DAYS")]
+    retention_days: f64,
+
     /// Per-job memory cap (MiB). The cgroup OOM-kills a job that exceeds it (exit 137).
     #[arg(long, default_value_t = 1024, env = "DOKAN_MEM_LIMIT_MB")]
     mem_limit_mb: i64,
@@ -208,6 +212,26 @@ async fn main() -> Result<()> {
                 headroom: 1.3,
             },
         );
+        // Retention GC: keep Postgres bounded by deleting logs + terminal runs past the TTL.
+        if cli.retention_days > 0.0 {
+            let db = db.clone();
+            let days = cli.retention_days;
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
+                loop {
+                    tick.tick().await;
+                    match db.gc_old(days).await {
+                        Ok((r, l)) if r > 0 || l > 0 => {
+                            tracing::info!(runs = r, logs = l, "retention GC");
+                            metrics::counter!("dokan_gc_runs_total").increment(r);
+                            metrics::counter!("dokan_gc_logs_total").increment(l);
+                        }
+                        Err(e) => tracing::error!("retention GC: {e}"),
+                        _ => {}
+                    }
+                }
+            });
+        }
         // Flow engine drives DAGs by enqueuing each step as a normal run.
         flow::FlowEngine::new(db.clone(), exec.clone()).start().await?;
         tracing::info!("flow engine started");

@@ -468,6 +468,52 @@ impl Db {
         Ok(())
     }
 
+    /// Find a prior run by idempotency key: (run_id, status). Exactly-once intent — a
+    /// repeated run_script with the same key returns this instead of a duplicate.
+    pub async fn find_run_by_idempotency(&self, key: &str) -> Result<Option<(i64, String)>> {
+        let row = sqlx::query(
+            "SELECT id, status FROM runs WHERE idempotency_key = $1 ORDER BY id DESC LIMIT 1",
+        )
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| (r.get("id"), r.get("status"))))
+    }
+
+    pub async fn set_run_idempotency(&self, id: i64, key: &str) -> Result<()> {
+        sqlx::query("UPDATE runs SET idempotency_key = $2 WHERE id = $1")
+            .bind(id)
+            .bind(key)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Retention GC: delete logs + terminal runs older than `days`. Keeps recent history and
+    /// all non-terminal runs. Returns (runs deleted, logs deleted). (T3 — Postgres bounded.)
+    pub async fn gc_old(&self, days: f64) -> Result<(u64, u64)> {
+        let mut tx = self.pool.begin().await?;
+        let logs = sqlx::query(
+            "DELETE FROM logs WHERE run_id IN ( \
+                 SELECT id FROM runs WHERE finished_at IS NOT NULL \
+                   AND finished_at < now() - make_interval(secs => $1))",
+        )
+        .bind(days * 86400.0)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        let runs = sqlx::query(
+            "DELETE FROM runs WHERE finished_at IS NOT NULL \
+               AND finished_at < now() - make_interval(secs => $1)",
+        )
+        .bind(days * 86400.0)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        Ok((runs, logs))
+    }
+
     /// Tag a run with its content-address cache key (set after insert; the worker doesn't
     /// need it to run — only future recalls query it).
     pub async fn set_run_cache_key(&self, id: i64, key: &str) -> Result<()> {

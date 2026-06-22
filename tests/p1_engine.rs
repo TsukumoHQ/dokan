@@ -372,6 +372,23 @@ async fn deterministic_network_off_receipt_and_recall() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// An idempotency key makes a repeated enqueue return the same run, not a duplicate. (T5.)
+#[tokio::test]
+async fn idempotency_key_dedups() -> anyhow::Result<()> {
+    let c = spawn().await?;
+    let sid = upload(&c, "bash", "echo hi\n").await;
+    let a = call(&c, "run_script", json!({"script_id": sid, "idempotency_key": "job-42"})).await?;
+    let id = a["run_id"].as_i64().unwrap();
+    let b = call(&c, "run_script", json!({"script_id": sid, "idempotency_key": "job-42"})).await?;
+    assert_eq!(b["idempotent"], true, "second is idempotent: {b}");
+    assert_eq!(b["run_id"].as_i64().unwrap(), id, "same run returned");
+    // A different key enqueues a fresh run.
+    let d = call(&c, "run_script", json!({"script_id": sid, "idempotency_key": "job-99"})).await?;
+    assert_ne!(d["run_id"].as_i64().unwrap(), id, "different key -> new run");
+    c.cancel().await?;
+    Ok(())
+}
+
 /// A 5-field crontab (missing the leading SECONDS column) is rejected loudly instead of
 /// being silently accepted and never firing. (Terrain P2.)
 #[tokio::test]

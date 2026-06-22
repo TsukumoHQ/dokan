@@ -135,6 +135,9 @@ pub struct RunArgs {
     /// Your agent id. Tags the run for provenance, selects which scoped secrets the job
     /// sees (global + this agent's), and counts against this agent's concurrency quota.
     pub agent_id: Option<String>,
+    /// Exactly-once key: if a run with this key already exists, return it instead of
+    /// enqueuing a duplicate. Use for safe retries of the enqueue call itself.
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -484,6 +487,14 @@ impl Dokan {
         let Some(script) = script else {
             return ok(json!({"error": "script_not_found", "id": a.script_id}));
         };
+        // Idempotency: a repeated enqueue with the same key returns the existing run.
+        if let Some(key) = a.idempotency_key.as_deref() {
+            if let Some((run_id, status)) =
+                self.db.find_run_by_idempotency(key).await.map_err(internal)?
+            {
+                return ok(json!({"run_id": run_id, "status": status, "idempotent": true}));
+            }
+        }
         let input = a.input.unwrap_or(json!({}));
         // Run-or-recall: if opted in and an identical run already succeeded, return its
         // result instead of spawning a container. The key folds in the secrets generation,
@@ -525,6 +536,9 @@ impl Dokan {
             .map_err(internal)?;
         if let Some(key) = &cache_key {
             let _ = self.db.set_run_cache_key(run_id, key).await;
+        }
+        if let Some(key) = a.idempotency_key.as_deref() {
+            let _ = self.db.set_run_idempotency(run_id, key).await;
         }
         let mut out = json!({"run_id": run_id, "status": "pending"});
         if let Some(key) = cache_key {
@@ -849,5 +863,43 @@ impl ServerHandler for Dokan {
                 .into(),
         );
         info
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{canonical_json, run_cache_key, validate_cron};
+    use serde_json::json;
+
+    #[test]
+    fn canonical_json_is_key_order_stable() {
+        let a = json!({"b": 1, "a": [3, {"y": 1, "x": 2}], "c": "z"});
+        let b = json!({"c": "z", "a": [3, {"x": 2, "y": 1}], "b": 1});
+        assert_eq!(canonical_json(&a), canonical_json(&b), "key order must not matter");
+        // arrays stay ordered (semantically significant)
+        assert_ne!(canonical_json(&json!([1, 2])), canonical_json(&json!([2, 1])));
+    }
+
+    #[test]
+    fn cache_key_stable_and_input_sensitive() {
+        let i1 = json!({"a": 1, "b": 2});
+        let i2 = json!({"b": 2, "a": 1}); // same content, different order
+        let k = |i: &serde_json::Value, g: i64| run_cache_key("bash", "sha-d", "src", i, g);
+        assert_eq!(k(&i1, 0), k(&i2, 0), "input key-order doesn't change the cache key");
+        assert_ne!(k(&i1, 0), k(&json!({"a": 9}), 0), "different input -> different key");
+        assert_ne!(k(&i1, 0), k(&i1, 1), "secrets generation invalidates");
+        assert_ne!(
+            run_cache_key("bash", "digestA", "s", &i1, 0),
+            run_cache_key("bash", "digestB", "s", &i1, 0),
+            "image digest invalidates"
+        );
+    }
+
+    #[test]
+    fn cron_requires_six_fields() {
+        assert!(validate_cron("0 */5 * * * *").is_ok(), "6-field ok");
+        assert!(validate_cron("*/5 * * * *").is_err(), "5-field rejected");
+        assert!(validate_cron("0 0 0 0 0 0 0").is_err(), "7-field rejected");
+        assert!(validate_cron("  0   0 * * * *  ").is_ok(), "extra whitespace tolerated");
     }
 }

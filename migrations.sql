@@ -130,6 +130,11 @@ ALTER TABLE scripts ADD COLUMN IF NOT EXISTS network BOOLEAN NOT NULL DEFAULT tr
 -- Signed reproducibility receipt: proof of what produced a run's output.
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS receipt JSONB;
 
+-- Idempotency: an explicit agent-supplied key. A run_script carrying a key that already
+-- exists returns the existing run instead of enqueuing a duplicate (exactly-once intent).
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS idempotency_key TEXT;
+CREATE INDEX IF NOT EXISTS idx_runs_idempotency ON runs (idempotency_key) WHERE idempotency_key IS NOT NULL;
+
 -- Run-or-recall: content-addressed cache. cache_key = hash(runtime+source+input+secrets
 -- generation). A cache:true run recalls a prior succeeded run with the same key instead of
 -- spawning a container — exploits dokan's determinism. Bump secrets_generation on any secret
