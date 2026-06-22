@@ -32,16 +32,49 @@ pub struct WarmPool {
 
 impl WarmPool {
     pub fn new(docker: Docker, target_idle: usize, mem_bytes: i64, nano_cpus: i64) -> Arc<Self> {
-        let pool = Arc::new(Self {
+        // NB: the background filler is NOT started here. Only an *executor* process (one
+        // with worker caps) arms it via `arm()`. Control-plane-only instances — e.g. a
+        // per-agent stdio dokan that just enqueues/reads over the shared Postgres — share
+        // the same Docker host, so they must not each spin up their own warm containers.
+        Arc::new(Self {
             docker,
             target_idle,
             mem_bytes,
             nano_cpus,
             idle: Mutex::new(HashMap::new()),
             known: Mutex::new(HashSet::new()),
-        });
-        pool.clone().spawn_filler();
-        pool
+        })
+    }
+
+    /// Start the background filler. Call once, only on the executor process.
+    pub fn arm(self: &Arc<Self>) {
+        self.clone().spawn_filler();
+    }
+
+    /// Remove warm containers left behind by a previously-crashed dokan (labeled
+    /// `dokan.role=warm`). Run at executor startup: in the single-executor model these are
+    /// always orphans, so reclaiming them stops the slow Docker-host saturation that caused
+    /// the teardown 404s. Returns the count removed.
+    pub async fn sweep_orphans(&self) -> usize {
+        use bollard::query_parameters::ListContainersOptionsBuilder;
+        let mut filters = HashMap::new();
+        filters.insert("label".to_string(), vec!["dokan.role=warm".to_string()]);
+        let opts = ListContainersOptionsBuilder::default()
+            .all(true)
+            .filters(&filters)
+            .build();
+        let list = match self.docker.list_containers(Some(opts)).await {
+            Ok(l) => l,
+            Err(_) => return 0,
+        };
+        let mut n = 0;
+        for c in list {
+            if let Some(id) = c.id {
+                self.discard(&id).await;
+                n += 1;
+            }
+        }
+        n
     }
 
     /// Check out a ready container for `image`. Pops a warm one if available, else
@@ -115,6 +148,8 @@ impl WarmPool {
                 pids_limit: Some(PIDS_LIMIT),
                 ..Default::default()
             }),
+            // Tag so a fresh executor can sweep containers orphaned by a crashed one.
+            labels: Some(HashMap::from([("dokan.role".to_string(), "warm".to_string())])),
             ..Default::default()
         };
         let opts = CreateContainerOptionsBuilder::default().build();

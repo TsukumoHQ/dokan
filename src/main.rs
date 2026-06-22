@@ -166,7 +166,20 @@ async fn main() -> Result<()> {
 
     // In-process worker. Multi-host scale = run more dokan processes against the same
     // Postgres; SKIP LOCKED keeps claims disjoint.
-    if !cli.caps.is_empty() {
+    // Executor = a process that advertises at least one non-empty runtime. An empty
+    // DOKAN_CAPS (or one that parses to a single "" token) means control-plane only: no
+    // worker, no flow engine, no warm pool — it just enqueues/reads over shared Postgres.
+    let is_executor = cli.caps.iter().any(|c| !c.trim().is_empty());
+    if is_executor {
+        // This process is the executor: it owns the Docker host. Sweep containers orphaned
+        // by a prior crashed executor, then arm the warm pool. Control-plane-only instances
+        // (empty caps — e.g. per-agent stdio dokans) skip all of this and never touch the
+        // warm pool, so N co-located agents don't fight over one Docker.
+        let swept = exec.sweep_orphans().await;
+        if swept > 0 {
+            tracing::info!(containers = swept, "swept orphaned warm containers at startup");
+        }
+        exec.arm_pool();
         Worker::new(db.clone(), exec.clone(), cli.caps.clone(), cli.concurrency).spawn();
         // Flow engine drives DAGs by enqueuing each step as a normal run.
         flow::FlowEngine::new(db.clone(), exec.clone()).start().await?;

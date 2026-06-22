@@ -84,6 +84,16 @@ impl Executor {
         }
     }
 
+    /// Arm the warm pool's background filler — only the executor process should call this.
+    pub fn arm_pool(&self) {
+        self.pool.arm();
+    }
+
+    /// Reclaim warm containers orphaned by a crashed dokan. Run at executor startup.
+    pub async fn sweep_orphans(&self) -> usize {
+        self.pool.sweep_orphans().await
+    }
+
     /// Kill a running job's container (best-effort).
     pub async fn cancel(&self, run_id: i64) {
         let cid = self.active.lock().unwrap().get(&run_id).cloned();
