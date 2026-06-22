@@ -199,6 +199,29 @@ impl WarmPool {
                         let idle = self.idle.lock().unwrap();
                         idle.get(&image).map(|v| v.len()).unwrap_or(0)
                     };
+                    if have > target {
+                        // Scale down: the autoscaler lowered the target (λ fell), so discard
+                        // the excess idle containers instead of holding host resources.
+                        let excess = (have - target).min(BURST);
+                        let mut drop_ids = Vec::new();
+                        {
+                            let mut idle = self.idle.lock().unwrap();
+                            if let Some(v) = idle.get_mut(&image) {
+                                for _ in 0..excess {
+                                    if let Some(id) = v.pop() {
+                                        drop_ids.push(id);
+                                    }
+                                }
+                            }
+                        }
+                        for id in &drop_ids {
+                            self.discard(id).await;
+                        }
+                        let n = self.idle.lock().unwrap().get(&image).map(|v| v.len()).unwrap_or(0);
+                        metrics::gauge!("dokan_pool_idle_containers", "image" => image.clone())
+                            .set(n as f64);
+                        continue;
+                    }
                     let deficit = target.saturating_sub(have).min(BURST);
                     for _ in 0..deficit {
                         if let Ok(id) = self.create_idle(&image).await {

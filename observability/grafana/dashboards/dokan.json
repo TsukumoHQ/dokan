@@ -318,6 +318,55 @@
         ]
       },
       "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "type": "row",
+      "title": "Autoscale (Little's Law: L = λ·W)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 40 },
+      "id": 40,
+      "collapsed": false
+    },
+    {
+      "type": "timeseries",
+      "title": "Demand: arrival rate λ vs jobs-in-system L",
+      "description": "λ = runs enqueued/s (EWMA). L = λ·W, the concurrency the queue needs to stay stable. The controller sizes capacity to L·1.3.",
+      "id": 41,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 41 },
+      "datasource": { "type": "prometheus", "uid": "dokan-prom" },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "dokan-prom" }, "expr": "dokan_autoscale_arrival_rate", "legendFormat": "λ arrival rate (/s)" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "dokan-prom" }, "expr": "dokan_autoscale_in_system", "legendFormat": "L = λ·W (jobs)" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 8, "showPoints": "never", "lineWidth": 2 } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "λ arrival rate (/s)" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#7dd3fc" } } ] },
+          { "matcher": { "id": "byName", "options": "L = λ·W (jobs)" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#fbbf24" } } ] }
+        ]
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Capacity: concurrency & warm depth (autoscaled)",
+      "description": "The controller's outputs — worker concurrency and warm containers per image — tracking L, vs the actual idle containers held.",
+      "id": 42,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 41 },
+      "datasource": { "type": "prometheus", "uid": "dokan-prom" },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "dokan-prom" }, "expr": "dokan_autoscale_concurrency", "legendFormat": "concurrency" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "dokan-prom" }, "expr": "dokan_autoscale_warm_target", "legendFormat": "warm target / image" },
+        { "refId": "C", "datasource": { "type": "prometheus", "uid": "dokan-prom" }, "expr": "sum(dokan_pool_idle_containers)", "legendFormat": "idle containers (actual)" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "drawStyle": "line", "lineInterpolation": "stepAfter", "fillOpacity": 8, "showPoints": "never", "lineWidth": 2 } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "concurrency" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#4ade80" } } ] },
+          { "matcher": { "id": "byName", "options": "warm target / image" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#fbbf24" } } ] },
+          { "matcher": { "id": "byName", "options": "idle containers (actual)" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#5b6675" } } ] }
+        ]
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } }
     }
   ]
 }
