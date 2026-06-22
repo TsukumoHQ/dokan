@@ -96,6 +96,26 @@ pub struct CancelArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ComposeFlowArgs {
+    /// Flow name.
+    pub name: String,
+    /// DAG spec: { "steps": [ { "id", "script_id", "input"?, "depends_on"? [step ids] } ] }.
+    pub spec: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RunFlowArgs {
+    pub flow_id: i64,
+    /// JSON passed to every step as deps.flow_input. Optional.
+    pub input: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FlowRunArgs {
+    pub flow_run_id: i64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ScheduleArgs {
     pub script_id: i64,
     /// 6-field cron with leading seconds, e.g. "0 */5 * * * *" = every 5 min.
@@ -292,6 +312,58 @@ impl Dokan {
             })
             .collect();
         ok(json!({"counts": counts_obj, "recent": items}))
+    }
+
+    #[tool(description = "Compose a flow: a declarative DAG of steps wired over MCP. Validates acyclicity. Returns flow_id. The wire-over-MCP differentiator.")]
+    async fn compose_flow(
+        &self,
+        Parameters(a): Parameters<ComposeFlowArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(e) = crate::flow::validate_spec(&a.spec) {
+            return ok(json!({"error": "invalid_spec", "detail": e}));
+        }
+        let id = self
+            .db
+            .insert_flow(&a.name, &a.spec)
+            .await
+            .map_err(internal)?;
+        ok(json!({"flow_id": id, "status": "composed"}))
+    }
+
+    #[tool(description = "Run a flow. Returns flow_run_id immediately; the DAG executes step-by-step with checkpointing. Poll get_flow_run.")]
+    async fn run_flow(
+        &self,
+        Parameters(a): Parameters<RunFlowArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let Some(spec) = self.db.get_flow_spec(a.flow_id).await.map_err(internal)? else {
+            return ok(json!({"error": "flow_not_found", "id": a.flow_id}));
+        };
+        let input = a.input.unwrap_or(json!({}));
+        let id = self
+            .db
+            .insert_flow_run(a.flow_id, &spec, &input)
+            .await
+            .map_err(internal)?;
+        ok(json!({"flow_run_id": id, "status": "pending"}))
+    }
+
+    #[tool(description = "Status of a flow run: overall status + per-step status/output. Token-frugal step ledger.")]
+    async fn get_flow_run(
+        &self,
+        Parameters(a): Parameters<FlowRunArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let status = self
+            .db
+            .flow_run_status(a.flow_run_id)
+            .await
+            .map_err(internal)?
+            .unwrap_or_else(|| "unknown".into());
+        let steps = self.db.flow_steps(a.flow_run_id).await.map_err(internal)?;
+        let items: Vec<_> = steps
+            .iter()
+            .map(|s| json!({"id": s.step_id, "status": s.status, "out": s.output}))
+            .collect();
+        ok(json!({"status": status, "steps": items}))
     }
 
     #[tool(description = "Schedule a script on a cron (6-field, leading seconds). Each tick enqueues a run. Returns schedule_id.")]

@@ -51,6 +51,16 @@ pub struct ClaimedJob {
 }
 
 #[derive(Debug, Clone)]
+pub struct FlowStep {
+    pub step_id: String,
+    pub script_id: i64,
+    pub input: serde_json::Value,
+    pub depends_on: Vec<String>,
+    pub status: String,
+    pub output: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct Schedule {
     pub id: i64,
     pub script_id: i64,
@@ -339,6 +349,170 @@ impl Db {
             .collect())
     }
 
+    // ---- flows (P2) ----
+
+    pub async fn insert_flow(&self, name: &str, spec: &serde_json::Value) -> Result<i64> {
+        Ok(
+            sqlx::query_scalar("INSERT INTO flows (name, spec) VALUES ($1, $2) RETURNING id")
+                .bind(name)
+                .bind(spec)
+                .fetch_one(&self.pool)
+                .await?,
+        )
+    }
+
+    pub async fn get_flow_spec(&self, flow_id: i64) -> Result<Option<serde_json::Value>> {
+        Ok(
+            sqlx::query_scalar("SELECT spec FROM flows WHERE id = $1")
+                .bind(flow_id)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
+    /// Create a flow_run plus its flow_steps (the durability ledger), from the spec.
+    pub async fn insert_flow_run(
+        &self,
+        flow_id: i64,
+        spec: &serde_json::Value,
+        input: &serde_json::Value,
+    ) -> Result<i64> {
+        let mut tx = self.pool.begin().await?;
+        let flow_run_id: i64 = sqlx::query_scalar(
+            "INSERT INTO flow_runs (flow_id, input) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(flow_id)
+        .bind(input)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        let steps = spec.get("steps").and_then(|s| s.as_array()).cloned().unwrap_or_default();
+        for st in steps {
+            let step_id = st.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+            let script_id = st.get("script_id").and_then(|v| v.as_i64()).unwrap_or(0);
+            let step_input = st.get("input").cloned().unwrap_or(serde_json::json!({}));
+            let deps: Vec<String> = st
+                .get("depends_on")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|d| d.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            sqlx::query(
+                "INSERT INTO flow_steps (flow_run_id, step_id, script_id, input, depends_on) \
+                 VALUES ($1, $2, $3, $4, $5)",
+            )
+            .bind(flow_run_id)
+            .bind(step_id)
+            .bind(script_id)
+            .bind(step_input)
+            .bind(&deps)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(flow_run_id)
+    }
+
+    /// Claim a pending flow_run for driving (SKIP LOCKED, multi-engine safe).
+    pub async fn claim_flow_run(&self) -> Result<Option<(i64, serde_json::Value)>> {
+        let row = sqlx::query(
+            "WITH c AS ( \
+                 SELECT id FROM flow_runs WHERE status = 'pending' \
+                 ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1 \
+             ) \
+             UPDATE flow_runs SET status = 'running' FROM c WHERE flow_runs.id = c.id \
+             RETURNING flow_runs.id, flow_runs.input",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| {
+            (
+                r.get("id"),
+                r.get::<Option<serde_json::Value>, _>("input")
+                    .unwrap_or(serde_json::json!({})),
+            )
+        }))
+    }
+
+    pub async fn flow_steps(&self, flow_run_id: i64) -> Result<Vec<FlowStep>> {
+        let rows = sqlx::query(
+            "SELECT step_id, script_id, input, depends_on, status, output \
+             FROM flow_steps WHERE flow_run_id = $1 ORDER BY id",
+        )
+        .bind(flow_run_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| FlowStep {
+                step_id: r.get("step_id"),
+                script_id: r.get("script_id"),
+                input: r.get::<Option<serde_json::Value>, _>("input")
+                    .unwrap_or(serde_json::json!({})),
+                depends_on: r.get("depends_on"),
+                status: r.get("status"),
+                output: r.get("output"),
+            })
+            .collect())
+    }
+
+    pub async fn set_step_running(&self, flow_run_id: i64, step_id: &str, run_id: i64) -> Result<()> {
+        sqlx::query(
+            "UPDATE flow_steps SET status = 'running', run_id = $3 \
+             WHERE flow_run_id = $1 AND step_id = $2",
+        )
+        .bind(flow_run_id)
+        .bind(step_id)
+        .bind(run_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn finish_step(
+        &self,
+        flow_run_id: i64,
+        step_id: &str,
+        status: &str,
+        output: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE flow_steps SET status = $3, output = $4 \
+             WHERE flow_run_id = $1 AND step_id = $2",
+        )
+        .bind(flow_run_id)
+        .bind(step_id)
+        .bind(status)
+        .bind(output)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn finish_flow_run(&self, flow_run_id: i64, status: &str) -> Result<()> {
+        sqlx::query("UPDATE flow_runs SET status = $2, finished_at = now() WHERE id = $1")
+            .bind(flow_run_id)
+            .bind(status)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn flow_run_status(&self, flow_run_id: i64) -> Result<Option<String>> {
+        Ok(sqlx::query_scalar("SELECT status FROM flow_runs WHERE id = $1")
+            .bind(flow_run_id)
+            .fetch_optional(&self.pool)
+            .await?)
+    }
+
+    /// On engine startup: hand orphaned 'running' flow_runs back to 'pending' so they
+    /// resume. Completed steps persist, so resume continues at the step boundary.
+    pub async fn requeue_orphan_flow_runs(&self) -> Result<u64> {
+        let r = sqlx::query("UPDATE flow_runs SET status = 'pending' WHERE status = 'running'")
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected())
+    }
+
     // ---- logs ----
 
     pub async fn append_log(&self, run_id: i64, seq: i64, stream: &str, line: &str) -> Result<()> {
@@ -379,6 +553,17 @@ impl Db {
                 line: r.get("line"),
             })
             .collect())
+    }
+
+    /// Last stdout line of a run — used as a step's "output" passed to dependents.
+    pub async fn last_stdout(&self, run_id: i64) -> Result<Option<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT line FROM logs WHERE run_id = $1 AND stream = 'stdout' \
+             ORDER BY seq DESC LIMIT 1",
+        )
+        .bind(run_id)
+        .fetch_optional(&self.pool)
+        .await?)
     }
 
     pub async fn max_log_seq(&self, run_id: i64) -> Result<i64> {

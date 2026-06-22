@@ -55,3 +55,40 @@ CREATE TABLE IF NOT EXISTS schedules (
 
 -- Pending-run claim path; partial index keeps the queue scan tight.
 CREATE INDEX IF NOT EXISTS idx_runs_pending ON runs (id) WHERE status = 'pending';
+
+-- ── Flows (P2): declarative DAG of steps, each step = one container run. ──
+
+CREATE TABLE IF NOT EXISTS flows (
+    id         BIGSERIAL PRIMARY KEY,
+    name       TEXT        NOT NULL,
+    spec       JSONB       NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS flow_runs (
+    id          BIGSERIAL PRIMARY KEY,
+    flow_id     BIGINT      NOT NULL REFERENCES flows (id),
+    status      TEXT        NOT NULL DEFAULT 'pending',  -- pending|running|succeeded|failed
+    input       JSONB,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    finished_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_flow_runs_pending ON flow_runs (id) WHERE status = 'pending';
+
+-- One row per step per flow_run. Status here IS the durability checkpoint:
+-- on resume, 'succeeded' steps are skipped and the DAG continues at the boundary.
+CREATE TABLE IF NOT EXISTS flow_steps (
+    id          BIGSERIAL PRIMARY KEY,
+    flow_run_id BIGINT      NOT NULL REFERENCES flow_runs (id),
+    step_id     TEXT        NOT NULL,
+    script_id   BIGINT      NOT NULL REFERENCES scripts (id),
+    input       JSONB,
+    depends_on  TEXT[]      NOT NULL DEFAULT '{}',
+    status      TEXT        NOT NULL DEFAULT 'pending',  -- pending|running|succeeded|failed
+    run_id      BIGINT,
+    output      TEXT,
+    UNIQUE (flow_run_id, step_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_flow_steps_run ON flow_steps (flow_run_id);

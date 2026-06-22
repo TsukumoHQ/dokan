@@ -4,6 +4,7 @@
 mod cron;
 mod db;
 mod exec;
+mod flow;
 mod mcp;
 mod pool;
 mod worker;
@@ -77,6 +78,9 @@ async fn main() -> Result<()> {
     // Postgres; SKIP LOCKED keeps claims disjoint.
     if !cli.caps.is_empty() {
         Worker::new(db.clone(), exec.clone(), cli.caps.clone(), cli.concurrency).spawn();
+        // Flow engine drives DAGs by enqueuing each step as a normal run.
+        flow::FlowEngine::new(db.clone(), exec.clone()).start().await?;
+        tracing::info!("flow engine started");
     }
 
     match cli.transport.as_str() {
