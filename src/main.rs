@@ -2,6 +2,7 @@
 //! MCP-first control plane. Zero LLM inside.
 
 mod cron;
+mod crypto;
 mod db;
 mod embed;
 mod exec;

@@ -97,6 +97,10 @@ impl WarmPool {
                 memory: Some(self.mem_bytes),
                 nano_cpus: Some(self.nano_cpus),
                 pids_limit: Some(PIDS_LIMIT),
+                // Harden: drop all Linux capabilities + block privilege escalation. Jobs are
+                // scripts hitting APIs; none need caps. Relax per-deployment if ever needed.
+                cap_drop: Some(vec!["ALL".to_string()]),
+                security_opt: Some(vec!["no-new-privileges".to_string()]),
                 network_mode: Some("none".to_string()),
                 ..Default::default()
             }),
@@ -233,6 +237,10 @@ impl WarmPool {
                 memory: Some(self.mem_bytes),
                 nano_cpus: Some(self.nano_cpus),
                 pids_limit: Some(PIDS_LIMIT),
+                // Harden: drop all Linux capabilities + block privilege escalation. Jobs are
+                // scripts hitting APIs; none need caps. Relax per-deployment if ever needed.
+                cap_drop: Some(vec!["ALL".to_string()]),
+                security_opt: Some(vec!["no-new-privileges".to_string()]),
                 ..Default::default()
             }),
             // Tag so a fresh executor can sweep containers orphaned by a crashed one.

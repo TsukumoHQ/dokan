@@ -32,6 +32,11 @@ const AGENT_MAX_CONCURRENT: i64 = 25;
 /// Runtimes dokan can execute (reported by whoami so an agent self-configures).
 const SUPPORTED_RUNTIMES: [&str; 3] = ["python", "node", "bash"];
 
+/// Per-agent compute budget: max container service-seconds over the rolling window. Cheap
+/// runaway guard the agent can see (whoami) and reason about. Generous default.
+const AGENT_COMPUTE_BUDGET_SECS: f64 = 3600.0;
+const AGENT_BUDGET_WINDOW_SECS: i64 = 86400;
+
 /// Canonicalize a JSON value to a deterministic string (object keys sorted recursively),
 /// so the cache key is stable regardless of input key order.
 fn canonical_json(v: &serde_json::Value) -> String {
@@ -518,13 +523,25 @@ impl Dokan {
         } else {
             None
         };
-        // Per-agent concurrency quota: a runaway agent can't swamp the shared runtime.
+        // Per-agent backpressure: concurrency quota + rolling compute budget. A runaway
+        // agent can't swamp the shared runtime or burn unbounded compute.
         if let Some(aid) = a.agent_id.as_deref() {
             let n = self.db.agent_running_count(aid).await.map_err(internal)?;
             if n >= AGENT_MAX_CONCURRENT {
                 return ok(json!({
                     "error": "quota_exceeded", "agent_id": aid,
                     "in_flight": n, "limit": AGENT_MAX_CONCURRENT
+                }));
+            }
+            let spent = self
+                .db
+                .agent_compute_seconds(aid, AGENT_BUDGET_WINDOW_SECS)
+                .await
+                .map_err(internal)?;
+            if spent >= AGENT_COMPUTE_BUDGET_SECS {
+                return ok(json!({
+                    "error": "budget_exceeded", "agent_id": aid,
+                    "compute_seconds_24h": spent, "budget": AGENT_COMPUTE_BUDGET_SECS
                 }));
             }
         }
@@ -797,9 +814,15 @@ impl Dokan {
             .secret_names(a.agent_id.as_deref())
             .await
             .unwrap_or_default();
-        let in_flight = match a.agent_id.as_deref() {
-            Some(aid) => self.db.agent_running_count(aid).await.unwrap_or(0),
-            None => 0,
+        let (in_flight, spent) = match a.agent_id.as_deref() {
+            Some(aid) => (
+                self.db.agent_running_count(aid).await.unwrap_or(0),
+                self.db
+                    .agent_compute_seconds(aid, AGENT_BUDGET_WINDOW_SECS)
+                    .await
+                    .unwrap_or(0.0),
+            ),
+            None => (0, 0.0),
         };
         ok(json!({
             "agent_id": a.agent_id,
@@ -807,6 +830,10 @@ impl Dokan {
             "limits": { "mem_mb": mem_bytes / (1024 * 1024), "cpus": nano_cpus as f64 / 1e9 },
             "secrets": secrets,
             "quota": { "max_concurrent": AGENT_MAX_CONCURRENT, "in_flight": in_flight },
+            "budget": {
+                "compute_seconds_24h": (spent * 10.0).round() / 10.0,
+                "compute_budget": AGENT_COMPUTE_BUDGET_SECS
+            },
             "input_contract": "job reads DOKAN_INPUT (JSON env), secrets as env vars; emit `::dokan:result:: {json}` for a structured result",
         }))
     }

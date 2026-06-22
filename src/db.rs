@@ -16,6 +16,8 @@ pub struct Db {
     /// secrets generation so a change invalidates it. Avoids scanning the secret tables on
     /// every job. (Perf #4.)
     secrets_cache: Arc<Mutex<SecretsCache>>,
+    /// Seals/opens secret values at rest. (T2.)
+    crypto: crate::crypto::SecretCrypto,
 }
 
 struct SecretsCache {
@@ -120,6 +122,7 @@ impl Db {
                 generation: -1, // sentinel: first lookup misses
                 by_agent: HashMap::new(),
             })),
+            crypto: crate::crypto::SecretCrypto::from_env(),
         })
     }
 
@@ -416,6 +419,20 @@ impl Db {
              FROM runs WHERE finished_at > now() - make_interval(secs => $1) \
                AND started_at IS NOT NULL AND finished_at IS NOT NULL",
         )
+        .bind(window_secs as f64)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
+    /// Sum of an agent's run service-time (seconds) over the last `window_secs` — the cost
+    /// accounting / budget input.
+    pub async fn agent_compute_seconds(&self, agent_id: &str, window_secs: i64) -> Result<f64> {
+        Ok(sqlx::query_scalar(
+            "SELECT COALESCE(sum(extract(epoch FROM (finished_at - started_at))), 0)::double precision \
+             FROM runs WHERE agent_id = $1 AND started_at IS NOT NULL \
+               AND finished_at > now() - make_interval(secs => $2)",
+        )
+        .bind(agent_id)
         .bind(window_secs as f64)
         .fetch_one(&self.pool)
         .await?)
@@ -770,6 +787,7 @@ impl Db {
     /// Set a secret. Global (`agent_id` None) or scoped to one agent. A job sees global +
     /// its triggering agent's scoped secrets, scoped overriding on name conflict.
     pub async fn upsert_secret(&self, name: &str, value: &str, agent_id: Option<&str>) -> Result<()> {
+        let sealed = self.crypto.encrypt(value); // encrypt-at-rest before it touches the DB
         let mut tx = self.pool.begin().await?;
         match agent_id {
             Some(aid) => {
@@ -779,7 +797,7 @@ impl Db {
                 )
                 .bind(aid)
                 .bind(name)
-                .bind(value)
+                .bind(&sealed)
                 .execute(&mut *tx)
                 .await?;
             }
@@ -789,7 +807,7 @@ impl Db {
                      ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value",
                 )
                 .bind(name)
-                .bind(value)
+                .bind(&sealed)
                 .execute(&mut *tx)
                 .await?;
             }
@@ -856,7 +874,12 @@ impl Db {
                 .fetch_all(&self.pool)
                 .await?
                 .into_iter()
-                .map(|r| (r.get::<String, _>("name"), r.get::<String, _>("value")))
+                .map(|r| {
+                    (
+                        r.get::<String, _>("name"),
+                        self.crypto.decrypt(&r.get::<String, _>("value")),
+                    )
+                })
                 .collect();
         if let Some(aid) = agent_id {
             let scoped = sqlx::query("SELECT name, value FROM agent_secrets WHERE agent_id = $1")
@@ -864,7 +887,10 @@ impl Db {
                 .fetch_all(&self.pool)
                 .await?;
             for r in scoped {
-                map.insert(r.get::<String, _>("name"), r.get::<String, _>("value"));
+                map.insert(
+                    r.get::<String, _>("name"),
+                    self.crypto.decrypt(&r.get::<String, _>("value")),
+                );
             }
         }
         Ok(map.into_iter().collect())
