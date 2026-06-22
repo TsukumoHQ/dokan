@@ -1,0 +1,22 @@
+# dokan state/queue store. pgvector image so the later semantic-search phase
+# (fastembed + pgvector) needs no schema swap.
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: dokan-db
+    environment:
+      POSTGRES_USER: dokan
+      POSTGRES_PASSWORD: dokan
+      POSTGRES_DB: dokan
+    ports:
+      - "5499:5432"
+    volumes:
+      - dokan_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dokan"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  dokan_pg:

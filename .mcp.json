@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "dokan": {
+      "command": "./target/debug/dokan",
+      "args": ["--transport", "stdio"],
+      "env": {
+        "DATABASE_URL": "postgres://dokan:dokan@127.0.0.1:5499/dokan",
+        "DOCKER_HOST": "unix:///Users/loic/.colima/default/docker.sock"
+      }
+    }
+  }
+}
