@@ -42,14 +42,19 @@ pub fn runtime_spec(runtime: &str) -> Option<(&'static str, &'static str)> {
 }
 
 impl Executor {
-    pub fn connect(warm_idle: usize, relay: Option<String>) -> Result<Self> {
+    pub fn connect(
+        warm_idle: usize,
+        mem_bytes: i64,
+        nano_cpus: i64,
+        relay: Option<String>,
+    ) -> Result<Self> {
         // Honor DOCKER_HOST (Colima/Docker Desktop sockets live outside /var/run).
         let docker = if std::env::var("DOCKER_HOST").is_ok() {
             Docker::connect_with_defaults()?
         } else {
             Docker::connect_with_local_defaults()?
         };
-        let pool = WarmPool::new(docker.clone(), warm_idle);
+        let pool = WarmPool::new(docker.clone(), warm_idle, mem_bytes, nano_cpus);
         Ok(Self {
             docker,
             pool,
@@ -59,13 +64,21 @@ impl Executor {
         })
     }
 
-    /// Record terminal metrics and POST the result to the relay (mesh egress).
-    async fn finalize(&self, run_id: i64, status: &str, exit_code: Option<i32>) {
+    /// Record terminal metrics and POST the outcome to the relay (mesh egress). The
+    /// structured `result` (if the job emitted one) rides along so a monitor's finding
+    /// reaches the agent event-driven — no polling.
+    async fn finalize(
+        &self,
+        run_id: i64,
+        status: &str,
+        exit_code: Option<i32>,
+        result: Option<serde_json::Value>,
+    ) {
         metrics::counter!("dokan_runs_finished_total", "status" => status.to_string())
             .increment(1);
         if let Some(url) = &self.relay {
             let body = serde_json::json!({
-                "run_id": run_id, "status": status, "exit_code": exit_code,
+                "run_id": run_id, "status": status, "exit_code": exit_code, "result": result,
             });
             let _ = self.http.post(url).json(&body).send().await;
         }
@@ -100,7 +113,7 @@ impl Executor {
             let seq = db.max_log_seq(run_id).await.unwrap_or(0) + 1;
             let _ = db.append_log(run_id, seq, "stderr", &format!("dokan: {msg}")).await;
             let _ = db.finish_run(run_id, "failed", None, Some(&msg)).await;
-            self.finalize(run_id, "failed", None).await;
+            self.finalize(run_id, "failed", None, None).await;
             terminal = "failed";
         }
         self.active.lock().unwrap().remove(&run_id);
@@ -177,13 +190,15 @@ impl Executor {
                     ..Default::default()
                 },
             )
-            .await?;
+            .await
+            .map_err(stale_container)?;
         let exec_id = exec.id;
 
         let started = self
             .docker
             .start_exec(&exec_id, None::<StartExecOptions>)
-            .await?;
+            .await
+            .map_err(stale_container)?;
 
         let output = match started {
             StartExecResults::Attached { output, .. } => output,
@@ -204,11 +219,17 @@ impl Executor {
                 db.append_log(run_id, s, "stderr", "dokan: timeout, container killed")
                     .await?;
                 db.finish_run(run_id, "failed", None, Some("timeout")).await?;
-                self.finalize(run_id, "failed", None).await;
+                self.finalize(run_id, "failed", None, None).await;
                 return Ok(());
             }
         };
+        let (last_seq, result_raw) = last_seq;
         let _ = last_seq;
+        // Parse the structured result (best-effort: non-JSON is wrapped as a string so the
+        // channel still works for a plain status token).
+        let result = result_raw.map(|s| {
+            serde_json::from_str::<serde_json::Value>(&s).unwrap_or(serde_json::Value::String(s))
+        });
 
         let exit_code = match self.docker.inspect_exec(&exec_id).await {
             Ok(inspect) => inspect.exit_code.unwrap_or(0),
@@ -221,7 +242,7 @@ impl Executor {
                 db.append_log(run_id, s, "stderr", "dokan: container vanished before exit code; marking failed")
                     .await?;
                 db.finish_run(run_id, "failed", None, Some("container vanished")).await?;
-                self.finalize(run_id, "failed", None).await;
+                self.finalize(run_id, "failed", None, result).await;
                 return Ok(());
             }
             Err(e) => return Err(e.into()),
@@ -229,20 +250,43 @@ impl Executor {
         let status = if exit_code == 0 { "succeeded" } else { "failed" };
         db.finish_run(run_id, status, Some(exit_code as i32), None)
             .await?;
-        self.finalize(run_id, status, Some(exit_code as i32)).await;
+        if let Some(r) = &result {
+            let _ = db.set_run_result(run_id, r).await;
+        }
+        self.finalize(run_id, status, Some(exit_code as i32), result).await;
         Ok(())
     }
 }
 
-/// Stream container output line-by-line into the DB. Returns the last seq written.
+/// Map a "container vanished" (404) Docker error into a clean, retryable infra error: the
+/// acquired warm container was torn down (multi-daemon / teardown race) before we could
+/// exec into it. The run then finishes with a NULL exit code, so the worker retries it onto
+/// a fresh container instead of dumping a raw Docker 404 into the job's stderr tail.
+fn stale_container(e: bollard::errors::Error) -> anyhow::Error {
+    match e {
+        bollard::errors::Error::DockerResponseServerError { status_code: 404, .. } => {
+            anyhow!("warm container unavailable (stale); retrying on a fresh one")
+        }
+        other => other.into(),
+    }
+}
+
+/// A stdout line of the form `::dokan:result:: {json}` is the job's structured result —
+/// captured (last one wins) rather than logged, so monitors return findings without the
+/// caller parsing stdout, and the relay egress can carry it.
+const RESULT_MARKER: &str = "::dokan:result::";
+
+/// Stream container output line-by-line into the DB. Returns (last seq written, captured
+/// structured result if the job emitted a RESULT_MARKER line).
 async fn pump_logs(
     db: &Db,
     run_id: i64,
     mut stream: impl Stream<Item = Result<LogOutput, bollard::errors::Error>> + Unpin,
-) -> Result<i64> {
+) -> Result<(i64, Option<String>)> {
     let mut seq = db.max_log_seq(run_id).await.unwrap_or(0);
     let mut buf_out = String::new();
     let mut buf_err = String::new();
+    let mut result: Option<String> = None;
 
     while let Some(item) = stream.next().await {
         let out = match item {
@@ -268,17 +312,30 @@ async fn pump_logs(
         while let Some(nl) = buf.find('\n') {
             let line: String = buf.drain(..=nl).collect();
             let line = line.trim_end_matches('\n').trim_end_matches('\r');
+            if stream_name == "stdout" {
+                if let Some(rest) = line.trim_start().strip_prefix(RESULT_MARKER) {
+                    result = Some(rest.trim().to_string()); // control line: result, not a log
+                    continue;
+                }
+            }
             seq += 1;
             db.append_log(run_id, seq, stream_name, line).await?;
             metrics::counter!("dokan_log_lines_total", "stream" => stream_name).increment(1);
         }
     }
     for (stream_name, buf) in [("stdout", &buf_out), ("stderr", &buf_err)] {
-        if !buf.is_empty() {
-            seq += 1;
-            db.append_log(run_id, seq, stream_name, buf).await?;
-            metrics::counter!("dokan_log_lines_total", "stream" => stream_name).increment(1);
+        if buf.is_empty() {
+            continue;
         }
+        if stream_name == "stdout" {
+            if let Some(rest) = buf.trim_start().strip_prefix(RESULT_MARKER) {
+                result = Some(rest.trim().to_string());
+                continue;
+            }
+        }
+        seq += 1;
+        db.append_log(run_id, seq, stream_name, buf).await?;
+        metrics::counter!("dokan_log_lines_total", "stream" => stream_name).increment(1);
     }
-    Ok(seq)
+    Ok((seq, result))
 }

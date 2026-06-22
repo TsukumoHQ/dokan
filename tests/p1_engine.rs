@@ -210,6 +210,49 @@ async fn fuzzy_search_finds_typo() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A job emits a structured result via the `::dokan:result::` stdout channel; dokan
+/// captures it (not as a log line) and returns it from wait_for. (Terrain #1+#5.)
+#[tokio::test]
+async fn structured_result_is_captured() -> anyhow::Result<()> {
+    let c = spawn().await?;
+    let sid = upload(
+        &c,
+        "bash",
+        "echo working\necho '::dokan:result:: {\"alert\":true,\"n\":3}'\n",
+    )
+    .await;
+    let run = call(&c, "run_script", json!({"script_id": sid})).await?;
+    let run_id = run["run_id"].as_i64().unwrap();
+    let w = call(&c, "wait_for", json!({"run_id": run_id, "timeout": 60})).await?;
+    assert_eq!(w["status"], "succeeded", "ran: {w}");
+    assert_eq!(w["result"]["alert"], true, "result captured: {w}");
+    assert_eq!(w["result"]["n"], 3, "result payload intact: {w}");
+    // The sentinel line is a control channel, not log output.
+    let text = logs_text(&c, run_id).await;
+    assert!(text.contains("working"), "normal stdout logged: {text}");
+    assert!(!text.contains("::dokan:result::"), "sentinel not logged: {text}");
+    c.cancel().await?;
+    Ok(())
+}
+
+/// delete_script removes the script and cascades its runs; afterwards get_script 404s.
+/// (Terrain #2 — orphan cleanup.)
+#[tokio::test]
+async fn delete_script_cascades() -> anyhow::Result<()> {
+    let c = spawn().await?;
+    let sid = upload(&c, "bash", "echo bye\n").await;
+    let run = call(&c, "run_script", json!({"script_id": sid})).await?;
+    let run_id = run["run_id"].as_i64().unwrap();
+    assert_eq!(wait_status(&c, run_id, 60).await, "succeeded", "ran");
+    let d = call(&c, "delete_script", json!({"script_id": sid})).await?;
+    assert_eq!(d["status"], "deleted", "deleted: {d}");
+    assert!(d["runs_removed"].as_i64().unwrap() >= 1, "cascaded a run: {d}");
+    let g = call(&c, "get_script", json!({"id": sid})).await?;
+    assert_eq!(g["error"], "not_found", "script gone: {g}");
+    c.cancel().await?;
+    Ok(())
+}
+
 /// A 5-field crontab (missing the leading SECONDS column) is rejected loudly instead of
 /// being silently accepted and never firing. (Terrain P2.)
 #[tokio::test]

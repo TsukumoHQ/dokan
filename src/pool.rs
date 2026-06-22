@@ -18,21 +18,25 @@ use std::sync::Mutex;
 use std::sync::Arc;
 use std::time::Duration;
 
-const MEM_LIMIT_BYTES: i64 = 512 * 1024 * 1024; // 512 MiB
-const NANO_CPUS: i64 = 1_000_000_000; // 1.0 CPU
+/// Hard guard against a fork bomb / runaway thread count inside a job.
+const PIDS_LIMIT: i64 = 512;
 
 pub struct WarmPool {
     docker: Docker,
     target_idle: usize,
+    mem_bytes: i64,
+    nano_cpus: i64,
     idle: Mutex<HashMap<String, Vec<String>>>, // image -> [container_id]
     known: Mutex<HashSet<String>>,             // images to keep warm
 }
 
 impl WarmPool {
-    pub fn new(docker: Docker, target_idle: usize) -> Arc<Self> {
+    pub fn new(docker: Docker, target_idle: usize, mem_bytes: i64, nano_cpus: i64) -> Arc<Self> {
         let pool = Arc::new(Self {
             docker,
             target_idle,
+            mem_bytes,
+            nano_cpus,
             idle: Mutex::new(HashMap::new()),
             known: Mutex::new(HashSet::new()),
         });
@@ -106,8 +110,9 @@ impl WarmPool {
             // Idle until we exec the job into it; resource caps applied here.
             cmd: Some(vec!["sleep".into(), "infinity".into()]),
             host_config: Some(HostConfig {
-                memory: Some(MEM_LIMIT_BYTES),
-                nano_cpus: Some(NANO_CPUS),
+                memory: Some(self.mem_bytes),
+                nano_cpus: Some(self.nano_cpus),
+                pids_limit: Some(PIDS_LIMIT),
                 ..Default::default()
             }),
             ..Default::default()

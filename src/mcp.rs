@@ -138,6 +138,11 @@ pub struct ScheduleArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DeleteScriptArgs {
+    pub script_id: i64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SetSecretArgs {
     /// Env var name injected into every job container, e.g. "OPENAI_API_KEY".
     pub name: String,
@@ -232,7 +237,7 @@ impl Dokan {
         ok(v)
     }
 
-    #[tool(description = "Upload a script. Returns script_id + version. Runtime: python|node|bash. INPUT CONTRACT: the script reads its input from the DOKAN_INPUT env var (a JSON string) — NOT stdin or argv. Secrets set via set_secret arrive as their own env vars (e.g. $OPENAI_API_KEY). A nonzero exit is treated as the script's own deterministic verdict (e.g. a monitor finding) and is NOT retried; only a container/infra failure retries. Pass upsert=true to re-provision by name idempotently (no duplicate rows on respawn).")]
+    #[tool(description = "Upload a script. Returns script_id + version. Runtime: python|node|bash. INPUT CONTRACT: the script reads its input from the DOKAN_INPUT env var (a JSON string) — NOT stdin or argv. Secrets set via set_secret arrive as their own env vars (e.g. $OPENAI_API_KEY). A nonzero exit is treated as the script's own deterministic verdict (e.g. a monitor finding) and is NOT retried; only a container/infra failure retries. Pass upsert=true to re-provision by name idempotently (no duplicate rows on respawn). STRUCTURED RESULT: print a line `::dokan:result:: {json}` on stdout to attach a structured result to the run — it is captured (not logged), returned by wait_for/read_logs, and POSTed to the relay, so a monitor's finding reaches the agent event-driven.")]
     async fn upload_script(
         &self,
         Parameters(a): Parameters<UploadArgs>,
@@ -263,6 +268,8 @@ impl Dokan {
                 return ok(json!({"script_id": id, "version": version, "status": "updated"}));
             }
         }
+        // Captured before insert so the duplicate-name warning can compare against it.
+        let prior = self.db.find_script_by_name(&a.name).await.ok().flatten();
         let embedding = self.embed_script(&a.name, &a.description).await;
         let (id, version) = self
             .db
@@ -276,7 +283,17 @@ impl Dokan {
             )
             .await
             .map_err(internal)?;
-        ok(json!({"script_id": id, "version": version, "status": "uploaded"}))
+        let mut out = json!({"script_id": id, "version": version, "status": "uploaded"});
+        // Footgun guard: a plain upload of a name that already exists silently spawns a
+        // duplicate script_id (orphan accumulation). `prior` was captured before insert.
+        if let Some((existing, _, _)) = prior {
+            out["warning"] = json!(format!(
+                "another script named '{}' already exists (id {}); this created a NEW id {}. \
+                 Pass upsert=true to update in place instead of accumulating duplicates.",
+                a.name, existing, id
+            ));
+        }
+        ok(out)
     }
 
     /// Embed name + description for semantic search (best-effort; None when no embedder).
@@ -287,6 +304,34 @@ impl Dokan {
                 emb.embed(text).await.ok()
             }
             None => None,
+        }
+    }
+
+    #[tool(description = "Delete a script and cascade its runs, logs, and schedules (live cron jobs stopped). Refused if a flow references it. Use to clean up orphan scripts from re-uploads.")]
+    async fn delete_script(
+        &self,
+        Parameters(a): Parameters<DeleteScriptArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        match self.db.delete_script(a.script_id).await.map_err(internal)? {
+            crate::db::DeleteResult::NotFound => {
+                ok(json!({"error": "script_not_found", "id": a.script_id}))
+            }
+            crate::db::DeleteResult::BlockedByFlow(n) => ok(json!({
+                "error": "referenced_by_flow", "id": a.script_id, "flow_steps": n,
+                "hint": "a flow depends on this script; delete/retire the flow first"
+            })),
+            crate::db::DeleteResult::Deleted { runs, schedules } => {
+                // Stop the live cron jobs for the schedules we just removed.
+                if let Some(cron) = &self.cron {
+                    for sid in &schedules {
+                        let _ = cron.remove(*sid).await;
+                    }
+                }
+                ok(json!({
+                    "script_id": a.script_id, "status": "deleted",
+                    "runs_removed": runs, "schedules_removed": schedules.len()
+                }))
+            }
         }
     }
 
@@ -336,12 +381,16 @@ impl Dokan {
             .map(|l| format!("{}|{}|{}", l.seq, l.stream, l.line))
             .collect();
         let remaining = (max_seq - next_cursor).max(0);
-        ok(json!({
+        let mut out = json!({
             "status": status,
             "lines": rendered,
             "next_cursor": next_cursor,
             "note": format!("{} more after cursor", remaining),
-        }))
+        });
+        if let Some(r) = self.db.run_result(a.run_id).await.ok().flatten() {
+            out["result"] = r;
+        }
+        ok(out)
     }
 
     #[tool(description = "Long-poll a run until it reaches a terminal status or timeout. Returns final status + tail logs. Fewer round-trips than polling.")]
@@ -376,11 +425,15 @@ impl Dokan {
             .iter()
             .map(|l| format!("{}|{}|{}", l.seq, l.stream, l.line))
             .collect();
-        ok(json!({
+        let mut out = json!({
             "status": status,
             "tail": rendered,
             "next_cursor": max_seq,
-        }))
+        });
+        if let Some(r) = self.db.run_result(a.run_id).await.ok().flatten() {
+            out["result"] = r;
+        }
+        ok(out)
     }
 
     #[tool(description = "List recent runs with server-side status counts. Optional status filter. Cursor-light summary, not every row.")]

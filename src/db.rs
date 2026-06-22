@@ -74,6 +74,15 @@ pub struct Schedule {
     pub input: serde_json::Value,
 }
 
+/// Outcome of `delete_script`.
+pub enum DeleteResult {
+    NotFound,
+    /// Referenced by N flow steps — refused (flows are durable).
+    BlockedByFlow(i64),
+    /// Deleted; `runs` rows removed, `schedules` ids whose live cron jobs must be stopped.
+    Deleted { runs: u64, schedules: Vec<i64> },
+}
+
 #[derive(Debug, Clone)]
 pub struct LogLine {
     pub seq: i64,
@@ -218,6 +227,51 @@ impl Db {
         Ok((out, total))
     }
 
+    /// Delete a script and cascade its runs, logs, and schedules in one transaction.
+    /// Refuses (BlockedByFlow) if any flow step references it — flows are durable. Returns
+    /// the removed schedule ids so the caller can stop their live cron jobs.
+    pub async fn delete_script(&self, id: i64) -> Result<DeleteResult> {
+        let mut tx = self.pool.begin().await?;
+        let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM scripts WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if exists.is_none() {
+            return Ok(DeleteResult::NotFound);
+        }
+        let flow_refs: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM flow_steps WHERE script_id = $1")
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if flow_refs > 0 {
+            return Ok(DeleteResult::BlockedByFlow(flow_refs));
+        }
+        let schedules: Vec<i64> = sqlx::query_scalar("SELECT id FROM schedules WHERE script_id = $1")
+            .bind(id)
+            .fetch_all(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM logs WHERE run_id IN (SELECT id FROM runs WHERE script_id = $1)")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        let runs = sqlx::query("DELETE FROM runs WHERE script_id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        sqlx::query("DELETE FROM schedules WHERE script_id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM scripts WHERE id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(DeleteResult::Deleted { runs, schedules })
+    }
+
     /// Look up a script by exact name (newest first) for idempotent re-provisioning.
     /// Returns (id, source, version) so upload can no-op when nothing changed.
     pub async fn find_script_by_name(&self, name: &str) -> Result<Option<(i64, String, i32)>> {
@@ -295,6 +349,27 @@ impl Db {
             .bind(id)
             .fetch_optional(&self.pool)
             .await?)
+    }
+
+    /// Store a job's structured result (from the `::dokan:result::` channel).
+    pub async fn set_run_result(&self, id: i64, result: &serde_json::Value) -> Result<()> {
+        sqlx::query("UPDATE runs SET result = $2 WHERE id = $1")
+            .bind(id)
+            .bind(result)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// A run's structured result, if any.
+    pub async fn run_result(&self, id: i64) -> Result<Option<serde_json::Value>> {
+        let v: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT result FROM runs WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?
+                .flatten();
+        Ok(v)
     }
 
     /// (status, exit_code) — the retry decision input. A present exit_code means the

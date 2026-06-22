@@ -54,6 +54,14 @@ struct Cli {
     #[arg(long, default_value_t = 2, env = "DOKAN_WARM_IDLE")]
     warm_idle: usize,
 
+    /// Per-job memory cap (MiB). The cgroup OOM-kills a job that exceeds it (exit 137).
+    #[arg(long, default_value_t = 1024, env = "DOKAN_MEM_LIMIT_MB")]
+    mem_limit_mb: i64,
+
+    /// Per-job CPU cap (cores; fractional allowed, e.g. 1.5).
+    #[arg(long, default_value_t = 2.0, env = "DOKAN_CPU_LIMIT")]
+    cpu_limit: f64,
+
     /// Enable local semantic search (loads the BGE embedding model).
     #[arg(long, env = "DOKAN_EMBED")]
     embed: bool,
@@ -121,8 +129,20 @@ async fn main() -> Result<()> {
         });
     }
 
-    let exec = Arc::new(Executor::connect(cli.warm_idle, cli.relay_url.clone())?);
-    tracing::info!(warm_idle = cli.warm_idle, "docker connected, warm pool armed");
+    let mem_bytes = cli.mem_limit_mb * 1024 * 1024;
+    let nano_cpus = (cli.cpu_limit * 1e9) as i64;
+    let exec = Arc::new(Executor::connect(
+        cli.warm_idle,
+        mem_bytes,
+        nano_cpus,
+        cli.relay_url.clone(),
+    )?);
+    tracing::info!(
+        warm_idle = cli.warm_idle,
+        mem_limit_mb = cli.mem_limit_mb,
+        cpu_limit = cli.cpu_limit,
+        "docker connected, warm pool armed"
+    );
 
     // Optional local embeddings for semantic search.
     let embedder = if cli.embed {

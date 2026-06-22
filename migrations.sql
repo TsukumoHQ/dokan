@@ -117,3 +117,8 @@ ALTER TABLE flow_runs ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ;
 -- index keeps it cheap as the registry grows.
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 CREATE INDEX IF NOT EXISTS idx_scripts_name_trgm ON scripts USING gin (name gin_trgm_ops);
+
+-- Structured result channel: a job emits `::dokan:result:: {json}` on stdout; dokan
+-- captures the last one here so monitors return findings without callers parsing stdout,
+-- and the relay egress carries it for event-driven alerting.
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS result JSONB;
