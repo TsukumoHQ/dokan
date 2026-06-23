@@ -329,10 +329,15 @@ async fn serve_http(
         metrics: metrics_handle,
     };
     // MCP control plane + thin operator UI, behind one bearer-token gate.
-    let app = axum::Router::new()
+    let protected = axum::Router::new()
         .nest_service("/mcp", service)
-        .merge(http::operator_router(state))
+        .merge(http::operator_router(state.clone()))
         .layer(axum::middleware::from_fn_with_state(token, http::auth));
+    // Inbound webhooks sit OUTSIDE the bearer gate (the URL token is their auth), so an
+    // external service can reach /hook/<token> without DOKAN_TOKEN.
+    let app = axum::Router::new()
+        .merge(http::webhook_router(state))
+        .merge(protected);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("dokan listening: MCP http://{addr}/mcp · UI http://{addr}/");

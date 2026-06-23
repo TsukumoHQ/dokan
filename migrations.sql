@@ -206,3 +206,19 @@ CREATE TABLE IF NOT EXISTS executors (
     started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_seen  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- ── Webhooks: inbound HTTP triggers. An external service POSTs to /hook/<token> and the
+-- request body becomes the run's input. The unguessable `token` in the URL IS the auth
+-- (the endpoint sits outside the bearer gate); `signing_secret` is reserved for optional
+-- HMAC verification later. dokan only owns the endpoint — public reachability of a local
+-- daemon (tunnel/relay) is the operator's concern. ──
+CREATE TABLE IF NOT EXISTS webhooks (
+    id             BIGSERIAL PRIMARY KEY,
+    token          TEXT        NOT NULL UNIQUE,   -- capability in the URL path
+    target_kind    TEXT        NOT NULL,          -- 'script' | 'flow'
+    target_id      BIGINT      NOT NULL,
+    signing_secret TEXT,                          -- reserved: future HMAC verification
+    agent_id       TEXT,                          -- provenance + scoped secrets
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_webhooks_token ON webhooks (token);

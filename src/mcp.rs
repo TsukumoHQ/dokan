@@ -198,6 +198,21 @@ pub struct FlowRunArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CreateWebhookArgs {
+    /// What to trigger: "script" or "flow".
+    pub target: String,
+    /// The script_id or flow_id to run when the webhook fires.
+    pub target_id: i64,
+    /// Optional agent tag — provenance + scoped secrets for the triggered run.
+    pub agent_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DeleteWebhookArgs {
+    pub webhook_id: i64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct UnscheduleArgs {
     pub schedule_id: i64,
 }
@@ -804,6 +819,46 @@ impl Dokan {
             .map(|s| json!({"schedule_id": s.id, "script_id": s.script_id, "script": s.script_name, "cron": s.cron}))
             .collect();
         ok(json!({"schedules": items}))
+    }
+
+    #[tool(description = "Register an inbound webhook so an external service can trigger a script/flow over HTTP. An external POST to /hook/<token> enqueues the target with the request body as input (non-blocking). target is \"script\" or \"flow\". Returns the token + path. The unguessable URL token is the auth (the endpoint is outside the bearer gate). dokan owns only the endpoint — making a local daemon publicly reachable (tunnel/relay) is the operator's concern.")]
+    async fn create_webhook(
+        &self,
+        Parameters(a): Parameters<CreateWebhookArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        if a.target != "script" && a.target != "flow" {
+            return ok(json!({"error": "bad_target", "detail": "target must be \"script\" or \"flow\""}));
+        }
+        let exists = if a.target == "flow" {
+            self.db.get_flow_spec(a.target_id).await.map_err(internal)?.is_some()
+        } else {
+            self.db.get_script(a.target_id).await.map_err(internal)?.is_some()
+        };
+        if !exists {
+            return ok(json!({"error": format!("{}_not_found", a.target), "id": a.target_id}));
+        }
+        let token = crate::crypto::random_token();
+        let id = self
+            .db
+            .insert_webhook(&token, &a.target, a.target_id, a.agent_id.as_deref())
+            .await
+            .map_err(internal)?;
+        ok(json!({"webhook_id": id, "token": token, "path": format!("/hook/{token}"), "status": "created"}))
+    }
+
+    #[tool(description = "List inbound webhooks: id, token (the URL secret), target kind + id, agent. Operator-only surface.")]
+    async fn list_webhooks(&self) -> Result<CallToolResult, McpError> {
+        let rows = self.db.list_webhooks().await.map_err(internal)?;
+        ok(json!({"webhooks": rows}))
+    }
+
+    #[tool(description = "Revoke an inbound webhook by id (its /hook/<token> URL stops working).")]
+    async fn delete_webhook(
+        &self,
+        Parameters(a): Parameters<DeleteWebhookArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let deleted = self.db.delete_webhook(a.webhook_id).await.map_err(internal)?;
+        ok(json!({"webhook_id": a.webhook_id, "deleted": deleted}))
     }
 
     #[tool(description = "Set a secret, injected as an env var into every job container (e.g. OPENAI_API_KEY). Write-only: values are never returned or logged. Upsert by name.")]

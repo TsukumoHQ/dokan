@@ -173,3 +173,79 @@ async fn operator_surface_and_relay() -> anyhow::Result<()> {
     let _ = child.kill().await;
     Ok(())
 }
+
+/// Inbound webhook: an external POST to /hook/<token> enqueues the target script with the
+/// body as input — and works WITHOUT a bearer token (the URL token is the auth), even
+/// though the daemon is booted with one. Proves the endpoint sits outside the bearer gate.
+#[tokio::test]
+async fn webhook_fires_without_bearer() -> anyhow::Result<()> {
+    let port = free_port();
+    let base = format!("http://127.0.0.1:{port}");
+    let token = "testtok";
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dokan"))
+        .args([
+            "--transport", "http",
+            "--addr", &format!("127.0.0.1:{port}"),
+            "--token", token,
+        ])
+        .kill_on_drop(true)
+        .spawn()?;
+
+    let cli = reqwest::Client::new();
+    let auth = format!("Bearer {token}");
+    let mut up = false;
+    for _ in 0..50 {
+        if let Ok(r) = cli.get(format!("{base}/metrics")).header("authorization", &auth).send().await {
+            if r.status().is_success() { up = true; break; }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(up, "dokan http did not come up");
+
+    // Seed a script + a webhook pointing at it.
+    let pool = sqlx::postgres::PgPool::connect(&db_url()).await?;
+    let script_id: i64 = sqlx::query(
+        "INSERT INTO scripts (name, runtime, source, description) \
+         VALUES ('wh-test', 'bash', 'echo from-webhook\n', 'p3 webhook') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await?
+    .get("id");
+    let hook_token = format!("whtok-{port}");
+    sqlx::query("INSERT INTO webhooks (token, target_kind, target_id) VALUES ($1, 'script', $2)")
+        .bind(&hook_token)
+        .bind(script_id)
+        .execute(&pool)
+        .await?;
+
+    // Fire it with NO authorization header — must be accepted (202) and return a run_id.
+    let resp = cli
+        .post(format!("{base}/hook/{hook_token}"))
+        .json(&json!({"event": "ping"}))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 202, "webhook accepted without bearer");
+    let body: serde_json::Value = resp.json().await?;
+    let run_id = body["run_id"].as_i64().expect(&body.to_string());
+
+    // An unknown token is 404.
+    let miss = cli.post(format!("{base}/hook/nope")).json(&json!({})).send().await?;
+    assert_eq!(miss.status(), 404, "unknown webhook token rejected");
+
+    // The enqueued run executes to completion (daemon is an executor).
+    let mut done = false;
+    for _ in 0..60 {
+        let st: Option<String> = sqlx::query("SELECT status FROM runs WHERE id = $1")
+            .bind(run_id)
+            .fetch_one(&pool)
+            .await?
+            .get("status");
+        if st.as_deref() == Some("succeeded") { done = true; break; }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(done, "webhook-triggered run reached succeeded");
+
+    let _ = child.kill().await;
+    Ok(())
+}

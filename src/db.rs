@@ -1310,6 +1310,77 @@ impl Db {
         Ok(())
     }
 
+    // ---- webhooks (inbound HTTP triggers) ----
+
+    /// Register an inbound webhook. `kind` is "script" | "flow", `target_id` the script/flow.
+    pub async fn insert_webhook(
+        &self,
+        token: &str,
+        kind: &str,
+        target_id: i64,
+        agent_id: Option<&str>,
+    ) -> Result<i64> {
+        let id = sqlx::query_scalar(
+            "INSERT INTO webhooks (token, target_kind, target_id, agent_id) \
+             VALUES ($1, $2, $3, $4) RETURNING id",
+        )
+        .bind(token)
+        .bind(kind)
+        .bind(target_id)
+        .bind(agent_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    /// Resolve a webhook token to its target: (kind, target_id, agent_id). The token is the
+    /// capability — this is the only auth the /hook endpoint applies.
+    pub async fn find_webhook_by_token(
+        &self,
+        token: &str,
+    ) -> Result<Option<(String, i64, Option<String>)>> {
+        let row = sqlx::query(
+            "SELECT target_kind, target_id, agent_id FROM webhooks WHERE token = $1",
+        )
+        .bind(token)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| (r.get("target_kind"), r.get("target_id"), r.get("agent_id"))))
+    }
+
+    pub async fn list_webhooks(&self) -> Result<Vec<serde_json::Value>> {
+        let rows = sqlx::query(
+            "SELECT id, token, target_kind, target_id, agent_id, created_at \
+             FROM webhooks ORDER BY id DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let created: chrono::DateTime<chrono::Utc> = r.get("created_at");
+                serde_json::json!({
+                    "webhook_id": r.get::<i64, _>("id"),
+                    "token": r.get::<String, _>("token"),
+                    "kind": r.get::<String, _>("target_kind"),
+                    "target_id": r.get::<i64, _>("target_id"),
+                    "agent_id": r.get::<Option<String>, _>("agent_id"),
+                    "created_at": created.to_rfc3339(),
+                })
+            })
+            .collect())
+    }
+
+    /// Delete a webhook by id. Returns true if a row was removed.
+    pub async fn delete_webhook(&self, id: i64) -> Result<bool> {
+        let n = sqlx::query("DELETE FROM webhooks WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        Ok(n > 0)
+    }
+
     /// Batch-insert log lines in ONE round-trip via UNNEST — a chatty job no longer pays a
     /// query per line. (Perf #2.) `rows` is (seq, stream, line).
     pub async fn append_logs_batch(&self, run_id: i64, rows: &[(i64, &str, &str)]) -> Result<()> {
