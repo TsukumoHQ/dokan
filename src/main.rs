@@ -380,5 +380,6 @@ fn describe_metrics() {
     // Cron + flows.
     metrics::describe_counter!("dokan_cron_runs_enqueued_total", Unit::Count, "Runs enqueued by the cron scheduler");
     metrics::describe_counter!("dokan_flow_runs_finished_total", Unit::Count, "Flow runs reaching a terminal status, by status");
-    metrics::describe_counter!("dokan_flow_steps_finished_total", Unit::Count, "Flow steps reaching a terminal status, by status");
+    metrics::describe_counter!("dokan_flow_steps_finished_total", Unit::Count, "Flow steps reaching a terminal status, by status (succeeded/failed/skipped)");
+    metrics::describe_counter!("dokan_flow_compensations_total", Unit::Count, "Saga compensation script runs (rollback of a succeeded step after the flow failed)");
 }

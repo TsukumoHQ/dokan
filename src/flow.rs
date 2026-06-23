@@ -4,14 +4,13 @@
 //! step there is no magic: a step that dies is re-run, so steps must be idempotent.
 //! This is the deliberate escape from the Temporal replay trap (PRD §6).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::db::Db;
 use crate::exec::{runtime_spec, Executor};
 
-const STEP_MAX_ATTEMPTS: u32 = 2;
 const IDLE_POLL: Duration = Duration::from_millis(400);
 /// Flow-run lease: a driver heartbeats between step batches, but a single in-flight step
 /// can run silent up to the job timeout. Set above that bound so a healthy long step is
@@ -59,8 +58,10 @@ impl FlowEngine {
         Ok(())
     }
 
-    /// Drive one flow_run to terminal status. Runs all currently-ready steps in parallel,
-    /// checkpoints each, and repeats until the DAG completes or a step fails.
+    /// Drive one flow_run to terminal status. Each pass: aggregate finished map fan-outs,
+    /// resolve pending steps (skip dead branches, evaluate `when` gates, expand `map` steps,
+    /// or run plain steps in parallel), checkpoint, repeat until the DAG completes or fails.
+    /// On failure, succeeded steps with a `compensate` script are rolled back (saga).
     async fn drive(&self, flow_run_id: i64, input: serde_json::Value) -> anyhow::Result<()> {
         loop {
             // Heartbeat: keeps this flow's lease fresh between step batches so the reaper
@@ -70,51 +71,202 @@ impl FlowEngine {
             let steps = self.db.flow_steps(flow_run_id).await?;
 
             if steps.iter().any(|s| s.status == "failed") {
+                self.compensate(flow_run_id, &input, &steps).await;
                 self.db.finish_flow_run(flow_run_id, "failed").await?;
                 metrics::counter!("dokan_flow_runs_finished_total", "status" => "failed").increment(1);
                 return Ok(());
             }
-            if steps.iter().all(|s| s.status == "succeeded") {
+            // Terminal when no step is still pending/running/expanded. Succeeded if we got
+            // here without any failure (remaining steps are succeeded and/or skipped).
+            let active = steps
+                .iter()
+                .any(|s| matches!(s.status.as_str(), "pending" | "running" | "expanded"));
+            if !active {
                 self.db.finish_flow_run(flow_run_id, "succeeded").await?;
                 metrics::counter!("dokan_flow_runs_finished_total", "status" => "succeeded").increment(1);
                 return Ok(());
             }
 
-            // Map of completed step outputs, for dependents.
+            // Outputs of succeeded steps (deps + ref resolution); set of skipped steps.
             let outputs: HashMap<String, String> = steps
                 .iter()
                 .filter(|s| s.status == "succeeded")
                 .map(|s| (s.step_id.clone(), s.output.clone().unwrap_or_default()))
                 .collect();
-
-            // Ready = pending with all deps succeeded.
-            let ready: Vec<_> = steps
+            let skipped: HashSet<String> = steps
                 .iter()
-                .filter(|s| s.status == "pending")
-                .filter(|s| s.depends_on.iter().all(|d| outputs.contains_key(d)))
-                .cloned()
+                .filter(|s| s.status == "skipped")
+                .map(|s| s.step_id.clone())
                 .collect();
 
-            if ready.is_empty() {
-                // Nothing ready and not all done → either a running step elsewhere or a
-                // stuck/unsatisfiable dep. Poll briefly; if truly stuck the next pass with
-                // no progress will be caught by the failed/succeeded checks above.
-                tokio::time::sleep(IDLE_POLL).await;
+            // 1) Aggregate any map parents whose children have all finished.
+            let mut progressed = false;
+            for parent in steps.iter().filter(|s| s.status == "expanded") {
+                match aggregate_children(&steps, &parent.step_id) {
+                    Some(Agg::Failed) => {
+                        self.db
+                            .finish_step(flow_run_id, &parent.step_id, "failed", Some("map_child_failed"))
+                            .await
+                            .ok();
+                        progressed = true;
+                    }
+                    Some(Agg::Succeeded(out)) => {
+                        self.db
+                            .finish_step(flow_run_id, &parent.step_id, "succeeded", Some(&out))
+                            .await
+                            .ok();
+                        metrics::counter!("dokan_flow_steps_finished_total", "status" => "succeeded").increment(1);
+                        progressed = true;
+                    }
+                    None => {}
+                }
+            }
+            if progressed {
                 continue;
             }
 
-            let mut handles = Vec::new();
-            for step in ready {
-                let me = self.clone();
-                let input = input.clone();
+            // 2) Resolve pending steps: skip dead branches, gate on `when`, expand `map`,
+            //    else queue for a normal container run.
+            let mut to_run = Vec::new();
+            for step in steps.iter().filter(|s| s.status == "pending").cloned() {
+                // A step is actionable only once every dep is terminal (succeeded or skipped).
+                let dep_ready = step
+                    .depends_on
+                    .iter()
+                    .all(|d| outputs.contains_key(d) || skipped.contains(d));
+                if !dep_ready {
+                    continue;
+                }
+                // Dead branch: a required dep was skipped → this step is skipped too.
+                if step.depends_on.iter().any(|d| skipped.contains(d)) {
+                    self.db.mark_step_skipped(flow_run_id, &step.step_id).await.ok();
+                    metrics::counter!("dokan_flow_steps_finished_total", "status" => "skipped").increment(1);
+                    progressed = true;
+                    continue;
+                }
                 let deps = build_deps(&step.depends_on, &outputs);
-                handles.push(tokio::spawn(async move {
-                    me.run_step(flow_run_id, step, input, deps).await
-                }));
+                // `when` gate: false → skip.
+                if let Some(cond) = &step.when_cond {
+                    if !eval_when(cond, &input, &deps) {
+                        self.db.mark_step_skipped(flow_run_id, &step.step_id).await.ok();
+                        metrics::counter!("dokan_flow_steps_finished_total", "status" => "skipped").increment(1);
+                        progressed = true;
+                        continue;
+                    }
+                }
+                // `map` fan-out: expand into children, parent becomes `expanded`.
+                if let Some(mref) = step.map_ref.clone() {
+                    self.expand(flow_run_id, &step, &input, &deps, &mref).await;
+                    progressed = true;
+                    continue;
+                }
+                to_run.push((step, deps));
             }
-            for h in handles {
-                let _ = h.await;
+
+            if !to_run.is_empty() {
+                let mut handles = Vec::new();
+                for (step, deps) in to_run {
+                    let me = self.clone();
+                    let input = input.clone();
+                    handles.push(tokio::spawn(async move {
+                        me.run_step(flow_run_id, step, input, deps).await
+                    }));
+                }
+                for h in handles {
+                    let _ = h.await;
+                }
+                continue;
             }
+            if progressed {
+                continue;
+            }
+            // Nothing actionable but work remains (a step running elsewhere) → poll.
+            tokio::time::sleep(IDLE_POLL).await;
+        }
+    }
+
+    /// Expand a `map` step: resolve its ref to an array and create one child run per element
+    /// (`<id>#<i>`, each carrying the element as its `step` input and the parent's deps). An
+    /// empty array completes the parent immediately; a non-array fails it.
+    async fn expand(
+        &self,
+        flow_run_id: i64,
+        step: &crate::db::FlowStep,
+        flow_input: &serde_json::Value,
+        deps: &serde_json::Value,
+        map_ref: &str,
+    ) {
+        let items = match resolve_ref(map_ref, flow_input, deps) {
+            Some(serde_json::Value::Array(a)) => a,
+            _ => {
+                self.db
+                    .finish_step(flow_run_id, &step.step_id, "failed", Some("map_ref_not_array"))
+                    .await
+                    .ok();
+                metrics::counter!("dokan_flow_steps_finished_total", "status" => "failed").increment(1);
+                return;
+            }
+        };
+        if items.is_empty() {
+            self.db
+                .finish_step(flow_run_id, &step.step_id, "succeeded", Some("[]"))
+                .await
+                .ok();
+            metrics::counter!("dokan_flow_steps_finished_total", "status" => "succeeded").increment(1);
+            return;
+        }
+        let children: Vec<_> = items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| {
+                (
+                    format!("{}#{}", step.step_id, i),
+                    step.script_id,
+                    item.clone(),
+                    step.depends_on.clone(),
+                )
+            })
+            .collect();
+        if let Err(e) = self.db.expand_map_step(flow_run_id, &step.step_id, &children).await {
+            tracing::error!(flow_run_id, step = %step.step_id, "map expand failed: {e}");
+        }
+    }
+
+    /// Saga rollback: for each succeeded step with a `compensate` script, in reverse order,
+    /// run that script with the step's input/output. Best-effort — a failing compensation is
+    /// logged and the rest still run, so a partial flow is unwound as far as possible.
+    async fn compensate(
+        &self,
+        flow_run_id: i64,
+        flow_input: &serde_json::Value,
+        steps: &[crate::db::FlowStep],
+    ) {
+        for step in steps.iter().rev() {
+            if step.status != "succeeded" || step.compensated {
+                continue;
+            }
+            let Some(comp_id) = step.compensate else { continue };
+            let Some(script) = self.db.get_script(comp_id).await.ok().flatten() else {
+                tracing::warn!(flow_run_id, step = %step.step_id, comp_id, "compensate script missing");
+                continue;
+            };
+            if runtime_spec(&script.runtime).is_none() {
+                continue;
+            }
+            let comp_input = serde_json::json!({
+                "flow_input": flow_input,
+                "step": step.input,
+                "output": step.output,
+            });
+            let Ok(run_id) = self.db.insert_run(comp_id, &comp_input, None).await else {
+                continue;
+            };
+            self.exec
+                .run(&self.db, run_id, &script.runtime, &script.source, &comp_input, None, script.network)
+                .await;
+            self.db.mark_step_compensated(flow_run_id, &step.step_id).await.ok();
+            metrics::counter!("dokan_flow_compensations_total").increment(1);
+            tracing::info!(flow_run_id, step = %step.step_id, "compensated");
         }
     }
 
@@ -149,7 +301,10 @@ impl FlowEngine {
             "step": step.input,
         });
 
-        for attempt in 1..=STEP_MAX_ATTEMPTS {
+        // attempts = retries + 1; a step may override the default (e.g. 0 retries for a
+        // non-idempotent step that must never re-run).
+        let max_attempts = step.retries.unwrap_or(1).max(0) as u32 + 1;
+        for attempt in 1..=max_attempts {
             let run_id = match self.db.insert_run(step.script_id, &step_input, None).await {
                 Ok(id) => id,
                 Err(e) => {
@@ -200,6 +355,100 @@ impl FlowEngine {
     }
 }
 
+/// Result of aggregating a map step's children.
+enum Agg {
+    Succeeded(String),
+    Failed,
+}
+
+/// Aggregate a map parent's children (`<parent>#<i>`). Returns `None` while any child is
+/// still pending/running, `Failed` if any child failed, else `Succeeded` with a JSON array
+/// of child outputs in index order. A skipped child contributes a null slot.
+fn aggregate_children(steps: &[crate::db::FlowStep], parent: &str) -> Option<Agg> {
+    let prefix = format!("{parent}#");
+    let mut children: Vec<&crate::db::FlowStep> =
+        steps.iter().filter(|s| s.step_id.starts_with(&prefix)).collect();
+    if children.is_empty() {
+        return None;
+    }
+    if children.iter().any(|c| matches!(c.status.as_str(), "pending" | "running" | "expanded")) {
+        return None;
+    }
+    if children.iter().any(|c| c.status == "failed") {
+        return Some(Agg::Failed);
+    }
+    // Order by the numeric index suffix so the aggregated array matches input order.
+    children.sort_by_key(|c| c.step_id.rsplit('#').next().and_then(|n| n.parse::<u64>().ok()).unwrap_or(0));
+    let arr: Vec<serde_json::Value> = children
+        .iter()
+        .map(|c| match (c.status.as_str(), &c.output) {
+            ("succeeded", Some(o)) => serde_json::Value::String(o.clone()),
+            _ => serde_json::Value::Null,
+        })
+        .collect();
+    Some(Agg::Succeeded(serde_json::Value::Array(arr).to_string()))
+}
+
+/// Resolve a dotted ref against `{flow_input, deps}`. Roots are `flow_input` or `deps`.
+/// Step outputs are stored as strings, so a string that parses as JSON is decoded at each
+/// hop — letting `map: "deps.fetch"` see an array a step printed as JSON.
+fn resolve_ref(r: &str, flow_input: &serde_json::Value, deps: &serde_json::Value) -> Option<serde_json::Value> {
+    let mut parts = r.split('.');
+    let mut cur = match parts.next()? {
+        "flow_input" => flow_input.clone(),
+        "deps" => deps.clone(),
+        _ => return None,
+    };
+    for p in parts {
+        if let serde_json::Value::String(s) = &cur {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
+                cur = v;
+            }
+        }
+        cur = cur.get(p).cloned()?;
+    }
+    if let serde_json::Value::String(s) = &cur {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
+            return Some(v);
+        }
+    }
+    Some(cur)
+}
+
+/// Evaluate a `when` gate `{ref, op, value}`. ops: eq, ne, contains, truthy, falsy.
+fn eval_when(cond: &serde_json::Value, flow_input: &serde_json::Value, deps: &serde_json::Value) -> bool {
+    let r = cond.get("ref").and_then(|v| v.as_str()).unwrap_or("");
+    let op = cond.get("op").and_then(|v| v.as_str()).unwrap_or("truthy");
+    let actual = resolve_ref(r, flow_input, deps).unwrap_or(serde_json::Value::Null);
+    let expected = cond.get("value").cloned().unwrap_or(serde_json::Value::Null);
+    match op {
+        "eq" => coerce_str(&actual) == coerce_str(&expected),
+        "ne" => coerce_str(&actual) != coerce_str(&expected),
+        "contains" => coerce_str(&actual).contains(&coerce_str(&expected)),
+        "falsy" => !is_truthy(&actual),
+        _ => is_truthy(&actual), // "truthy" and any unknown op
+    }
+}
+
+/// Compare-friendly string form: strings as-is, everything else via JSON repr.
+fn coerce_str(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+fn is_truthy(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::Null => false,
+        serde_json::Value::Bool(b) => *b,
+        serde_json::Value::Number(n) => n.as_f64().map(|f| f != 0.0).unwrap_or(true),
+        serde_json::Value::String(s) => !s.is_empty() && s != "false" && s != "0",
+        serde_json::Value::Array(a) => !a.is_empty(),
+        serde_json::Value::Object(o) => !o.is_empty(),
+    }
+}
+
 /// Build the `{dep_id: output}` object for a step's satisfied dependencies.
 fn build_deps(depends_on: &[String], outputs: &HashMap<String, String>) -> serde_json::Value {
     let mut m = serde_json::Map::new();
@@ -232,8 +481,36 @@ pub fn validate_spec(spec: &serde_json::Value) -> Result<(), String> {
         if ids.contains(&id) {
             return Err(format!("duplicate step id: {id}"));
         }
+        // '#' is reserved for map-fan-out child ids (`<id>#<i>`).
+        if id.contains('#') {
+            return Err(format!("step id may not contain '#': {id}"));
+        }
         if st.get("script_id").and_then(|v| v.as_i64()).is_none() {
             return Err(format!("step {id} missing script_id"));
+        }
+        if let Some(c) = st.get("compensate") {
+            if !c.is_i64() {
+                return Err(format!("step {id} compensate must be a script_id (int)"));
+            }
+        }
+        if let Some(m) = st.get("map") {
+            if !m.is_string() {
+                return Err(format!("step {id} map must be a string ref"));
+            }
+        }
+        if let Some(r) = st.get("retries") {
+            if r.as_u64().is_none() {
+                return Err(format!("step {id} retries must be a non-negative int"));
+            }
+        }
+        if let Some(w) = st.get("when") {
+            if w.get("ref").and_then(|v| v.as_str()).is_none() {
+                return Err(format!("step {id} when needs a string ref"));
+            }
+            let op = w.get("op").and_then(|v| v.as_str()).unwrap_or("truthy");
+            if !["eq", "ne", "contains", "truthy", "falsy"].contains(&op) {
+                return Err(format!("step {id} when.op invalid: {op}"));
+            }
         }
         let deps: Vec<String> = st
             .get("depends_on")

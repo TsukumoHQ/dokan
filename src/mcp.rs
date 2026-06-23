@@ -178,7 +178,9 @@ pub struct CancelArgs {
 pub struct ComposeFlowArgs {
     /// Flow name.
     pub name: String,
-    /// DAG spec: { "steps": [ { "id", "script_id", "input"?, "depends_on"? [step ids] } ] }.
+    /// DAG spec: { "steps": [ { "id", "script_id", "input"?, "depends_on"? [ids],
+    /// "when"? {ref,op,value}, "map"? "<ref>", "compensate"? <script_id>, "retries"? <n> } ] }.
+    /// See compose_flow's description for when/map/compensate/retries semantics.
     pub spec: serde_json::Value,
 }
 
@@ -681,7 +683,13 @@ impl Dokan {
         ok(json!({"counts": counts_obj, "recent": items}))
     }
 
-    #[tool(description = "Compose a flow: a declarative DAG of steps wired over MCP. Validates acyclicity. Returns flow_id. The wire-over-MCP differentiator.")]
+    #[tool(description = "Compose a flow: a declarative DAG of steps wired over MCP. Validates acyclicity. Returns flow_id. \
+        Step fields: id, script_id, input?, depends_on? (ids). \
+        Rich control flow (all optional): \
+        when {ref,op,value} gates a step — ref is `deps.<id>` or `flow_input.<f>`, op eq|ne|contains|truthy|falsy; false → step skipped and the skip propagates to its dependents (branching). \
+        map \"<ref>\" fans the step out over an array (one child run per element, element passed as `step`); parent succeeds with the array of outputs or fails if any child fails. \
+        compensate <script_id> runs that script (saga rollback) if the flow later fails, in reverse order, for each succeeded step. \
+        retries <n> overrides per-step retries (default 1; set 0 for non-idempotent steps). Each step sees {flow_input, deps, step}.")]
     async fn compose_flow(
         &self,
         Parameters(a): Parameters<ComposeFlowArgs>,
@@ -726,9 +734,36 @@ impl Dokan {
             .map_err(internal)?
             .unwrap_or_else(|| "unknown".into());
         let steps = self.db.flow_steps(a.flow_run_id).await.map_err(internal)?;
+        // Token-frugal: a map fan-out can have thousands of `<id>#<i>` children. Collapse
+        // them into a per-parent {n, ok, failed} count instead of listing every child (and
+        // drop the parent's aggregated array `out`, which would re-inline all child outputs).
+        let mut child: std::collections::HashMap<String, (u32, u32, u32)> =
+            std::collections::HashMap::new();
+        for s in &steps {
+            if let Some(i) = s.step_id.find('#') {
+                let e = child.entry(s.step_id[..i].to_string()).or_default();
+                e.0 += 1;
+                match s.status.as_str() {
+                    "succeeded" => e.1 += 1,
+                    "failed" => e.2 += 1,
+                    _ => {}
+                }
+            }
+        }
         let items: Vec<_> = steps
             .iter()
-            .map(|s| json!({"id": s.step_id, "status": s.status, "out": s.output}))
+            .filter(|s| !s.step_id.contains('#'))
+            .map(|s| {
+                let mut o = json!({"id": s.step_id, "status": s.status});
+                match child.get(&s.step_id) {
+                    Some((n, ok, failed)) => o["map"] = json!({"n": n, "ok": ok, "failed": failed}),
+                    None => o["out"] = json!(s.output),
+                }
+                if s.compensated {
+                    o["comp"] = json!(true);
+                }
+                o
+            })
             .collect();
         ok(json!({"status": status, "steps": items}))
     }
@@ -892,7 +927,10 @@ impl ServerHandler for Dokan {
              -> read_logs(after_cursor) to poll, or wait_for for fewer round-trips. \
              Token rules: always request only the fields you need; always paginate logs with \
              next_cursor; never fetch a script body unless you must (use include_source=true \
-             explicitly). No LLM runs inside dokan — intelligence is yours, applied at the edge."
+             explicitly). No LLM runs inside dokan — intelligence is yours, applied at the edge. \
+             Flows: compose_flow wires a DAG; steps support when (branch), map (fan-out), \
+             compensate (saga rollback), retries. Poll get_flow_run — map children are collapsed \
+             into a {n,ok,failed} count, not listed individually."
                 .into(),
         );
         info
