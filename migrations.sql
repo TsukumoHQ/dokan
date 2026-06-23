@@ -132,6 +132,11 @@ ALTER TABLE flow_steps ADD COLUMN IF NOT EXISTS retries BIGINT;
 -- INT→BIGINT is a safe widening; the ALTER is a cheap no-op once the type already matches.
 ALTER TABLE flow_steps ALTER COLUMN retries TYPE BIGINT;
 
+-- Per-step run-or-recall: opt a step into the content-addressed run cache. Since a step's
+-- cache key folds in its `deps` (upstream outputs), re-running a flow recalls unchanged
+-- upstream steps and only re-executes the dirty subgraph (partial flow recall).
+ALTER TABLE flow_steps ADD COLUMN IF NOT EXISTS cache BOOLEAN NOT NULL DEFAULT false;
+
 -- Typo-tolerant script search: pg_trgm powers similarity() so search_script catches
 -- near-misses (the substring-only fallback returned 0 on fuzzy queries). GIN trigram
 -- index keeps it cheap as the registry grows.
