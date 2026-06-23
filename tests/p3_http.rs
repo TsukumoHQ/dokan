@@ -18,7 +18,12 @@ fn free_port() -> u16 {
     p
 }
 
-const DB_URL: &str = "postgres://dokan:dokan@127.0.0.1:5499/dokan";
+// Read DATABASE_URL so this test's own pool hits the SAME database the spawned daemon
+// uses (the daemon inherits the env). Falls back to the default dev DB. Without this the
+// pool would pin to `dokan` while an isolated run points the daemon elsewhere → mismatch.
+fn db_url() -> String {
+    std::env::var("DATABASE_URL").unwrap_or_else(|_| "postgres://dokan:dokan@127.0.0.1:5499/dokan".into())
+}
 
 #[tokio::test]
 async fn operator_surface_and_relay() -> anyhow::Result<()> {
@@ -75,7 +80,7 @@ async fn operator_surface_and_relay() -> anyhow::Result<()> {
     assert_eq!(r.status(), 401, "unauthenticated rejected");
 
     // 4. Seed a script directly, then trigger it via the HTTP API.
-    let pool = sqlx::postgres::PgPool::connect(DB_URL).await?;
+    let pool = sqlx::postgres::PgPool::connect(&db_url()).await?;
     let script_id: i64 = sqlx::query(
         "INSERT INTO scripts (name, runtime, source, description) \
          VALUES ('http-test', 'bash', 'echo hi-http\n', 'p3 http') RETURNING id",

@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# One run per ref; a newer push cancels an in-flight run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    env:
+      # Tests spawn dokan against this Postgres (p3 hardcodes the same URL).
+      DATABASE_URL: postgres://dokan:dokan@127.0.0.1:5499/dokan
+      # Deterministic receipt signing in CI (otherwise a random dev key is used).
+      DOKAN_RECEIPT_KEY: ci-receipt-key
+      CARGO_TERM_COLOR: always
+
+    services:
+      # pgvector image so the semantic-search migration (vector/pg_trgm) needs no swap.
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: dokan
+          POSTGRES_PASSWORD: dokan
+          POSTGRES_DB: dokan
+        ports:
+          - 5499:5432
+        options: >-
+          --health-cmd "pg_isready -U dokan"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      # Pre-pull the runtime images the executor uses, so per-test container
+      # acquisition doesn't race a cold image pull.
+      - name: Pre-pull runtime images
+        run: |
+          docker pull alpine:3.20
+          docker pull python:3.12-slim
+          docker pull node:22-slim
+
+      # --- informational (repo carries pre-existing fmt/clippy debt; not gated yet) ---
+      - name: rustfmt (informational)
+        run: cargo fmt --all --check
+        continue-on-error: true
+
+      - name: clippy (informational)
+        run: cargo clippy --all-targets
+        continue-on-error: true
+
+      # --- hard gates ---
+      - name: Build
+        run: cargo build --all-targets --locked
+
+      # Serial: tests share the Postgres + Docker daemon and are not isolated, so
+      # parallel runs race on migrations and the container pool. This run also
+      # executes the full SQL surface against the real schema — a column/type
+      # mismatch (e.g. the kind that crashed a daemon) fails here, before merge.
+      - name: Test
+        run: cargo test --locked -- --test-threads=1

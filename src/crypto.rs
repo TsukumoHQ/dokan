@@ -5,7 +5,7 @@
 
 use base64::Engine;
 use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng};
-use chacha20poly1305::{ChaCha20Poly1305, Key};
+use chacha20poly1305::ChaCha20Poly1305;
 use sha2::{Digest, Sha256};
 
 const PREFIX: &str = "enc:v1:";
@@ -20,10 +20,9 @@ impl SecretCrypto {
     pub fn from_env() -> Self {
         match std::env::var("DOKAN_SECRET_KEY") {
             Ok(k) if !k.is_empty() => {
-                // Derive a 32-byte key from the passphrase.
+                // Derive a 32-byte key from the passphrase (SHA-256 → 32-byte ChaCha key).
                 let digest = Sha256::digest(k.as_bytes());
-                let key = Key::from_slice(&digest);
-                Self { cipher: Some(ChaCha20Poly1305::new(key)) }
+                Self { cipher: Some(ChaCha20Poly1305::new(&digest)) }
             }
             _ => {
                 tracing::warn!("DOKAN_SECRET_KEY unset — secrets stored in plaintext at rest");
@@ -78,7 +77,7 @@ mod tests {
 
     fn keyed() -> SecretCrypto {
         let digest = Sha256::digest(b"test-pass");
-        SecretCrypto { cipher: Some(ChaCha20Poly1305::new(Key::from_slice(&digest))) }
+        SecretCrypto { cipher: Some(ChaCha20Poly1305::new(&digest)) }
     }
 
     #[test]
