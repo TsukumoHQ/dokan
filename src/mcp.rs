@@ -98,6 +98,12 @@ pub struct SearchArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListScriptsArgs {
+    /// Max rows (default 50, max 500).
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetScriptArgs {
     pub id: i64,
     /// When true, include the full source body (costly). Default false.
@@ -335,6 +341,20 @@ impl Dokan {
             "mode": mode,
             "note": format!("showing {} of {}", rows.len(), total),
         }))
+    }
+
+    #[tool(description = "List all scripts (newest first): id + name + runtime + 1-line desc, no bodies. The catalog of input-driven scripts — search needs a query, list_schedules is crons only. Use to spot duplicates/orphans. Cursor-light: returns up to limit with a \"showing X of Y\" note.")]
+    async fn list_scripts(
+        &self,
+        Parameters(a): Parameters<ListScriptsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let limit = a.limit.unwrap_or(50).clamp(1, 500);
+        let (rows, total) = self.db.list_scripts(limit).await.map_err(internal)?;
+        let items: Vec<_> = rows
+            .iter()
+            .map(|s| json!({"id": s.id, "name": s.name, "runtime": s.runtime, "desc": s.description}))
+            .collect();
+        ok(json!({"scripts": items, "note": format!("showing {} of {}", rows.len(), total)}))
     }
 
     #[tool(description = "Fetch a script's metadata. Source body included only when include_source=true.")]
