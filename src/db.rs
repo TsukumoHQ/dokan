@@ -279,6 +279,29 @@ impl Db {
         Ok((out, total))
     }
 
+    /// Catalog: every script, newest first (token-frugal — id + name + runtime + 1-line
+    /// desc, no bodies). Lets an agent enumerate input-driven scripts (search needs a query;
+    /// list_schedules is crons only), so it can spot duplicates/orphans.
+    pub async fn list_scripts(&self, limit: i64) -> Result<(Vec<ScriptSummary>, i64)> {
+        let total: i64 = sqlx::query_scalar("SELECT count(*) FROM scripts")
+            .fetch_one(&self.pool)
+            .await?;
+        let rows = sqlx::query("SELECT id, name, runtime, description FROM scripts ORDER BY id DESC LIMIT $1")
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
+        let out = rows
+            .into_iter()
+            .map(|r| ScriptSummary {
+                id: r.get("id"),
+                name: r.get("name"),
+                runtime: r.get("runtime"),
+                description: r.get("description"),
+            })
+            .collect();
+        Ok((out, total))
+    }
+
     /// Delete a script and cascade its runs, logs, and schedules in one transaction.
     /// Refuses (BlockedByFlow) if any flow step references it — flows are durable. Returns
     /// the removed schedule ids so the caller can stop their live cron jobs.
@@ -708,6 +731,23 @@ impl Db {
              WHERE status = 'running' AND started_at < now() - make_interval(secs => $1)",
         )
         .bind(lease_secs)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected())
+    }
+
+    /// Fail runs stuck `pending` past `max_age_secs` — never claimed (no live worker serves
+    /// the runtime, or they were enqueued by a since-dead control-plane). Bounds zombie
+    /// accumulation. Distinct from the orphan reaper, which reclaims *running* rows; this
+    /// retires never-started ones. Threshold is generous, so a healthy backlog (which drains
+    /// in seconds) is never touched. Returns the number failed.
+    pub async fn fail_stale_pending(&self, max_age_secs: f64) -> Result<u64> {
+        let r = sqlx::query(
+            "UPDATE runs SET status = 'failed', error = 'unclaimed: pending past timeout', \
+                finished_at = now() \
+             WHERE status = 'pending' AND created_at < now() - make_interval(secs => $1)",
+        )
+        .bind(max_age_secs)
         .execute(&self.pool)
         .await?;
         Ok(r.rows_affected())
