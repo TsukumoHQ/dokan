@@ -1,30 +1,19 @@
 //! dokan — agent-operated runtime for deterministic scripts in Docker.
 //! MCP-first control plane. Zero LLM inside.
 
-mod cron;
-mod crypto;
-mod db;
-mod embed;
-mod exec;
-mod flow;
-mod http;
-mod mcp;
-mod pool;
-mod receipt;
-mod scale;
-mod worker;
-
 use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use crate::cron::Cron;
-use crate::db::Db;
-use crate::exec::Executor;
-use crate::mcp::Dokan;
-use crate::worker::Worker;
+// Modules now live in the `dokan` library crate (see src/lib.rs); the binary drives them.
+use dokan::cron::Cron;
+use dokan::db::Db;
+use dokan::exec::Executor;
+use dokan::mcp::Dokan;
+use dokan::worker::Worker;
+use dokan::{embed, exec, flow, http, scale};
 
 #[derive(Parser, Debug)]
 #[command(name = "dokan", version, about = "Agent-operated script runtime (MCP-first)")]
@@ -161,7 +150,7 @@ async fn main() -> Result<()> {
 
     // Optional local embeddings for semantic search.
     let embedder = if cli.embed {
-        match crate::embed::Embedder::try_load(&cli.embed_cache) {
+        match embed::Embedder::try_load(&cli.embed_cache) {
             Ok(e) => {
                 tracing::info!("semantic search enabled (BGE-small)");
                 Some(e)
@@ -296,7 +285,7 @@ async fn serve_stdio(
     db: Db,
     exec: Arc<Executor>,
     cron: Arc<Cron>,
-    embedder: Option<crate::embed::Embedder>,
+    embedder: Option<embed::Embedder>,
 ) -> Result<()> {
     use rmcp::transport::stdio;
     use rmcp::ServiceExt;
@@ -311,7 +300,7 @@ async fn serve_http(
     db: Db,
     exec: Arc<Executor>,
     cron: Arc<Cron>,
-    embedder: Option<crate::embed::Embedder>,
+    embedder: Option<embed::Embedder>,
     metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
     token: Option<String>,
     addr: &str,
