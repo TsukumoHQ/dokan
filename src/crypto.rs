@@ -4,12 +4,21 @@
 //! plaintext, and with no key configured we store plaintext (loudly warned).
 
 use base64::Engine;
+use chacha20poly1305::aead::rand_core::RngCore;
 use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng};
 use chacha20poly1305::ChaCha20Poly1305;
 use sha2::{Digest, Sha256};
 
 const PREFIX: &str = "enc:v1:";
 const NONCE_LEN: usize = 12;
+
+/// Unguessable 128-bit token (hex) — the capability in a webhook URL `/hook/<token>`.
+/// Uses the same OS CSPRNG as nonce generation; no extra dependency.
+pub fn random_token() -> String {
+    let mut b = [0u8; 16];
+    OsRng.fill_bytes(&mut b);
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
 
 #[derive(Clone)]
 pub struct SecretCrypto {

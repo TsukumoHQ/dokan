@@ -6,6 +6,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, Sse};
@@ -38,6 +39,54 @@ pub fn operator_router(state: AppState) -> Router {
         .route("/api/schedules", get(list_schedules))
         .route("/api/secrets", get(list_secrets).post(set_secret))
         .with_state(state)
+}
+
+/// Inbound webhook router. Mounted OUTSIDE the bearer gate — an external service (Stripe,
+/// GitHub…) can't send DOKAN_TOKEN, so the unguessable token in the URL is the auth. The
+/// request body becomes the run's input. Keep this separate so the auth layer never wraps it.
+pub fn webhook_router(state: AppState) -> Router {
+    Router::new()
+        .route("/hook/{token}", post(webhook_fire))
+        .with_state(state)
+}
+
+/// Fire an inbound webhook: resolve the token → enqueue the target script/flow with the
+/// POST body as input. Non-blocking (202 + id); the worker/flow engine runs it.
+async fn webhook_fire(
+    State(s): State<AppState>,
+    Path(token): Path<String>,
+    body: Bytes,
+) -> impl IntoResponse {
+    let Some((kind, target_id, agent_id)) =
+        s.db.find_webhook_by_token(&token).await.ok().flatten()
+    else {
+        // Same response for unknown vs malformed: don't leak which tokens exist.
+        return (StatusCode::NOT_FOUND, "no such webhook").into_response();
+    };
+    // Body → input: parse JSON if we can, else wrap the raw text so the script still sees it.
+    let input = serde_json::from_slice::<serde_json::Value>(&body)
+        .unwrap_or_else(|_| json!({ "raw": String::from_utf8_lossy(&body) }));
+
+    if kind == "flow" {
+        let Some(spec) = s.db.get_flow_spec(target_id).await.ok().flatten() else {
+            return (StatusCode::NOT_FOUND, "flow gone").into_response();
+        };
+        match s.db.insert_flow_run(target_id, &spec, &input).await {
+            Ok(id) => {
+                metrics::counter!("dokan_webhook_fires_total", "target" => "flow").increment(1);
+                (StatusCode::ACCEPTED, Json(json!({"flow_run_id": id, "status": "pending"}))).into_response()
+            }
+            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "enqueue failed").into_response(),
+        }
+    } else {
+        match s.db.insert_run(target_id, &input, agent_id.as_deref()).await {
+            Ok(id) => {
+                metrics::counter!("dokan_webhook_fires_total", "target" => "script").increment(1);
+                (StatusCode::ACCEPTED, Json(json!({"run_id": id, "status": "pending"}))).into_response()
+            }
+            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "enqueue failed").into_response(),
+        }
+    }
 }
 
 /// Bearer-token gate (RBAC slice). No-op when DOKAN_TOKEN is unset. Full OAuth 2.1 is

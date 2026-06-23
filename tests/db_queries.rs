@@ -32,6 +32,30 @@ async fn gc_old_deletes_terminal_runs_and_logs() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn webhook_insert_find_delete_roundtrip() -> anyhow::Result<()> {
+    let db = Db::connect(&db_url()).await?;
+    db.migrate().await?;
+
+    let (sid, _v) = db
+        .insert_script("wh-db", "bash", "echo hi", None, None, true, None)
+        .await?;
+    let token = dokan::crypto::random_token();
+    let id = db.insert_webhook(&token, "script", sid, Some("agent-x")).await?;
+
+    let found = db.find_webhook_by_token(&token).await?;
+    assert_eq!(
+        found,
+        Some(("script".to_string(), sid, Some("agent-x".to_string()))),
+        "token resolves to its target"
+    );
+    assert!(db.list_webhooks().await?.iter().any(|w| w["webhook_id"] == id));
+
+    assert!(db.delete_webhook(id).await?, "delete reports removal");
+    assert_eq!(db.find_webhook_by_token(&token).await?, None, "gone after delete");
+    Ok(())
+}
+
+#[tokio::test]
 async fn gc_old_keeps_fresh_terminal_runs() -> anyhow::Result<()> {
     let db = Db::connect(&db_url()).await?;
     db.migrate().await?;
