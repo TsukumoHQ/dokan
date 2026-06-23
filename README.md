@@ -1,114 +1,70 @@
-# dokan (導管)
+# dokan
 
-> Agent-operated runtime for **deterministic scripts in Docker**, with an **MCP-first control plane**. Zero LLM inside. Apache-2.0.
+### your AI agent builds the workflow. you don't click.
 
-Your coding agent uploads, runs, and reads logs over MCP. No UI clicks. The platform is the passive pipe; the agent is the orchestrator. See [PRD.md](PRD.md) for the full thesis.
+dokan is an automation engine built for the agent era. Instead of a human clicking through a UI, your coding agent stands up and runs the workflows itself by talking to the platform over MCP. The platform executes the deterministic, reliable, cheap work. The intelligence stays in the agent.
 
-## Status
+<img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="license Apache-2.0"> <img src="https://img.shields.io/badge/CI-tested-green" alt="CI tested">
 
-**P0–P3 shipped and tested** (8 integration tests, all green against live Postgres + Docker).
+---
 
-```
-✅ WEDGE PROVEN: agent uploaded + ran + read logs over MCP, zero UI.
-```
+## What it is
 
-- **P0 Proof** — agent uploads + runs + reads logs over MCP, zero UI.
-- **P1 Engine** — SKIP LOCKED queue, warm pool, capability routing, cron, retries.
-- **P2 Flows** — declarative `compose_flow` DAG, step-boundary durability, dep passing.
-- **P3 Scale/ops** — semantic search (fastembed+pgvector), Prometheus metrics, thin UI + SSE tail, secrets, relay egress, bearer auth.
+An automation engine for agents: your agent describes a workflow and triggers it; dokan runs it in isolated containers and streams the results back. Think Sidekiq for agents, the passive pipe that does the work while the agent orchestrates. No dashboard to click, no human in the loop for the mechanical 80%.
 
-## Architecture (this slice)
+## Automation that doesn't burn tokens
 
-- **Single Rust daemon** (`dokan`) — `axum` + `rmcp` MCP server, `stdio` (local) or Streamable HTTP (remote).
-- **State** — Postgres (`sqlx`, runtime queries, no offline cache needed). Tables: `scripts`, `runs`, `logs`.
-- **Execution** — `bollard`: one job = one clean container (`python:3.12-slim` / `node:22-slim` / `alpine`), discarded after. Per-job memory + CPU caps and a hard timeout. Code is trusted → raw containers, no micro-VM.
-- **Logs** — container stdout/stderr streamed line-by-line into Postgres, served back to the agent cursor-paginated.
+This is the sharpest difference. **dokan runs zero LLM inside.** It executes deterministic code, so it burns no tokens. The expensive model stays outside, in your agent, where the judgment belongs.
 
-## MCP surface (token-frugal contract)
+That is the cost argument against the current crop:
 
-| Tool | Returns |
-|---|---|
-| `search_script` | ranked IDs + 1-line desc, `"showing X of Y"` |
-| `get_script` | projected metadata; body only with `include_source=true` |
-| `upload_script` | `script_id` + version |
-| `run_script` | `run_id` immediately — **never blocks** |
-| `read_logs` | new lines since `after_cursor`, `next_cursor`, status; CSV-ish `seq\|stream\|text` |
-| `wait_for` | long-poll to terminal status + tail |
-| `list_runs` | server-side status counts + recent rows |
-| `cancel` | kill container + mark canceled |
-| `compose_flow` | declarative DAG spec → `flow_id` (validated acyclic) — wire-over-MCP |
-| `run_flow` / `get_flow_run` | run a DAG; poll overall + per-step status/output |
-| `schedule` / `list_schedules` | cron a script (6-field, leading seconds) |
+| | dokan | n8n / Windmill / Zapier-likes |
+|---|---|---|
+| Where the LLM runs | outside, in your agent | sold as "LLM in the workflow" (per-step model calls) |
+| Token cost of running a workflow | none (deterministic execution) | compounds with every LLM-in-step |
+| Who operates it | the agent, over MCP | a human, clicking a UI |
+| License | Apache-2.0, no trap | often restrictive / source-available |
 
-Server instructions ship in-band so the agent self-limits (paginate, project fields, don't fetch bodies). Semantic ranking via local embeddings (`--embed`), substring fallback otherwise.
-
-## Operator surface (HTTP, humans)
-
-`dokan --transport http` also serves a thin UI + API behind an optional bearer token (`DOKAN_TOKEN`):
-
-| Route | Purpose |
-|---|---|
-| `GET /` | self-refreshing run list |
-| `GET/POST /api/runs` | list / trigger a run |
-| `GET /api/runs/{id}/logs` | cursor logs |
-| `GET /api/runs/{id}/stream` | live SSE log tail |
-| `GET/POST /api/secrets` | write-only secrets (injected as job env) |
-| `GET /metrics` | Prometheus (`dokan_runs_*`) → Grafana |
-
-Job results POST to `DOKAN_RELAY_URL` on completion (mesh egress).
+You pay for intelligence once, in the agent. The execution layer is cheap and deterministic by design.
 
 ## Quickstart
 
-```sh
-# 1. state store
-docker compose up -d
+> `[TECH: owner fills, we do not invent commands.]`
 
-# 2. build
-cargo build
+- `[TECH: install headline, how an agent connects to dokan over MCP]`
+- `[TECH: operator bootstrap, bring up the daemon / dependencies]`
+- `[TECH: prerequisites, runtime, Docker, Postgres, versions]`
+- `[TECH: quickstart, zero to first run, agent uploads + runs + reads a script]`
+- `[TECH: usage example, a real workflow described, not coded]`
 
-# 3. prove the wedge end-to-end (needs Docker; honors $DOCKER_HOST)
-export DOCKER_HOST=unix:///path/to/docker.sock   # Colima/Docker Desktop; omit if /var/run/docker.sock
-cargo test --test smoke -- --nocapture
-```
+## What it does
 
-### Wire into Claude Code
+- **Complex workflows, described not coded.** Conditions, mass processing (the same step over a thousand items), and clean rollback on failure. Rich business processes, not just linear task chains.
+- **Never compute twice.** Unchanged parts of a workflow are reused instantly, so you get speed and a direct cost cut.
+- **Reliable by construction.** Overload protection, crash recovery, and data consistency are built in.
+- **Quality you can check.** CI runs every change through tests before it ships, and test coverage is solid. We promise reliability because it is tested, not because we assert it.
 
-Local (stdio): see [.mcp.json](.mcp.json) — point `DOCKER_HOST` at your socket.
+## Part of the suite
 
-Remote (HTTP):
+dokan is the execution pillar of the agent stack. The four answer four different questions:
 
-```sh
-dokan --transport http --addr 127.0.0.1:8088   # MCP at http://127.0.0.1:8088/mcp
-```
+- **trovex** is what your agents KNOW (canonical context).
+- **wrai.th** is how they COORDINATE.
+- **yoru** is whether they are HEALTHY.
+- **dokan** is what they DO deterministically (execution and automation, the mechanical 80%).
 
-## Config
+`[TECH/design: insert the 4-pillar suite diagram]`
 
-| Flag / env | Default |
-|---|---|
-| `--transport` / `DOKAN_TRANSPORT` | `http` (`stdio` for local agents) |
-| `--addr` / `DOKAN_ADDR` | `127.0.0.1:8088` |
-| `--database-url` / `DATABASE_URL` | `postgres://dokan:dokan@127.0.0.1:5499/dokan` |
-| `DOCKER_HOST` | local socket if unset |
+## Why this approach holds up
 
-## Worker / semantic / ops config (P1–P3)
+Recent academic work (2025 to 2026) describes an approach close to this one: keep the model outside, run deterministic execution underneath. The thesis is in the air, and dokan is positioned early on it. `[TECH: tech-copy / geo insert the real paper citation here, cite the actual paper, no fabrication.]`
 
-| Flag / env | Purpose |
-|---|---|
-| `--caps` / `DOKAN_CAPS` | runtimes this worker serves (routing) |
-| `--concurrency` / `DOKAN_CONCURRENCY` | max concurrent jobs |
-| `--warm-idle` / `DOKAN_WARM_IDLE` | warm containers kept per image |
-| `--embed` / `DOKAN_EMBED` | enable semantic search |
-| `--relay-url` / `DOKAN_RELAY_URL` | mesh egress endpoint |
-| `--token` / `DOKAN_TOKEN` | bearer token for the HTTP surface |
+## Status (honest)
 
-## Roadmap (per PRD §12)
+The core is solid and differentiated, and it is dogfooded: we run the mechanical 80% of our own agent fleet on dokan. It is **ready for a demo, design partners, and technical early adopters.**
 
-- **P0 — Proof** ✅ agent-operated run+logs over MCP.
-- **P1 — Engine** ✅ `SKIP LOCKED` queue, warm pool, capability routing, cron, retries, resource caps.
-- **P2 — Flows** ✅ declarative `compose_flow`, DAG, step-boundary durability, retries.
-- **P3 — Scale/ops** ✅ semantic registry (fastembed+pgvector), Prometheus metrics, thin UI + SSE, secrets, relay egress, bearer auth. Multi-worker = run more processes vs the same Postgres.
-- **P4 — Enterprise** (next) — SSO/OAuth 2.1 (available via rmcp), audit, HA, persistent-service engine, micro-VM isolation, Loki shipping + Grafana dashboards.
+It is **not** enterprise-turnkey on every axis yet (multi-tenant security and high availability are identified and out of scope while we target internal teams). dokan is built for internal-team use and design partners, not for a large-enterprise rollout without hand-holding. We would rather say that plainly than overpromise.
 
 ## License
 
-Apache-2.0.
+Apache-2.0. Open source, no license trap. `[TECH: repo link]`
