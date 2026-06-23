@@ -94,6 +94,8 @@ pub struct FlowStep {
     pub retries: Option<i64>,
     /// When this step reached a terminal status — orders saga compensation (reverse completion).
     pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Opt this step into the content-addressed run cache (partial flow recall).
+    pub cache: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1079,10 +1081,11 @@ impl Db {
             let map_ref = st.get("map").and_then(|v| v.as_str()).map(String::from);
             let compensate = st.get("compensate").and_then(|v| v.as_i64());
             let retries = st.get("retries").and_then(|v| v.as_i64());
+            let cache = st.get("cache").and_then(|v| v.as_bool()).unwrap_or(false);
             sqlx::query(
                 "INSERT INTO flow_steps \
-                 (flow_run_id, step_id, script_id, input, depends_on, when_cond, map_ref, compensate, retries) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                 (flow_run_id, step_id, script_id, input, depends_on, when_cond, map_ref, compensate, retries, cache) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
             )
             .bind(flow_run_id)
             .bind(step_id)
@@ -1093,6 +1096,7 @@ impl Db {
             .bind(map_ref)
             .bind(compensate)
             .bind(retries)
+            .bind(cache)
             .execute(&mut *tx)
             .await?;
         }
@@ -1125,7 +1129,7 @@ impl Db {
     pub async fn flow_steps(&self, flow_run_id: i64) -> Result<Vec<FlowStep>> {
         let rows = sqlx::query(
             "SELECT step_id, script_id, input, depends_on, status, output, \
-                    when_cond, map_ref, compensate, compensated, retries, finished_at \
+                    when_cond, map_ref, compensate, compensated, retries, finished_at, cache \
              FROM flow_steps WHERE flow_run_id = $1 ORDER BY id",
         )
         .bind(flow_run_id)
@@ -1147,6 +1151,7 @@ impl Db {
                 compensated: r.get("compensated"),
                 retries: r.get("retries"),
                 finished_at: r.get("finished_at"),
+                cache: r.get("cache"),
             })
             .collect())
     }
@@ -1218,18 +1223,22 @@ impl Db {
         flow_run_id: i64,
         parent: &str,
         children: &[(String, i64, serde_json::Value, Vec<String>)],
+        cache: bool,
     ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         for (step_id, script_id, input, deps) in children {
+            // Children inherit the parent's cache opt-in, so a deterministic map fan-out
+            // recalls per-element on re-run.
             sqlx::query(
-                "INSERT INTO flow_steps (flow_run_id, step_id, script_id, input, depends_on) \
-                 VALUES ($1, $2, $3, $4, $5) ON CONFLICT (flow_run_id, step_id) DO NOTHING",
+                "INSERT INTO flow_steps (flow_run_id, step_id, script_id, input, depends_on, cache) \
+                 VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (flow_run_id, step_id) DO NOTHING",
             )
             .bind(flow_run_id)
             .bind(step_id)
             .bind(script_id)
             .bind(input)
             .bind(deps)
+            .bind(cache)
             .execute(&mut *tx)
             .await?;
         }

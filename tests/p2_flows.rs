@@ -266,6 +266,50 @@ async fn flow_saga_compensation() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A `cache:true` step recalls a prior identical run instead of re-executing (partial
+/// flow recall). The script echoes its own run id, which differs on every real execution —
+/// so an identical output across two flow runs proves the second was recalled.
+#[tokio::test]
+async fn flow_step_cache_recall() -> anyhow::Result<()> {
+    let c = spawn().await?;
+    let rid = call(
+        &c,
+        "upload_script",
+        json!({"name":"rid","runtime":"bash","source":"echo \"$DOKAN_RUN_ID\"\n","description":"echoes run id"}),
+    )
+    .await["script_id"]
+        .as_i64()
+        .unwrap();
+
+    let flow = call(
+        &c,
+        "compose_flow",
+        json!({
+            "name": "cacheflow",
+            "spec": { "steps": [ {"id":"x","script_id": rid, "cache": true} ]}
+        }),
+    )
+    .await;
+    let flow_id = flow["flow_id"].as_i64().expect(&flow.to_string());
+
+    // First run: cache miss → executes, tags the run with its cache key.
+    let fr1 = call(&c, "run_flow", json!({"flow_id": flow_id})).await;
+    let r1 = poll_flow(&c, fr1["flow_run_id"].as_i64().unwrap()).await;
+    assert_eq!(r1["status"], "succeeded", "run1: {r1}");
+    let out1 = step(r1["steps"].as_array().unwrap(), "x")["out"].as_str().unwrap_or("").to_string();
+    assert!(!out1.is_empty(), "run1 produced an output: {r1}");
+
+    // Second run: cache hit → recalled, same output despite a fresh run id would differ.
+    let fr2 = call(&c, "run_flow", json!({"flow_id": flow_id})).await;
+    let r2 = poll_flow(&c, fr2["flow_run_id"].as_i64().unwrap()).await;
+    assert_eq!(r2["status"], "succeeded", "run2: {r2}");
+    let out2 = step(r2["steps"].as_array().unwrap(), "x")["out"].as_str().unwrap_or("").to_string();
+
+    assert_eq!(out1, out2, "step recalled (identical output) — not re-executed: {out1} vs {out2}");
+    c.cancel().await?;
+    Ok(())
+}
+
 /// A cyclic spec is rejected at compose time, not at run time.
 #[tokio::test]
 async fn cyclic_flow_rejected() -> anyhow::Result<()> {

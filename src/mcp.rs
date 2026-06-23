@@ -60,7 +60,7 @@ fn canonical_json(v: &serde_json::Value) -> String {
 
 /// Content-address a run: hash(runtime + source + canonical(input) + secrets generation).
 /// Same inputs ⇒ same key ⇒ recallable (dokan jobs are deterministic).
-fn run_cache_key(
+pub(crate) fn run_cache_key(
     runtime: &str,
     image_digest: &str,
     source: &str,
@@ -179,8 +179,9 @@ pub struct ComposeFlowArgs {
     /// Flow name.
     pub name: String,
     /// DAG spec: { "steps": [ { "id", "script_id", "input"?, "depends_on"? [ids],
-    /// "when"? {ref,op,value}, "map"? "<ref>", "compensate"? <script_id>, "retries"? <n> } ] }.
-    /// See compose_flow's description for when/map/compensate/retries semantics.
+    /// "when"? {ref,op,value}, "map"? "<ref>", "compensate"? <script_id>, "retries"? <n>,
+    /// "cache"? <bool> } ] }.
+    /// See compose_flow's description for when/map/compensate/retries/cache semantics.
     pub spec: serde_json::Value,
 }
 
@@ -689,7 +690,8 @@ impl Dokan {
         when {ref,op,value} gates a step — ref is `deps.<id>` or `flow_input.<f>`, op eq|ne|contains|truthy|falsy; false → step skipped and the skip propagates to its dependents (branching). \
         map \"<ref>\" fans the step out over an array (one child run per element, element passed as `step`); parent succeeds with the array of outputs or fails if any child fails. \
         compensate <script_id> runs that script (saga rollback) if the flow later fails, in reverse order, for each succeeded step. \
-        retries <n> overrides per-step retries (default 1; set 0 for non-idempotent steps). Each step sees {flow_input, deps, step}.")]
+        retries <n> overrides per-step retries (default 1; set 0 for non-idempotent steps). \
+        cache true opts the step into the content-addressed run cache: since the key folds in upstream deps, re-running a flow recalls unchanged steps and only re-executes the changed subgraph (partial flow recall — best for deterministic/network:false steps). Each step sees {flow_input, deps, step}.")]
     async fn compose_flow(
         &self,
         Parameters(a): Parameters<ComposeFlowArgs>,

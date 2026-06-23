@@ -256,7 +256,11 @@ impl FlowEngine {
                 )
             })
             .collect();
-        if let Err(e) = self.db.expand_map_step(flow_run_id, &step.step_id, &children).await {
+        if let Err(e) = self
+            .db
+            .expand_map_step(flow_run_id, &step.step_id, &children, step.cache)
+            .await
+        {
             tracing::error!(flow_run_id, step = %step.step_id, "map expand failed: {e}");
         }
     }
@@ -353,6 +357,28 @@ impl FlowEngine {
             "step": step.input,
         });
 
+        // Partial flow recall: when the step opts into the cache, content-address it on
+        // (runtime, image, source, step_input, secrets) — step_input folds in upstream
+        // `deps`, so an unchanged upstream subgraph recalls and only the dirty part re-runs.
+        let cache_key = if step.cache {
+            let secrets_gen = self.db.secrets_generation().await.unwrap_or(0);
+            let digest = self.exec.image_digest(&script.runtime).unwrap_or_default();
+            let key = crate::mcp::run_cache_key(&script.runtime, &digest, &script.source, &step_input, secrets_gen);
+            if let Ok(Some((cached_run_id, _exit, _result))) = self.db.find_cached_run(&key).await {
+                let out = self.db.last_stdout(cached_run_id).await.ok().flatten();
+                let _ = self
+                    .db
+                    .finish_step(flow_run_id, &step.step_id, "succeeded", out.as_deref())
+                    .await;
+                metrics::counter!("dokan_flow_steps_recalled_total").increment(1);
+                metrics::counter!("dokan_flow_steps_finished_total", "status" => "succeeded").increment(1);
+                return;
+            }
+            Some(key)
+        } else {
+            None
+        };
+
         // attempts = retries + 1; a step may override the default (e.g. 0 retries for a
         // non-idempotent step that must never re-run).
         let max_attempts = step.retries.unwrap_or(1).max(0) as u32 + 1;
@@ -367,6 +393,10 @@ impl FlowEngine {
                     return;
                 }
             };
+            // Tag the produced run so future flows recall it.
+            if let Some(key) = &cache_key {
+                let _ = self.db.set_run_cache_key(run_id, key).await;
+            }
             let _ = self.db.set_step_running(flow_run_id, &step.step_id, run_id).await;
             // Drive the container to completion (this finishes the underlying run). Hold a
             // shared concurrency permit only while the container runs, so a wide map fan-out
@@ -558,6 +588,11 @@ pub fn validate_spec(spec: &serde_json::Value) -> Result<(), String> {
         if let Some(r) = st.get("retries") {
             if r.as_u64().is_none() {
                 return Err(format!("step {id} retries must be a non-negative int"));
+            }
+        }
+        if let Some(c) = st.get("cache") {
+            if !c.is_boolean() {
+                return Err(format!("step {id} cache must be a boolean"));
             }
         }
         if let Some(w) = st.get("when") {
