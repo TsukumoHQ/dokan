@@ -23,6 +23,7 @@ That is the cost argument against the current crop:
 | Where the LLM runs | outside, in your agent | sold as "LLM in the workflow" (per-step model calls) |
 | Token cost of running a workflow | none (deterministic execution) | compounds with every LLM-in-step |
 | Who operates it | the agent, over MCP | a human, clicking a UI |
+| Triggers | cron plus inbound webhooks, agent-wired | cron plus webhooks, human-wired in a UI |
 | License | Apache-2.0, no trap | often restrictive / source-available |
 
 You pay for intelligence once, in the agent. The execution layer is cheap and deterministic by design.
@@ -39,6 +40,7 @@ You pay for intelligence once, in the agent. The execution layer is cheap and de
 
 ## What it does
 
+- **Real triggers, not just cron.** Schedule work on a cron, or fire it on a real event with an inbound webhook (a POST to a per-hook token URL, ready for Stripe, Calendly, or GitHub). The same event triggers Zapier and n8n are built on, agent-wired and with zero LLM in the loop.
 - **Complex workflows, described not coded.** Conditions, mass processing (the same step over a thousand items), and clean rollback on failure. Rich business processes, not just linear task chains.
 - **Never compute twice.** Unchanged parts of a workflow are reused instantly, so you get speed and a direct cost cut.
 - **Reliable by construction.** Overload protection, crash recovery, and data consistency are built in.
