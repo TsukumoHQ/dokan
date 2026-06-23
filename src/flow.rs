@@ -10,22 +10,26 @@ use std::time::Duration;
 
 use crate::db::Db;
 use crate::exec::{runtime_spec, Executor};
+use crate::scale::Concurrency;
 
 const IDLE_POLL: Duration = Duration::from_millis(400);
-/// Flow-run lease: a driver heartbeats between step batches, but a single in-flight step
-/// can run silent up to the job timeout. Set above that bound so a healthy long step is
-/// never mistaken for a dead engine. Tunable; 2× the job timeout gives comfortable margin.
+/// Flow-run lease: the driver heartbeats periodically (see `spawn_heartbeat`), so the lease
+/// stays fresh even across a long step batch. Set above the job timeout so a healthy long
+/// step is never mistaken for a dead engine. 2× the job timeout gives comfortable margin.
 const FLOW_LEASE_SECS: f64 = (crate::exec::DEFAULT_TIMEOUT_SECS * 2) as f64;
 
 #[derive(Clone)]
 pub struct FlowEngine {
     db: Db,
     exec: Arc<Executor>,
+    /// Shared with the worker: bounds total in-flight containers so a large `map` fan-out
+    /// can't spawn one container per element at once and swamp the host.
+    slots: Arc<Concurrency>,
 }
 
 impl FlowEngine {
-    pub fn new(db: Db, exec: Arc<Executor>) -> Self {
-        Self { db, exec }
+    pub fn new(db: Db, exec: Arc<Executor>, slots: Arc<Concurrency>) -> Self {
+        Self { db, exec, slots }
     }
 
     /// Resume orphaned flows, then loop claiming and driving pending flow_runs.
@@ -58,15 +62,37 @@ impl FlowEngine {
         Ok(())
     }
 
-    /// Drive one flow_run to terminal status. Each pass: aggregate finished map fan-outs,
-    /// resolve pending steps (skip dead branches, evaluate `when` gates, expand `map` steps,
-    /// or run plain steps in parallel), checkpoint, repeat until the DAG completes or fails.
-    /// On failure, succeeded steps with a `compensate` script are rolled back (saga).
+    /// Background lease heartbeat: bumps `started_at` on an interval well inside the lease,
+    /// so even a long-running step batch (e.g. a large map fan-out) never lets the reaper
+    /// reclaim this live driver. Aborted when `drive` returns.
+    fn spawn_heartbeat(&self, flow_run_id: i64) -> tokio::task::JoinHandle<()> {
+        let db = self.db.clone();
+        let beat = Duration::from_secs((FLOW_LEASE_SECS / 4.0) as u64);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(beat).await;
+                let _ = db.touch_flow_run(flow_run_id).await;
+            }
+        })
+    }
+
+    /// Drive one flow_run to terminal status, with a background lease heartbeat for its
+    /// whole lifetime.
     async fn drive(&self, flow_run_id: i64, input: serde_json::Value) -> anyhow::Result<()> {
+        let hb = self.spawn_heartbeat(flow_run_id);
+        let res = self.drive_inner(flow_run_id, input).await;
+        hb.abort();
+        res
+    }
+
+    /// Each pass: aggregate finished map fan-outs, resolve pending steps (skip dead branches,
+    /// evaluate `when` gates, expand `map` steps, or run plain steps in parallel), checkpoint,
+    /// repeat until the DAG completes or fails. On failure, succeeded steps with a
+    /// `compensate` script are rolled back (saga).
+    async fn drive_inner(&self, flow_run_id: i64, input: serde_json::Value) -> anyhow::Result<()> {
         loop {
-            // Heartbeat: keeps this flow's lease fresh between step batches so the reaper
-            // never reclaims a live driver. A single step can run up to the job timeout
-            // with no beat, hence FLOW_LEASE_SECS sits above that bound.
+            // Belt-and-suspenders beat at the top of each pass (the background heartbeat is
+            // the real guarantee for long batches).
             let _ = self.db.touch_flow_run(flow_run_id).await;
             let steps = self.db.flow_steps(flow_run_id).await?;
 
@@ -137,7 +163,10 @@ impl FlowEngine {
                 if !dep_ready {
                     continue;
                 }
-                // Dead branch: a required dep was skipped → this step is skipped too.
+                // Dead-branch propagation, AND-semantics: if ANY dependency was skipped this
+                // step is skipped too (a step needs all its deps to have actually produced
+                // output). On a diamond merge that means one skipped upstream skips the join —
+                // model an OR-merge by not depending on the optional branch.
                 if step.depends_on.iter().any(|d| skipped.contains(d)) {
                     self.db.mark_step_skipped(flow_run_id, &step.step_id).await.ok();
                     metrics::counter!("dokan_flow_steps_finished_total", "status" => "skipped").increment(1);
@@ -232,20 +261,26 @@ impl FlowEngine {
         }
     }
 
-    /// Saga rollback: for each succeeded step with a `compensate` script, in reverse order,
-    /// run that script with the step's input/output. Best-effort — a failing compensation is
-    /// logged and the rest still run, so a partial flow is unwound as far as possible.
+    /// Saga rollback: for each succeeded step with a `compensate` script, in reverse
+    /// completion order, run that script with the step's input/output. Best-effort — a
+    /// compensation whose own script fails is logged + counted but does not stop the rest,
+    /// so a partial flow is unwound as far as possible.
     async fn compensate(
         &self,
         flow_run_id: i64,
         flow_input: &serde_json::Value,
         steps: &[crate::db::FlowStep],
     ) {
-        for step in steps.iter().rev() {
-            if step.status != "succeeded" || step.compensated {
-                continue;
-            }
-            let Some(comp_id) = step.compensate else { continue };
+        // Reverse *completion* order (latest finished first), not declaration order — correct
+        // for DAGs with parallel branches. Steps without finished_at sort last.
+        let mut to_comp: Vec<&crate::db::FlowStep> = steps
+            .iter()
+            .filter(|s| s.status == "succeeded" && !s.compensated && s.compensate.is_some())
+            .collect();
+        to_comp.sort_by(|a, b| b.finished_at.cmp(&a.finished_at));
+
+        for step in to_comp {
+            let comp_id = step.compensate.unwrap();
             let Some(script) = self.db.get_script(comp_id).await.ok().flatten() else {
                 tracing::warn!(flow_run_id, step = %step.step_id, comp_id, "compensate script missing");
                 continue;
@@ -261,12 +296,29 @@ impl FlowEngine {
             let Ok(run_id) = self.db.insert_run(comp_id, &comp_input, None).await else {
                 continue;
             };
-            self.exec
-                .run(&self.db, run_id, &script.runtime, &script.source, &comp_input, None, script.network)
-                .await;
+            {
+                let _permit = self.slots.acquire().await;
+                self.exec
+                    .run(&self.db, run_id, &script.runtime, &script.source, &comp_input, None, script.network)
+                    .await;
+            }
+            // Surface a compensation whose own script failed instead of silently marking it done.
+            let ok = self
+                .db
+                .run_status(run_id)
+                .await
+                .ok()
+                .flatten()
+                .as_deref()
+                == Some("succeeded");
             self.db.mark_step_compensated(flow_run_id, &step.step_id).await.ok();
-            metrics::counter!("dokan_flow_compensations_total").increment(1);
-            tracing::info!(flow_run_id, step = %step.step_id, "compensated");
+            let result = if ok { "ok" } else { "failed" };
+            metrics::counter!("dokan_flow_compensations_total", "result" => result).increment(1);
+            if ok {
+                tracing::info!(flow_run_id, step = %step.step_id, "compensated");
+            } else {
+                tracing::warn!(flow_run_id, step = %step.step_id, run_id, "compensation script FAILED");
+            }
         }
     }
 
@@ -316,18 +368,23 @@ impl FlowEngine {
                 }
             };
             let _ = self.db.set_step_running(flow_run_id, &step.step_id, run_id).await;
-            // Drive the container to completion (this finishes the underlying run).
-            self.exec
-                .run(
-                    &self.db,
-                    run_id,
-                    &script.runtime,
-                    &script.source,
-                    &step_input,
-                    None,
-                    script.network,
-                )
-                .await;
+            // Drive the container to completion (this finishes the underlying run). Hold a
+            // shared concurrency permit only while the container runs, so a wide map fan-out
+            // is throttled to the same cap as the worker rather than spawning all at once.
+            {
+                let _permit = self.slots.acquire().await;
+                self.exec
+                    .run(
+                        &self.db,
+                        run_id,
+                        &script.runtime,
+                        &script.source,
+                        &step_input,
+                        None,
+                        script.network,
+                    )
+                    .await;
+            }
 
             let status = self
                 .db
