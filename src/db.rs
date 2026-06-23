@@ -92,6 +92,8 @@ pub struct FlowStep {
     pub compensated: bool,
     /// Retries (extra attempts) on failure; None → default 1. attempts = retries + 1.
     pub retries: Option<i64>,
+    /// When this step reached a terminal status — orders saga compensation (reverse completion).
+    pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1123,7 +1125,7 @@ impl Db {
     pub async fn flow_steps(&self, flow_run_id: i64) -> Result<Vec<FlowStep>> {
         let rows = sqlx::query(
             "SELECT step_id, script_id, input, depends_on, status, output, \
-                    when_cond, map_ref, compensate, compensated, retries \
+                    when_cond, map_ref, compensate, compensated, retries, finished_at \
              FROM flow_steps WHERE flow_run_id = $1 ORDER BY id",
         )
         .bind(flow_run_id)
@@ -1144,6 +1146,7 @@ impl Db {
                 compensate: r.get("compensate"),
                 compensated: r.get("compensated"),
                 retries: r.get("retries"),
+                finished_at: r.get("finished_at"),
             })
             .collect())
     }

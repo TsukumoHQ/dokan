@@ -219,7 +219,7 @@ async fn main() -> Result<()> {
         scale::spawn_autoscaler(
             db.clone(),
             exec.clone(),
-            conc,
+            conc.clone(),
             scale::ScaleCfg {
                 conc_floor: cli.concurrency,
                 conc_max: cli.max_concurrency,
@@ -248,8 +248,9 @@ async fn main() -> Result<()> {
                 }
             });
         }
-        // Flow engine drives DAGs by enqueuing each step as a normal run.
-        flow::FlowEngine::new(db.clone(), exec.clone()).start().await?;
+        // Flow engine drives DAGs. It shares the worker's concurrency cap (`conc`) so a
+        // large map fan-out can't spawn unbounded containers and swamp the host.
+        flow::FlowEngine::new(db.clone(), exec.clone(), conc).start().await?;
         tracing::info!("flow engine started");
 
         // Orphan reaper: a worker/engine that dies mid-run leaves rows stuck `running`.

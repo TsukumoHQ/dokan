@@ -243,7 +243,8 @@ async fn flow_saga_compensation() -> anyhow::Result<()> {
         json!({
             "name": "saga",
             "spec": { "steps": [
-                {"id":"s1","script_id": good, "compensate": comp},
+                {"id":"s0","script_id": good, "compensate": comp},
+                {"id":"s1","script_id": good, "depends_on":["s0"], "compensate": comp},
                 {"id":"s2","script_id": bad, "depends_on":["s1"], "retries": 0}
             ]}
         }),
@@ -257,6 +258,8 @@ async fn flow_saga_compensation() -> anyhow::Result<()> {
     assert_eq!(last["status"], "failed", "flow fails: {last}");
     let steps = last["steps"].as_array().unwrap();
     assert_eq!(step(steps, "s1")["status"], "succeeded");
+    // Both upstream succeeded steps with a compensate are rolled back (reverse order).
+    assert_eq!(step(steps, "s0")["comp"], json!(true), "s0 compensated: {last}");
     assert_eq!(step(steps, "s1")["comp"], json!(true), "s1 compensated: {last}");
 
     c.cancel().await?;
