@@ -1,20 +1,35 @@
 {
   "uid": "dokan-runtime",
-  "title": "dokan — runtime",
-  "tags": ["dokan", "runtime"],
+  "title": "dokan \u2014 runtime",
+  "tags": [
+    "dokan",
+    "runtime"
+  ],
   "timezone": "browser",
   "schemaVersion": 39,
   "version": 1,
   "editable": true,
   "refresh": "10s",
-  "time": { "from": "now-6h", "to": "now" },
-  "templating": { "list": [] },
-  "annotations": { "list": [] },
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "templating": {
+    "list": []
+  },
+  "annotations": {
+    "list": []
+  },
   "panels": [
     {
       "type": "row",
       "title": "Overview",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
       "id": 1,
       "collapsed": false
     },
@@ -23,105 +38,316 @@
       "title": "Active runs",
       "description": "Runs currently executing in a container.",
       "id": 2,
-      "gridPos": { "h": 4, "w": 5, "x": 0, "y": 1 },
-      "datasource": { "type": "prometheus", "uid": "dokan-prom" },
+      "gridPos": {
+        "h": 4,
+        "w": 5,
+        "x": 0,
+        "y": 1
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dokan-prom"
+      },
       "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "dokan-prom" }, "expr": "sum(dokan_runs_active)", "instant": true }
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dokan-prom"
+          },
+          "expr": "sum(dokan_runs_active)",
+          "instant": true
+        }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "short",
-          "color": { "mode": "fixed", "fixedColor": "#fbbf24" },
-          "thresholds": { "mode": "absolute", "steps": [ { "color": "text", "value": null } ] }
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "#fbbf24"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
         },
         "overrides": []
       },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "textMode": "auto" }
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "auto"
+      }
     },
     {
       "type": "stat",
       "title": "Queued",
       "description": "Pending runs waiting to be claimed.",
       "id": 3,
-      "gridPos": { "h": 4, "w": 5, "x": 5, "y": 1 },
-      "datasource": { "type": "prometheus", "uid": "dokan-prom" },
+      "gridPos": {
+        "h": 4,
+        "w": 5,
+        "x": 5,
+        "y": 1
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dokan-prom"
+      },
       "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "dokan-prom" }, "expr": "sum(dokan_runs{status=\"pending\"})", "instant": true }
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dokan-prom"
+          },
+          "expr": "sum(dokan_runs{status=\"pending\"})",
+          "instant": true
+        }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "short",
-          "color": { "mode": "thresholds" },
-          "thresholds": { "mode": "absolute", "steps": [ { "color": "#94a3b8", "value": null }, { "color": "#fbbf24", "value": 20 }, { "color": "#f87171", "value": 100 } ] }
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94a3b8",
+                "value": null
+              },
+              {
+                "color": "#fbbf24",
+                "value": 20
+              },
+              {
+                "color": "#f87171",
+                "value": 100
+              }
+            ]
+          }
         },
         "overrides": []
       },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "area", "textMode": "auto" }
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto"
+      }
     },
     {
       "type": "stat",
       "title": "Success rate (1h)",
       "description": "succeeded / (succeeded + failed) over the last hour.",
       "id": 4,
-      "gridPos": { "h": 4, "w": 5, "x": 10, "y": 1 },
-      "datasource": { "type": "prometheus", "uid": "dokan-prom" },
+      "gridPos": {
+        "h": 4,
+        "w": 5,
+        "x": 10,
+        "y": 1
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dokan-prom"
+      },
       "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "dokan-prom" }, "expr": "sum(increase(dokan_runs_finished_total{status=\"succeeded\"}[1h])) / clamp_min(sum(increase(dokan_runs_finished_total[1h])), 1)", "instant": true }
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dokan-prom"
+          },
+          "expr": "sum(increase(dokan_runs_finished_total{status=\"succeeded\"}[1h])) / clamp_min(sum(increase(dokan_runs_finished_total[1h])), 1)",
+          "instant": true
+        }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "percentunit",
           "min": 0,
           "max": 1,
-          "color": { "mode": "thresholds" },
-          "thresholds": { "mode": "absolute", "steps": [ { "color": "#f87171", "value": null }, { "color": "#fbbf24", "value": 0.8 }, { "color": "#4ade80", "value": 0.95 } ] }
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#f87171",
+                "value": null
+              },
+              {
+                "color": "#fbbf24",
+                "value": 0.8
+              },
+              {
+                "color": "#4ade80",
+                "value": 0.95
+              }
+            ]
+          }
         },
         "overrides": []
       },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "none", "textMode": "auto" }
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto"
+      }
     },
     {
       "type": "stat",
       "title": "Warm-pool hit (1h)",
-      "description": "warm acquisitions / total — how often a job skipped cold container creation.",
+      "description": "warm acquisitions / total \u2014 how often a job skipped cold container creation.",
       "id": 5,
-      "gridPos": { "h": 4, "w": 5, "x": 15, "y": 1 },
-      "datasource": { "type": "prometheus", "uid": "dokan-prom" },
+      "gridPos": {
+        "h": 4,
+        "w": 5,
+        "x": 15,
+        "y": 1
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dokan-prom"
+      },
       "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "dokan-prom" }, "expr": "sum(increase(dokan_pool_acquire_total{result=\"warm\"}[1h])) / clamp_min(sum(increase(dokan_pool_acquire_total[1h])), 1)", "instant": true }
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dokan-prom"
+          },
+          "expr": "sum(increase(dokan_pool_acquire_total{result=\"warm\"}[1h])) / clamp_min(sum(increase(dokan_pool_acquire_total[1h])), 1)",
+          "instant": true
+        }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "percentunit",
           "min": 0,
           "max": 1,
-          "color": { "mode": "thresholds" },
-          "thresholds": { "mode": "absolute", "steps": [ { "color": "#f87171", "value": null }, { "color": "#fbbf24", "value": 0.5 }, { "color": "#4ade80", "value": 0.8 } ] }
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#f87171",
+                "value": null
+              },
+              {
+                "color": "#fbbf24",
+                "value": 0.5
+              },
+              {
+                "color": "#4ade80",
+                "value": 0.8
+              }
+            ]
+          }
         },
         "overrides": []
       },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "none", "textMode": "auto" }
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto"
+      }
     },
     {
       "type": "stat",
       "title": "Schedules",
       "description": "Enabled cron schedules.",
       "id": 6,
-      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 1 },
-      "datasource": { "type": "prometheus", "uid": "dokan-prom" },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 1
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dokan-prom"
+      },
       "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "dokan-prom" }, "expr": "max(dokan_schedules_enabled)", "instant": true }
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dokan-prom"
+          },
+          "expr": "max(dokan_schedules_enabled)",
+          "instant": true
+        }
       ],
       "fieldConfig": {
-        "defaults": { "unit": "short", "color": { "mode": "fixed", "fixedColor": "#7dd3fc" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "text", "value": null } ] } },
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "#7dd3fc"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
         "overrides": []
       },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "none", "textMode": "auto" }
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto"
+      }
     },
     {
       "type": "row",
       "title": "Throughput & outcomes",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 5
+      },
       "id": 10,
       "collapsed": false
     },
@@ -130,91 +356,464 @@
       "title": "Runs finished /s by status",
       "description": "rate of terminal runs, by status.",
       "id": 11,
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
-      "datasource": { "type": "prometheus", "uid": "dokan-prom" },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dokan-prom"
+      },
       "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "dokan-prom" }, "expr": "sum by (status) (rate(dokan_runs_finished_total[$__rate_interval]))", "legendFormat": "{{status}}" }
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dokan-prom"
+          },
+          "expr": "sum by (status) (rate(dokan_runs_finished_total[$__rate_interval]))",
+          "legendFormat": "{{status}}"
+        }
       ],
       "fieldConfig": {
-        "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 12, "showPoints": "never", "lineWidth": 2, "stacking": { "mode": "normal", "group": "A" } } },
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 12,
+            "showPoints": "never",
+            "lineWidth": 2,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
         "overrides": [
-          { "matcher": { "id": "byName", "options": "succeeded" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#4ade80" } } ] },
-          { "matcher": { "id": "byName", "options": "failed" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#f87171" } } ] },
-          { "matcher": { "id": "byName", "options": "canceled" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#64748b" } } ] }
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "succeeded"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#4ade80"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "failed"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#f87171"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "canceled"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#64748b"
+                }
+              }
+            ]
+          }
         ]
       },
-      "options": { "legend": { "displayMode": "list", "placement": "bottom", "calcs": [] }, "tooltip": { "mode": "multi", "sort": "desc" } }
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
     },
     {
       "type": "timeseries",
       "title": "Queue depth by status",
       "description": "live run counts sampled from the queue.",
       "id": 12,
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
-      "datasource": { "type": "prometheus", "uid": "dokan-prom" },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dokan-prom"
+      },
       "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "dokan-prom" }, "expr": "dokan_runs", "legendFormat": "{{status}}" }
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dokan-prom"
+          },
+          "expr": "dokan_runs",
+          "legendFormat": "{{status}}"
+        }
       ],
       "fieldConfig": {
-        "defaults": { "unit": "short", "custom": { "drawStyle": "line", "lineInterpolation": "stepAfter", "fillOpacity": 10, "showPoints": "never", "lineWidth": 2 } },
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "lineWidth": 2
+          }
+        },
         "overrides": [
-          { "matcher": { "id": "byName", "options": "pending" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#94a3b8" } } ] },
-          { "matcher": { "id": "byName", "options": "running" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#fbbf24" } } ] },
-          { "matcher": { "id": "byName", "options": "succeeded" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#4ade80" } } ] },
-          { "matcher": { "id": "byName", "options": "failed" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#f87171" } } ] },
-          { "matcher": { "id": "byName", "options": "canceled" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#64748b" } } ] }
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "pending"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#94a3b8"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "running"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#fbbf24"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "succeeded"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#4ade80"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "failed"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#f87171"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "canceled"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#64748b"
+                }
+              }
+            ]
+          }
         ]
       },
-      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } }
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
     },
     {
       "type": "timeseries",
-      "title": "Claims · retries · internal errors /s",
+      "title": "Claims \u00b7 retries \u00b7 internal errors /s",
       "description": "queue claims vs transient-failure retries vs dokan-side execution errors.",
       "id": 13,
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
-      "datasource": { "type": "prometheus", "uid": "dokan-prom" },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 14
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dokan-prom"
+      },
       "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "dokan-prom" }, "expr": "sum(rate(dokan_runs_claimed_total[$__rate_interval]))", "legendFormat": "claimed" },
-        { "refId": "B", "datasource": { "type": "prometheus", "uid": "dokan-prom" }, "expr": "sum(rate(dokan_runs_retried_total[$__rate_interval]))", "legendFormat": "retried" },
-        { "refId": "C", "datasource": { "type": "prometheus", "uid": "dokan-prom" }, "expr": "sum(rate(dokan_run_internal_errors_total[$__rate_interval]))", "legendFormat": "internal errors" }
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dokan-prom"
+          },
+          "expr": "sum(rate(dokan_runs_claimed_total[$__rate_interval]))",
+          "legendFormat": "claimed"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dokan-prom"
+          },
+          "expr": "sum(rate(dokan_runs_retried_total[$__rate_interval]))",
+          "legendFormat": "retried"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dokan-prom"
+          },
+          "expr": "sum(rate(dokan_run_internal_errors_total[$__rate_interval]))",
+          "legendFormat": "internal errors"
+        }
       ],
       "fieldConfig": {
-        "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 8, "showPoints": "never", "lineWidth": 2 } },
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "lineWidth": 2
+          }
+        },
         "overrides": [
-          { "matcher": { "id": "byName", "options": "claimed" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#7dd3fc" } } ] },
-          { "matcher": { "id": "byName", "options": "retried" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#fbbf24" } } ] },
-          { "matcher": { "id": "byName", "options": "internal errors" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#f87171" } } ] }
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "claimed"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#7dd3fc"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "retried"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#fbbf24"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "internal errors"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#f87171"
+                }
+              }
+            ]
+          }
         ]
       },
-      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
     },
     {
       "type": "timeseries",
-      "title": "Run duration (p50 · p95 · p99)",
+      "title": "Run duration (p50 \u00b7 p95 \u00b7 p99)",
       "description": "per-run wall-clock from acquire to discard, from the histogram.",
       "id": 14,
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
-      "datasource": { "type": "prometheus", "uid": "dokan-prom" },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 14
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dokan-prom"
+      },
       "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "dokan-prom" }, "expr": "histogram_quantile(0.50, sum by (le) (rate(dokan_run_duration_seconds_bucket[$__rate_interval])))", "legendFormat": "p50" },
-        { "refId": "B", "datasource": { "type": "prometheus", "uid": "dokan-prom" }, "expr": "histogram_quantile(0.95, sum by (le) (rate(dokan_run_duration_seconds_bucket[$__rate_interval])))", "legendFormat": "p95" },
-        { "refId": "C", "datasource": { "type": "prometheus", "uid": "dokan-prom" }, "expr": "histogram_quantile(0.99, sum by (le) (rate(dokan_run_duration_seconds_bucket[$__rate_interval])))", "legendFormat": "p99" }
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dokan-prom"
+          },
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(dokan_run_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dokan-prom"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(dokan_run_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p95"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dokan-prom"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(dokan_run_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p99"
+        }
       ],
       "fieldConfig": {
-        "defaults": { "unit": "s", "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 6, "showPoints": "never", "lineWidth": 2 } },
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 6,
+            "showPoints": "never",
+            "lineWidth": 2
+          }
+        },
         "overrides": [
-          { "matcher": { "id": "byName", "options": "p50" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#4ade80" } } ] },
-          { "matcher": { "id": "byName", "options": "p95" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#fbbf24" } } ] },
-          { "matcher": { "id": "byName", "options": "p99" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#f87171" } } ] }
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "p50"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#4ade80"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "p95"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#fbbf24"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "p99"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#f87171"
+                }
+              }
+            ]
+          }
         ]
       },
-      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } }
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
     },
     {
       "type": "row",
       "title": "Warm pool",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 22 },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 22
+      },
       "id": 20,
       "collapsed": false
     },
@@ -223,60 +822,232 @@
       "title": "Acquisitions /s (warm vs cold)",
       "description": "warm = reused idle container; cold = created on demand.",
       "id": 21,
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 23 },
-      "datasource": { "type": "prometheus", "uid": "dokan-prom" },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 23
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dokan-prom"
+      },
       "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "dokan-prom" }, "expr": "sum by (result) (rate(dokan_pool_acquire_total[$__rate_interval]))", "legendFormat": "{{result}}" }
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dokan-prom"
+          },
+          "expr": "sum by (result) (rate(dokan_pool_acquire_total[$__rate_interval]))",
+          "legendFormat": "{{result}}"
+        }
       ],
       "fieldConfig": {
-        "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 12, "showPoints": "never", "lineWidth": 2, "stacking": { "mode": "normal", "group": "A" } } },
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 12,
+            "showPoints": "never",
+            "lineWidth": 2,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
         "overrides": [
-          { "matcher": { "id": "byName", "options": "warm" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#4ade80" } } ] },
-          { "matcher": { "id": "byName", "options": "cold" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#fbbf24" } } ] }
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "warm"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#4ade80"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "cold"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#fbbf24"
+                }
+              }
+            ]
+          }
         ]
       },
-      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
     },
     {
       "type": "timeseries",
       "title": "Idle containers by image",
       "description": "warm containers kept ready, per runtime image.",
       "id": 22,
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 23 },
-      "datasource": { "type": "prometheus", "uid": "dokan-prom" },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 23
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dokan-prom"
+      },
       "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "dokan-prom" }, "expr": "dokan_pool_idle_containers", "legendFormat": "{{image}}" }
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dokan-prom"
+          },
+          "expr": "dokan_pool_idle_containers",
+          "legendFormat": "{{image}}"
+        }
       ],
       "fieldConfig": {
-        "defaults": { "unit": "short", "custom": { "drawStyle": "line", "lineInterpolation": "stepAfter", "fillOpacity": 10, "showPoints": "never", "lineWidth": 2 } },
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "lineWidth": 2
+          }
+        },
         "overrides": []
       },
-      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
     },
     {
       "type": "timeseries",
       "title": "Container acquire latency p95",
       "description": "time to obtain a ready container (warm pop ~0; cold includes create).",
       "id": 23,
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 23 },
-      "datasource": { "type": "prometheus", "uid": "dokan-prom" },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 23
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dokan-prom"
+      },
       "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "dokan-prom" }, "expr": "histogram_quantile(0.95, sum by (le) (rate(dokan_pool_acquire_seconds_bucket[$__rate_interval])))", "legendFormat": "acquire p95" },
-        { "refId": "B", "datasource": { "type": "prometheus", "uid": "dokan-prom" }, "expr": "histogram_quantile(0.95, sum by (le) (rate(dokan_pool_create_seconds_bucket[$__rate_interval])))", "legendFormat": "cold-create p95" }
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dokan-prom"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(dokan_pool_acquire_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "acquire p95"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dokan-prom"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(dokan_pool_create_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "cold-create p95"
+        }
       ],
       "fieldConfig": {
-        "defaults": { "unit": "s", "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 6, "showPoints": "never", "lineWidth": 2 } },
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 6,
+            "showPoints": "never",
+            "lineWidth": 2
+          }
+        },
         "overrides": [
-          { "matcher": { "id": "byName", "options": "acquire p95" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#7dd3fc" } } ] },
-          { "matcher": { "id": "byName", "options": "cold-create p95" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#fbbf24" } } ] }
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "acquire p95"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#7dd3fc"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "cold-create p95"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#fbbf24"
+                }
+              }
+            ]
+          }
         ]
       },
-      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
     },
     {
       "type": "row",
       "title": "Logs & reliability",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 31 },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 31
+      },
       "id": 30,
       "collapsed": false
     },
@@ -285,88 +1056,699 @@
       "title": "Log lines /s by stream",
       "description": "throughput of persisted container output.",
       "id": 31,
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
-      "datasource": { "type": "prometheus", "uid": "dokan-prom" },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 32
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dokan-prom"
+      },
       "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "dokan-prom" }, "expr": "sum by (stream) (rate(dokan_log_lines_total[$__rate_interval]))", "legendFormat": "{{stream}}" }
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dokan-prom"
+          },
+          "expr": "sum by (stream) (rate(dokan_log_lines_total[$__rate_interval]))",
+          "legendFormat": "{{stream}}"
+        }
       ],
       "fieldConfig": {
-        "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 8, "showPoints": "never", "lineWidth": 2 } },
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "lineWidth": 2
+          }
+        },
         "overrides": [
-          { "matcher": { "id": "byName", "options": "stderr" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#f87171" } } ] },
-          { "matcher": { "id": "byName", "options": "stdout" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#8b97a8" } } ] }
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "stderr"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#f87171"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "stdout"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#8b97a8"
+                }
+              }
+            ]
+          }
         ]
       },
-      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
     },
     {
       "type": "timeseries",
       "title": "Orphans reaped /s (dead workers/engines)",
       "description": "lease-based reclaim of runs/flows stranded by a crashed worker. Sustained nonzero = instability.",
       "id": 32,
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
-      "datasource": { "type": "prometheus", "uid": "dokan-prom" },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 32
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dokan-prom"
+      },
       "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "dokan-prom" }, "expr": "sum(rate(dokan_runs_reaped_total[$__rate_interval]))", "legendFormat": "runs reaped" },
-        { "refId": "B", "datasource": { "type": "prometheus", "uid": "dokan-prom" }, "expr": "sum(rate(dokan_flow_runs_reaped_total[$__rate_interval]))", "legendFormat": "flow runs reaped" },
-        { "refId": "C", "datasource": { "type": "prometheus", "uid": "dokan-prom" }, "expr": "sum(rate(dokan_run_timeouts_total[$__rate_interval]))", "legendFormat": "timeouts" }
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dokan-prom"
+          },
+          "expr": "sum(rate(dokan_runs_reaped_total[$__rate_interval]))",
+          "legendFormat": "runs reaped"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dokan-prom"
+          },
+          "expr": "sum(rate(dokan_flow_runs_reaped_total[$__rate_interval]))",
+          "legendFormat": "flow runs reaped"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dokan-prom"
+          },
+          "expr": "sum(rate(dokan_run_timeouts_total[$__rate_interval]))",
+          "legendFormat": "timeouts"
+        }
       ],
       "fieldConfig": {
-        "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 8, "showPoints": "never", "lineWidth": 2 } },
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "lineWidth": 2
+          }
+        },
         "overrides": [
-          { "matcher": { "id": "byName", "options": "timeouts" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#f87171" } } ] }
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "timeouts"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#f87171"
+                }
+              }
+            ]
+          }
         ]
       },
-      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
     },
     {
       "type": "row",
-      "title": "Autoscale (Little's Law: L = λ·W)",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 40 },
+      "title": "Autoscale (Little's Law: L = \u03bb\u00b7W)",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 40
+      },
       "id": 40,
       "collapsed": false
     },
     {
       "type": "timeseries",
-      "title": "Demand: arrival rate λ vs jobs-in-system L",
-      "description": "λ = runs enqueued/s (EWMA). L = λ·W, the concurrency the queue needs to stay stable. The controller sizes capacity to L·1.3.",
+      "title": "Demand: arrival rate \u03bb vs jobs-in-system L",
+      "description": "\u03bb = runs enqueued/s (EWMA). L = \u03bb\u00b7W, the concurrency the queue needs to stay stable. The controller sizes capacity to L\u00b71.3.",
       "id": 41,
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 41 },
-      "datasource": { "type": "prometheus", "uid": "dokan-prom" },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 41
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dokan-prom"
+      },
       "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "dokan-prom" }, "expr": "dokan_autoscale_arrival_rate", "legendFormat": "λ arrival rate (/s)" },
-        { "refId": "B", "datasource": { "type": "prometheus", "uid": "dokan-prom" }, "expr": "dokan_autoscale_in_system", "legendFormat": "L = λ·W (jobs)" }
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dokan-prom"
+          },
+          "expr": "dokan_autoscale_arrival_rate",
+          "legendFormat": "\u03bb arrival rate (/s)"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dokan-prom"
+          },
+          "expr": "dokan_autoscale_in_system",
+          "legendFormat": "L = \u03bb\u00b7W (jobs)"
+        }
       ],
       "fieldConfig": {
-        "defaults": { "unit": "short", "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 8, "showPoints": "never", "lineWidth": 2 } },
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "lineWidth": 2
+          }
+        },
         "overrides": [
-          { "matcher": { "id": "byName", "options": "λ arrival rate (/s)" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#7dd3fc" } } ] },
-          { "matcher": { "id": "byName", "options": "L = λ·W (jobs)" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#fbbf24" } } ] }
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "\u03bb arrival rate (/s)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#7dd3fc"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "L = \u03bb\u00b7W (jobs)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#fbbf24"
+                }
+              }
+            ]
+          }
         ]
       },
-      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } }
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
     },
     {
       "type": "timeseries",
       "title": "Capacity: concurrency & warm depth (autoscaled)",
-      "description": "The controller's outputs — worker concurrency and warm containers per image — tracking L, vs the actual idle containers held.",
+      "description": "The controller's outputs \u2014 worker concurrency and warm containers per image \u2014 tracking L, vs the actual idle containers held.",
       "id": 42,
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 41 },
-      "datasource": { "type": "prometheus", "uid": "dokan-prom" },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 41
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dokan-prom"
+      },
       "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "dokan-prom" }, "expr": "dokan_autoscale_concurrency", "legendFormat": "concurrency" },
-        { "refId": "B", "datasource": { "type": "prometheus", "uid": "dokan-prom" }, "expr": "dokan_autoscale_warm_target", "legendFormat": "warm target / image" },
-        { "refId": "C", "datasource": { "type": "prometheus", "uid": "dokan-prom" }, "expr": "sum(dokan_pool_idle_containers)", "legendFormat": "idle containers (actual)" }
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dokan-prom"
+          },
+          "expr": "dokan_autoscale_concurrency",
+          "legendFormat": "concurrency"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dokan-prom"
+          },
+          "expr": "dokan_autoscale_warm_target",
+          "legendFormat": "warm target / image"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dokan-prom"
+          },
+          "expr": "sum(dokan_pool_idle_containers)",
+          "legendFormat": "idle containers (actual)"
+        }
       ],
       "fieldConfig": {
-        "defaults": { "unit": "short", "custom": { "drawStyle": "line", "lineInterpolation": "stepAfter", "fillOpacity": 8, "showPoints": "never", "lineWidth": 2 } },
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "lineWidth": 2
+          }
+        },
         "overrides": [
-          { "matcher": { "id": "byName", "options": "concurrency" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#4ade80" } } ] },
-          { "matcher": { "id": "byName", "options": "warm target / image" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#fbbf24" } } ] },
-          { "matcher": { "id": "byName", "options": "idle containers (actual)" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#5b6675" } } ] }
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "concurrency"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#4ade80"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "warm target / image"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#fbbf24"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "idle containers (actual)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#5b6675"
+                }
+              }
+            ]
+          }
         ]
       },
-      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } }
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 49
+      },
+      "id": 50,
+      "panels": [],
+      "title": "Flows (DAG \u00b7 branch \u00b7 map \u00b7 saga)",
+      "type": "row",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dokan-prom"
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Flow runs finished /s by status",
+      "description": "rate of terminal runs, by status.",
+      "id": 51,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 50
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dokan-prom"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dokan-prom"
+          },
+          "expr": "sum by (status) (rate(dokan_flow_runs_finished_total[$__rate_interval]))",
+          "legendFormat": "{{status}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 12,
+            "showPoints": "never",
+            "lineWidth": 2,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "succeeded"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#4ade80"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "failed"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#f87171"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "canceled"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#64748b"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Flow steps finished /s by status (incl. skipped)",
+      "description": "rate of terminal runs, by status.",
+      "id": 52,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 50
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dokan-prom"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dokan-prom"
+          },
+          "expr": "sum by (status) (rate(dokan_flow_steps_finished_total[$__rate_interval]))",
+          "legendFormat": "{{status}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 12,
+            "showPoints": "never",
+            "lineWidth": 2,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "succeeded"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#4ade80"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "failed"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#f87171"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "canceled"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#64748b"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Saga compensations /s",
+      "description": "rate of terminal runs, by status.",
+      "id": 53,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 50
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dokan-prom"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dokan-prom"
+          },
+          "expr": "sum(rate(dokan_flow_compensations_total[$__rate_interval]))",
+          "legendFormat": "compensations"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 12,
+            "showPoints": "never",
+            "lineWidth": 2,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "succeeded"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#4ade80"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "failed"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#f87171"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "canceled"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#64748b"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
     }
   ]
 }

@@ -112,6 +112,26 @@ ALTER TABLE scripts ADD COLUMN IF NOT EXISTS created_by TEXT;
 -- blunt "reset every running flow_run" boot reset). `runs` already has started_at.
 ALTER TABLE flow_runs ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ;
 
+-- Rich flows: conditionals (`when`), fan-out (`map`), and saga compensation.
+-- These live on flow_steps so the durable driver reads them from the ledger (not the
+-- spec) and survives restarts. status vocabulary extends to: skipped | expanded.
+--   when_cond  — gate object {ref, op, value}; false → step (and dead branch) skipped.
+--   map_ref    — ref to an array; step fans out into children `<id>#<i>` at run time.
+--   compensate — script_id run (reverse order) for each succeeded step if the flow fails.
+ALTER TABLE flow_steps ADD COLUMN IF NOT EXISTS when_cond   JSONB;
+ALTER TABLE flow_steps ADD COLUMN IF NOT EXISTS map_ref     TEXT;
+ALTER TABLE flow_steps ADD COLUMN IF NOT EXISTS compensate  BIGINT;
+ALTER TABLE flow_steps ADD COLUMN IF NOT EXISTS compensated BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE flow_steps ADD COLUMN IF NOT EXISTS finished_at TIMESTAMPTZ;
+
+-- Per-step retry budget: number of *retries* (extra attempts) on failure. NULL → default 1
+-- (2 attempts total, the original behaviour). Set 0 for a non-idempotent step that must
+-- never re-run. attempts = retries + 1.
+ALTER TABLE flow_steps ADD COLUMN IF NOT EXISTS retries BIGINT;
+-- Self-heal installs that got `retries` as INT from an interim build (read as i64 → panic).
+-- INT→BIGINT is a safe widening; the ALTER is a cheap no-op once the type already matches.
+ALTER TABLE flow_steps ALTER COLUMN retries TYPE BIGINT;
+
 -- Typo-tolerant script search: pg_trgm powers similarity() so search_script catches
 -- near-misses (the substring-only fallback returned 0 on fuzzy queries). GIN trigram
 -- index keeps it cheap as the registry grows.

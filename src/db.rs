@@ -83,6 +83,15 @@ pub struct FlowStep {
     pub depends_on: Vec<String>,
     pub status: String,
     pub output: Option<String>,
+    /// Conditional gate {ref, op, value}; when present and false → step is skipped.
+    pub when_cond: Option<serde_json::Value>,
+    /// Map ref to an array; when present the step fans out into `<id>#<i>` children.
+    pub map_ref: Option<String>,
+    /// Compensation script run (saga) if the flow fails after this step succeeded.
+    pub compensate: Option<i64>,
+    pub compensated: bool,
+    /// Retries (extra attempts) on failure; None → default 1. attempts = retries + 1.
+    pub retries: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -1064,15 +1073,24 @@ impl Db {
                 .and_then(|v| v.as_array())
                 .map(|a| a.iter().filter_map(|d| d.as_str().map(String::from)).collect())
                 .unwrap_or_default();
+            let when_cond = st.get("when").cloned();
+            let map_ref = st.get("map").and_then(|v| v.as_str()).map(String::from);
+            let compensate = st.get("compensate").and_then(|v| v.as_i64());
+            let retries = st.get("retries").and_then(|v| v.as_i64());
             sqlx::query(
-                "INSERT INTO flow_steps (flow_run_id, step_id, script_id, input, depends_on) \
-                 VALUES ($1, $2, $3, $4, $5)",
+                "INSERT INTO flow_steps \
+                 (flow_run_id, step_id, script_id, input, depends_on, when_cond, map_ref, compensate, retries) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
             )
             .bind(flow_run_id)
             .bind(step_id)
             .bind(script_id)
             .bind(step_input)
             .bind(&deps)
+            .bind(when_cond)
+            .bind(map_ref)
+            .bind(compensate)
+            .bind(retries)
             .execute(&mut *tx)
             .await?;
         }
@@ -1104,7 +1122,8 @@ impl Db {
 
     pub async fn flow_steps(&self, flow_run_id: i64) -> Result<Vec<FlowStep>> {
         let rows = sqlx::query(
-            "SELECT step_id, script_id, input, depends_on, status, output \
+            "SELECT step_id, script_id, input, depends_on, status, output, \
+                    when_cond, map_ref, compensate, compensated, retries \
              FROM flow_steps WHERE flow_run_id = $1 ORDER BY id",
         )
         .bind(flow_run_id)
@@ -1120,6 +1139,11 @@ impl Db {
                 depends_on: r.get("depends_on"),
                 status: r.get("status"),
                 output: r.get("output"),
+                when_cond: r.get("when_cond"),
+                map_ref: r.get("map_ref"),
+                compensate: r.get("compensate"),
+                compensated: r.get("compensated"),
+                retries: r.get("retries"),
             })
             .collect())
     }
@@ -1145,7 +1169,7 @@ impl Db {
         output: Option<&str>,
     ) -> Result<()> {
         sqlx::query(
-            "UPDATE flow_steps SET status = $3, output = $4 \
+            "UPDATE flow_steps SET status = $3, output = $4, finished_at = now() \
              WHERE flow_run_id = $1 AND step_id = $2",
         )
         .bind(flow_run_id)
@@ -1154,6 +1178,64 @@ impl Db {
         .bind(output)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    /// Mark a step skipped (a false `when` gate, or a dead branch whose dep was skipped).
+    /// Terminal like succeeded/failed, but contributes no output to dependents.
+    pub async fn mark_step_skipped(&self, flow_run_id: i64, step_id: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE flow_steps SET status = 'skipped', finished_at = now() \
+             WHERE flow_run_id = $1 AND step_id = $2",
+        )
+        .bind(flow_run_id)
+        .bind(step_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Record that a step's compensation (saga rollback) has run.
+    pub async fn mark_step_compensated(&self, flow_run_id: i64, step_id: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE flow_steps SET compensated = true WHERE flow_run_id = $1 AND step_id = $2",
+        )
+        .bind(flow_run_id)
+        .bind(step_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Atomically expand a `map` step into its children and mark the parent `expanded`.
+    /// UNIQUE(flow_run_id, step_id) + ON CONFLICT DO NOTHING makes a crash-resumed
+    /// re-expansion a no-op, so map fan-out stays durable at the step boundary.
+    pub async fn expand_map_step(
+        &self,
+        flow_run_id: i64,
+        parent: &str,
+        children: &[(String, i64, serde_json::Value, Vec<String>)],
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        for (step_id, script_id, input, deps) in children {
+            sqlx::query(
+                "INSERT INTO flow_steps (flow_run_id, step_id, script_id, input, depends_on) \
+                 VALUES ($1, $2, $3, $4, $5) ON CONFLICT (flow_run_id, step_id) DO NOTHING",
+            )
+            .bind(flow_run_id)
+            .bind(step_id)
+            .bind(script_id)
+            .bind(input)
+            .bind(deps)
+            .execute(&mut *tx)
+            .await?;
+        }
+        sqlx::query("UPDATE flow_steps SET status = 'expanded' WHERE flow_run_id = $1 AND step_id = $2")
+            .bind(flow_run_id)
+            .bind(parent)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(())
     }
 
