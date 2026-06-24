@@ -1,72 +1,60 @@
-# dokan
+<p align="center"><img src="assets/wordmark.png" alt="dokan" width="280"></p>
 
-### your AI agent builds the workflow. you don't click.
+<p align="center"><b>Your AI coding agent builds and runs the workflow. You don't click.</b></p>
 
-dokan is an automation engine built for the agent era. Instead of a human clicking through a UI, your coding agent stands up and runs the workflows itself by talking to the platform over MCP. The platform executes the deterministic, reliable, cheap work. The intelligence stays in the agent.
-
-<img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="license Apache-2.0"> <img src="https://img.shields.io/badge/CI-tested-green" alt="CI tested">
+<p align="center">Agent-operated automation runtime · deterministic scripts in Docker · <b>zero LLM inside</b> · Apache-2.0</p>
 
 ---
 
-## What it is
+**dokan** is an automation runtime built for the agent era. Instead of a human clicking through a UI, your coding agent stands up, runs, and schedules workflows itself by talking to dokan over MCP. The platform runs deterministic code in clean containers and **burns zero tokens**: the expensive intelligence stays in your agent, outside the runtime.
 
-An automation engine for agents: your agent describes a workflow and triggers it; dokan runs it in isolated containers and streams the results back. Think Sidekiq for agents, the passive pipe that does the work while the agent orchestrates. No dashboard to click, no human in the loop for the mechanical 80%.
+Think *Sidekiq/cron for AI agents*: the agent scripts the mechanical 80%, dokan executes it cheaply and reliably, you don't touch a dashboard.
 
-## Automation that doesn't burn tokens
-
-This is the sharpest difference. **dokan runs zero LLM inside.** It executes deterministic code, so it burns no tokens. The expensive model stays outside, in your agent, where the judgment belongs.
-
-That is the cost argument against the current crop:
-
-| | dokan | n8n / Windmill / Zapier-likes |
-|---|---|---|
-| Where the LLM runs | outside, in your agent | sold as "LLM in the workflow" (per-step model calls) |
-| Token cost of running a workflow | none (deterministic execution) | compounds with every LLM-in-step |
-| Who operates it | the agent, over MCP | a human, clicking a UI |
-| Triggers | cron plus inbound webhooks, agent-wired | cron plus webhooks, human-wired in a UI |
-| License | Apache-2.0, no trap | often restrictive / source-available |
-
-You pay for intelligence once, in the agent. The execution layer is cheap and deterministic by design.
+## Why dokan
+- **Agent-operated.** your agent uploads, wires, triggers, reads logs over MCP. No UI.
+- **Zero LLM inside = zero token burn.** deterministic code, not LLM-in-the-loop. The platform never spends tokens to run your workflows.
+- **Deterministic + reliable.** one job = one clean Docker container, per-job CPU/mem caps, timeouts, retries, content-addressed cache (never recompute unchanged work).
+- **Real triggers.** cron + inbound webhooks (POST /hook/<token>, Stripe/Calendly/GitHub-ready).
+- **Token-frugal.** every MCP response engineered for an agent's context budget.
 
 ## Quickstart
+> [TECH: dokan-core verify the simplest real public install. current path = docker compose up + cargo build + run daemon; confirm/clean.]
+```sh
+docker compose up -d            # Postgres state store
+cargo build --release
+./target/release/dokan --transport http --addr 127.0.0.1:8088
+```
 
-> `[TECH: owner fills, we do not invent commands.]`
+## Wire into your agent (MCP)
+> [TECH: dokan-core confirm the exact config block.]
+```jsonc
+"dokan": { "type": "http", "url": "http://127.0.0.1:8088/mcp" }
+```
+Your agent now has the full dokan toolset over MCP.
 
-- `[TECH: install headline, how an agent connects to dokan over MCP]`
-- `[TECH: operator bootstrap, bring up the daemon / dependencies]`
-- `[TECH: prerequisites, runtime, Docker, Postgres, versions]`
-- `[TECH: quickstart, zero to first run, agent uploads + runs + reads a script]`
-- `[TECH: usage example, a real workflow described, not coded]`
+## MCP surface (token-frugal)
+| Tool | Returns |
+|---|---|
+| search_script | ranked IDs + 1-line desc |
+| upload_script | script_id + version |
+| run_script | run_id immediately, never blocks |
+| read_logs / wait_for | cursor logs / long-poll to terminal + tail |
+| schedule / list_schedules | cron a script (6-field) |
+| compose_flow / run_flow | declarative DAG, wired over MCP |
+| create_webhook | inbound HTTP trigger to a script/flow |
+| set_secret / list_secrets | write-only secrets, injected as job env |
+| cancel · list_runs · get_script | … |
 
-## What it does
+Server instructions ship in-band so the agent self-limits.
 
-- **Real triggers, not just cron.** Schedule work on a cron, or fire it on a real event with an inbound webhook (a POST to a per-hook token URL, ready for Stripe, Calendly, or GitHub). The same event triggers Zapier and n8n are built on, agent-wired and with zero LLM in the loop.
-- **Complex workflows, described not coded.** Conditions, mass processing (the same step over a thousand items), and clean rollback on failure. Rich business processes, not just linear task chains.
-- **Never compute twice.** Unchanged parts of a workflow are reused instantly, so you get speed and a direct cost cut.
-- **Reliable by construction.** Overload protection, crash recovery, and data consistency are built in.
-- **Quality you can check.** CI runs every change through tests before it ships, and test coverage is solid. We promise reliability because it is tested, not because we assert it.
+## How it works
+Single Rust daemon (axum + rmcp MCP server, stdio or Streamable HTTP). State in Postgres. Execution via Docker: one job, one clean container (python:3.12-slim / node:22-slim / alpine), discarded after, per-job caps + hard timeout. Logs stream into Postgres, served cursor-paginated. Thin operator cockpit at / + Prometheus at /metrics.
 
-## Part of the suite
-
-dokan is the execution pillar of the agent stack. The four answer four different questions:
-
-- **trovex** is what your agents KNOW (canonical context).
-- **wrai.th** is how they COORDINATE.
-- **yoru** is whether they are HEALTHY.
-- **dokan** is what they DO deterministically (execution and automation, the mechanical 80%).
-
-`[TECH/design: insert the 4-pillar suite diagram]`
-
-## Why this approach holds up
-
-Recent academic work (2025 to 2026) describes an approach close to this one: keep the model outside, run deterministic execution underneath. The thesis is in the air, and dokan is positioned early on it. `[TECH: tech-copy / geo insert the real paper citation here, cite the actual paper, no fabrication.]`
-
-## Status (honest)
-
-The core is solid and differentiated, and it is dogfooded: we run the mechanical 80% of our own agent fleet on dokan. It is **ready for a demo, design partners, and technical early adopters.**
-
-It is **not** enterprise-turnkey on every axis yet (multi-tenant security and high availability are identified and out of scope while we target internal teams). dokan is built for internal-team use and design partners, not for a large-enterprise rollout without hand-holding. We would rather say that plainly than overpromise.
+## Status
+Active development, built and run in production by the team that makes it (we run our own agent fleet's automation on dokan). **Ready for: demos, design partners, technical early adopters.** Not yet turnkey multi-tenant enterprise (no SSO/RBAC/HA), out of scope while we serve internal teams. Honest about where it is.
 
 ## License
+Apache-2.0. Use it, embed it, build on it.
 
-Apache-2.0. Open source, no license trap. `[TECH: repo link]`
+---
+*Part of the [tsukumo](https://tsukumo.ch) suite: open tools for running AI agents well at scale.*
