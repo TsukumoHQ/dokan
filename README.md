@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/dokan-wordmark.png" alt="dokan" width="680"></p>
+
 # dokan (導管)
 
 > Agent-operated runtime for **deterministic scripts in Docker**, with an **MCP-first control plane**. Zero LLM inside. Apache-2.0.
