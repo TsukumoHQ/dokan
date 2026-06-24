@@ -1,4 +1,4 @@
-<p align="center"><img src="assets/dokan-wordmark.png" alt="dokan" width="680"></p>
+<p align="center"><img src="assets/wordmark.png" alt="dokan" width="300"></p>
 
 # dokan (導管)
 
