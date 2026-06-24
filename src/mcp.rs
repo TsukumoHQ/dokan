@@ -58,6 +58,24 @@ fn canonical_json(v: &serde_json::Value) -> String {
     }
 }
 
+/// Some MCP clients stringify object/array params instead of sending them inline.
+/// If a JSON value arrives as a string that itself parses to an object or array,
+/// decode it once — otherwise a `{...}` input reaches the job double-encoded
+/// (DOKAN_INPUT = a quoted JSON string, so one JSON.parse yields a string, not the
+/// object, and the job silently reads its fields as undefined). A scalar string
+/// (or anything that doesn't parse to a container) passes through untouched, so a
+/// legitimately-stringy input is never mangled.
+fn destringify(v: serde_json::Value) -> serde_json::Value {
+    if let serde_json::Value::String(s) = &v {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
+            if parsed.is_object() || parsed.is_array() {
+                return parsed;
+            }
+        }
+    }
+    v
+}
+
 /// Content-address a run: hash(runtime + source + canonical(input) + secrets generation).
 /// Same inputs ⇒ same key ⇒ recallable (dokan jobs are deterministic).
 pub(crate) fn run_cache_key(
@@ -544,7 +562,7 @@ impl Dokan {
                 return ok(json!({"run_id": run_id, "status": status, "idempotent": true}));
             }
         }
-        let input = a.input.unwrap_or(json!({}));
+        let input = destringify(a.input.unwrap_or(json!({})));
         // Run-or-recall: if opted in and an identical run already succeeded, return its
         // result instead of spawning a container. The key folds in the secrets generation,
         // so a secret change invalidates env-dependent recalls.
@@ -731,12 +749,13 @@ impl Dokan {
         &self,
         Parameters(a): Parameters<ComposeFlowArgs>,
     ) -> Result<CallToolResult, McpError> {
-        if let Err(e) = crate::flow::validate_spec(&a.spec) {
+        let spec = destringify(a.spec);
+        if let Err(e) = crate::flow::validate_spec(&spec) {
             return ok(json!({"error": "invalid_spec", "detail": e}));
         }
         let id = self
             .db
-            .insert_flow(&a.name, &a.spec)
+            .insert_flow(&a.name, &spec)
             .await
             .map_err(internal)?;
         ok(json!({"flow_id": id, "status": "composed"}))
@@ -750,7 +769,7 @@ impl Dokan {
         let Some(spec) = self.db.get_flow_spec(a.flow_id).await.map_err(internal)? else {
             return ok(json!({"error": "flow_not_found", "id": a.flow_id}));
         };
-        let input = a.input.unwrap_or(json!({}));
+        let input = destringify(a.input.unwrap_or(json!({})));
         let id = self
             .db
             .insert_flow_run(a.flow_id, &spec, &input)
@@ -819,7 +838,7 @@ impl Dokan {
         if self.db.get_script(a.script_id).await.map_err(internal)?.is_none() {
             return ok(json!({"error": "script_not_found", "id": a.script_id}));
         }
-        let input = a.input.unwrap_or(json!({}));
+        let input = destringify(a.input.unwrap_or(json!({})));
         let id = self
             .db
             .insert_schedule(a.script_id, &a.cron, &input)
@@ -1016,7 +1035,7 @@ impl ServerHandler for Dokan {
 
 #[cfg(test)]
 mod tests {
-    use super::{canonical_json, run_cache_key, validate_cron};
+    use super::{canonical_json, destringify, run_cache_key, validate_cron};
     use serde_json::json;
 
     #[test]
@@ -1041,6 +1060,24 @@ mod tests {
             run_cache_key("bash", "digestB", "s", &i1, 0),
             "image digest invalidates"
         );
+    }
+
+    #[test]
+    fn destringify_decodes_client_stringified_objects() {
+        // The bug: an MCP client sends the input object as a JSON *string*. Left as-is it
+        // reaches the job double-encoded (DOKAN_INPUT = a quoted JSON string).
+        assert_eq!(destringify(json!(r#"{"write":true}"#)), json!({"write": true}));
+        assert_eq!(destringify(json!("[1,2,3]")), json!([1, 2, 3]));
+        // A real object passes through unchanged (idempotent — applying it twice is safe).
+        let obj = json!({"write": true});
+        assert_eq!(destringify(obj.clone()), obj);
+        assert_eq!(destringify(destringify(json!(r#"{"write":true}"#))), obj);
+        // A scalar string is NOT mangled, even when it happens to parse as a JSON scalar.
+        assert_eq!(destringify(json!("hello")), json!("hello"));
+        assert_eq!(destringify(json!("123")), json!("123"));
+        assert_eq!(destringify(json!("true")), json!("true"));
+        // Non-string values are untouched.
+        assert_eq!(destringify(json!(42)), json!(42));
     }
 
     #[test]

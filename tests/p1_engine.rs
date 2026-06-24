@@ -156,6 +156,37 @@ async fn secret_injected_into_job_env() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Some MCP clients stringify an object param. When `input` arrives as a JSON *string*
+/// of an object, the job must still see it single-encoded in DOKAN_INPUT (so one
+/// JSON.parse yields the object) — not double-encoded (a quoted JSON string that parses
+/// to a string and silently reads its fields as undefined). (Field bug: a write-flag job
+/// ran in dry mode because input{write:true} arrived stringified.)
+#[tokio::test]
+async fn stringified_object_input_is_not_double_encoded() -> anyhow::Result<()> {
+    let c = spawn().await?;
+    let sid = upload(&c, "bash", "echo \"IN=$DOKAN_INPUT\"\n").await;
+    // Simulate a client that sends the object as a JSON string instead of inline.
+    let run = call(
+        &c,
+        "run_script",
+        json!({"script_id": sid, "input": "{\"write\":true}"}),
+    )
+    .await?;
+    let run_id = run["run_id"].as_i64().unwrap();
+    assert_eq!(wait_status(&c, run_id, 60).await, "succeeded", "ran");
+    let text = logs_text(&c, run_id).await;
+    assert!(
+        text.contains("IN={\"write\":true}"),
+        "input reaches job single-encoded (a real object): {text}"
+    );
+    assert!(
+        !text.contains("\\\""),
+        "NOT double-encoded (no escaped quotes in DOKAN_INPUT): {text}"
+    );
+    c.cancel().await?;
+    Ok(())
+}
+
 /// upsert=true re-provisions a script by name: same id back, no duplicate rows, no-op
 /// when the source is unchanged, version bump when it changes. (Terrain P2.)
 #[tokio::test]
