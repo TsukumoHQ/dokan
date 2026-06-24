@@ -148,6 +148,12 @@ CREATE INDEX IF NOT EXISTS idx_scripts_name_trgm ON scripts USING gin (name gin_
 -- and the relay egress carries it for event-driven alerting.
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS result JSONB;
 
+-- Progress channel (latest-only): a long job emits `::dokan:progress:: <text>` on stdout;
+-- dokan captures the LAST one here (overwritten live during the run), surfaced on the run
+-- row WITHOUT entering the log stream — so the operator sees current status ("meeting 3/6")
+-- at a glance instead of paging the whole log. Transient; not part of the receipt.
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS progress TEXT;
+
 -- Determinism: a script declared network=false runs in a network-disabled container, so its
 -- result is a pure function of (image digest, source, input, secrets) — soundly cacheable.
 -- Default true keeps existing monitors (which hit APIs) working.

@@ -59,6 +59,8 @@ pub struct Run {
     pub script_name: String,
     pub script_description: Option<String>,
     pub script_created_by: Option<String>,
+    /// Latest transient progress line (from the `::dokan:progress::` channel), if any.
+    pub progress: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -521,6 +523,27 @@ impl Db {
         Ok(())
     }
 
+    /// Set a run's transient progress line (from the `::dokan:progress::` channel).
+    /// Latest-wins: overwritten on each emit and surfaced live on the run row, never logged.
+    pub async fn update_run_progress(&self, id: i64, msg: &str) -> Result<()> {
+        sqlx::query("UPDATE runs SET progress = $2 WHERE id = $1")
+            .bind(id)
+            .bind(msg)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// A run's latest progress line, if any.
+    pub async fn run_progress(&self, id: i64) -> Result<Option<String>> {
+        let v: Option<String> = sqlx::query_scalar("SELECT progress FROM runs WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?
+            .flatten();
+        Ok(v)
+    }
+
     /// Find a prior run by idempotency key: (run_id, status). Exactly-once intent — a
     /// repeated run_script with the same key returns this instead of a duplicate.
     pub async fn find_run_by_idempotency(&self, key: &str) -> Result<Option<(i64, String)>> {
@@ -632,7 +655,7 @@ impl Db {
     pub async fn list_runs(&self, status: Option<&str>, limit: i64) -> Result<Vec<Run>> {
         let rows = if let Some(st) = status {
             sqlx::query(
-                "SELECT r.id, r.script_id, r.status, r.exit_code, r.error, r.created_at, \
+                "SELECT r.id, r.script_id, r.status, r.exit_code, r.error, r.created_at, r.progress, \
                      s.name AS script_name, s.description AS script_description, \
                      s.created_by AS script_created_by \
                  FROM runs r JOIN scripts s ON s.id = r.script_id \
@@ -644,7 +667,7 @@ impl Db {
             .await?
         } else {
             sqlx::query(
-                "SELECT r.id, r.script_id, r.status, r.exit_code, r.error, r.created_at, \
+                "SELECT r.id, r.script_id, r.status, r.exit_code, r.error, r.created_at, r.progress, \
                      s.name AS script_name, s.description AS script_description, \
                      s.created_by AS script_created_by \
                  FROM runs r JOIN scripts s ON s.id = r.script_id \
@@ -666,6 +689,7 @@ impl Db {
                 script_name: r.get("script_name"),
                 script_description: r.get("script_description"),
                 script_created_by: r.get("script_created_by"),
+                progress: r.get("progress"),
             })
             .collect())
     }

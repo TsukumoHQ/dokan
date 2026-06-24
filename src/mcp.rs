@@ -397,7 +397,7 @@ impl Dokan {
         ok(v)
     }
 
-    #[tool(description = "Upload a script. Returns script_id + version. Runtime: python|node|bash. INPUT CONTRACT: the script reads its input from the DOKAN_INPUT env var (a JSON string) — NOT stdin or argv. Secrets set via set_secret arrive as their own env vars (e.g. $OPENAI_API_KEY). A nonzero exit is treated as the script's own deterministic verdict (e.g. a monitor finding) and is NOT retried; only a container/infra failure retries. Pass upsert=true to re-provision by name idempotently (no duplicate rows on respawn). STRUCTURED RESULT: print a line `::dokan:result:: {json}` on stdout to attach a structured result to the run — it is captured (not logged), returned by wait_for/read_logs, and POSTed to the relay, so a monitor's finding reaches the agent event-driven.")]
+    #[tool(description = "Upload a script. Returns script_id + version. Runtime: python|node|bash. INPUT CONTRACT: the script reads its input from the DOKAN_INPUT env var (a JSON string) — NOT stdin or argv. Secrets set via set_secret arrive as their own env vars (e.g. $OPENAI_API_KEY). A nonzero exit is treated as the script's own deterministic verdict (e.g. a monitor finding) and is NOT retried; only a container/infra failure retries. Pass upsert=true to re-provision by name idempotently (no duplicate rows on respawn). STRUCTURED RESULT: print a line `::dokan:result:: {json}` on stdout to attach a structured result to the run — it is captured (not logged), returned by wait_for/read_logs, and POSTed to the relay, so a monitor's finding reaches the agent event-driven. PROGRESS: print `::dokan:progress:: <text>` to set the run's live status line (latest wins, overwritten each emit) — surfaced by list_runs/read_logs/wait_for and the UI, NOT logged. Use it in a long loop (e.g. `meeting 3/6`) so the operator sees current state without paging logs; flush stdout (Python: print(..., flush=True)) so it lands live.")]
     async fn upload_script(
         &self,
         Parameters(a): Parameters<UploadArgs>,
@@ -661,6 +661,10 @@ impl Dokan {
         if let Some(r) = self.db.run_result(a.run_id).await.ok().flatten() {
             out["result"] = r;
         }
+        // Latest progress line (live status of a long run), if the job emitted one.
+        if let Some(p) = self.db.run_progress(a.run_id).await.ok().flatten() {
+            out["progress"] = json!(p);
+        }
         ok(out)
     }
 
@@ -704,6 +708,9 @@ impl Dokan {
         if let Some(r) = self.db.run_result(a.run_id).await.ok().flatten() {
             out["result"] = r;
         }
+        if let Some(p) = self.db.run_progress(a.run_id).await.ok().flatten() {
+            out["progress"] = json!(p);
+        }
         ok(out)
     }
 
@@ -730,6 +737,10 @@ impl Dokan {
                 let mut o = json!({"run_id": r.id, "script_id": r.script_id, "script": r.script_name, "status": r.status, "exit": r.exit_code, "at": r.created_at.to_rfc3339()});
                 if let Some(e) = &r.error {
                     o["error"] = json!(e);
+                }
+                // Latest progress line — the cheap "what is this long run doing now" signal.
+                if let Some(p) = &r.progress {
+                    o["progress"] = json!(p);
                 }
                 o
             })

@@ -397,6 +397,11 @@ fn stale_container(e: bollard::errors::Error) -> anyhow::Error {
 /// caller parsing stdout, and the relay egress can carry it.
 const RESULT_MARKER: &str = "::dokan:result::";
 
+/// A stdout line of the form `::dokan:progress:: <text>` is a transient status update —
+/// written to the run's `progress` field (latest wins, live) rather than logged, so the
+/// operator sees a long job's current step ("meeting 3/6") without paging the whole log.
+const PROGRESS_MARKER: &str = "::dokan:progress::";
+
 /// Stream container output line-by-line into the DB. Returns (last seq written, captured
 /// structured result if the job emitted a RESULT_MARKER line).
 async fn pump_logs(
@@ -455,6 +460,12 @@ async fn pump_logs(
                     result = Some(rest.trim().to_string()); // control line: result, not a log
                     continue;
                 }
+                if let Some(rest) = line.trim_start().strip_prefix(PROGRESS_MARKER) {
+                    // Live status, latest-wins; not a log line. Best-effort — a failed
+                    // progress write must never break the run's log pump.
+                    let _ = db.update_run_progress(run_id, rest.trim()).await;
+                    continue;
+                }
             }
             seq += 1;
             batch.push((seq, stream_name, line.to_string()));
@@ -473,6 +484,10 @@ async fn pump_logs(
         if stream_name == "stdout" {
             if let Some(rest) = buf.trim_start().strip_prefix(RESULT_MARKER) {
                 result = Some(rest.trim().to_string());
+                continue;
+            }
+            if let Some(rest) = buf.trim_start().strip_prefix(PROGRESS_MARKER) {
+                let _ = db.update_run_progress(run_id, rest.trim()).await;
                 continue;
             }
         }
