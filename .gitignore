@@ -1,2 +1,15 @@
 /target
 .fastembed_cache
+
+# secrets / env — repo is public, never commit credentials
+.env
+.env.*
+*.pem
+*.key
+*.p12
+secrets*
+.config/
+
+# local-only Claude config (personal hooks with machine paths)
+.claude/settings.local.json
+.claude/hooks/path-guard.sh
