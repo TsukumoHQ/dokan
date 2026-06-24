@@ -2,115 +2,62 @@
 
 # dokan (導管)
 
-> Agent-operated runtime for **deterministic scripts in Docker**, with an **MCP-first control plane**. Zero LLM inside. Apache-2.0.
+<p align="center"><b>Your AI coding agent builds and runs the workflow. You don't click.</b></p>
 
-Your coding agent uploads, runs, and reads logs over MCP. No UI clicks. The platform is the passive pipe; the agent is the orchestrator. See [PRD.md](PRD.md) for the full thesis.
+<p align="center">Agent-operated automation runtime · deterministic scripts in Docker · <b>zero LLM inside</b> · Apache-2.0</p>
 
-## Status
+---
 
-**P0–P3 shipped and tested** (8 integration tests, all green against live Postgres + Docker).
+**dokan** is an automation runtime built for the agent era. Instead of a human clicking through a UI, your coding agent stands up, runs, and schedules workflows itself by talking to dokan over MCP. The platform runs deterministic code in clean containers and **burns zero tokens**: the expensive intelligence stays in your agent, outside the runtime.
 
-```
-✅ WEDGE PROVEN: agent uploaded + ran + read logs over MCP, zero UI.
-```
+Think *Sidekiq/cron for AI agents*: the agent scripts the mechanical 80%, dokan executes it cheaply and reliably, you don't touch a dashboard.
 
-- **P0 Proof** — agent uploads + runs + reads logs over MCP, zero UI.
-- **P1 Engine** — SKIP LOCKED queue, warm pool, capability routing, cron, retries.
-- **P2 Flows** — declarative `compose_flow` DAG, step-boundary durability, dep passing.
-- **P3 Scale/ops** — semantic search (fastembed+pgvector), Prometheus metrics, thin UI + SSE tail, secrets, relay egress, bearer auth.
-
-## Architecture (this slice)
-
-- **Single Rust daemon** (`dokan`) — `axum` + `rmcp` MCP server, `stdio` (local) or Streamable HTTP (remote).
-- **State** — Postgres (`sqlx`, runtime queries, no offline cache needed). Tables: `scripts`, `runs`, `logs`.
-- **Execution** — `bollard`: one job = one clean container (`python:3.12-slim` / `node:22-slim` / `alpine`), discarded after. Per-job memory + CPU caps and a hard timeout. Code is trusted → raw containers, no micro-VM.
-- **Logs** — container stdout/stderr streamed line-by-line into Postgres, served back to the agent cursor-paginated.
-
-## MCP surface (token-frugal contract)
-
-| Tool | Returns |
-|---|---|
-| `search_script` | ranked IDs + 1-line desc, `"showing X of Y"` |
-| `get_script` | projected metadata; body only with `include_source=true` |
-| `upload_script` | `script_id` + version |
-| `run_script` | `run_id` immediately — **never blocks** |
-| `read_logs` | new lines since `after_cursor`, `next_cursor`, status; CSV-ish `seq\|stream\|text` |
-| `wait_for` | long-poll to terminal status + tail |
-| `list_runs` | server-side status counts + recent rows |
-| `cancel` | kill container + mark canceled |
-| `compose_flow` | declarative DAG spec → `flow_id` (validated acyclic) — wire-over-MCP |
-| `run_flow` / `get_flow_run` | run a DAG; poll overall + per-step status/output |
-| `schedule` / `list_schedules` | cron a script (6-field, leading seconds) |
-
-Server instructions ship in-band so the agent self-limits (paginate, project fields, don't fetch bodies). Semantic ranking via local embeddings (`--embed`), substring fallback otherwise.
-
-## Operator surface (HTTP, humans)
-
-`dokan --transport http` also serves a thin UI + API behind an optional bearer token (`DOKAN_TOKEN`):
-
-| Route | Purpose |
-|---|---|
-| `GET /` | self-refreshing run list |
-| `GET/POST /api/runs` | list / trigger a run |
-| `GET /api/runs/{id}/logs` | cursor logs |
-| `GET /api/runs/{id}/stream` | live SSE log tail |
-| `GET/POST /api/secrets` | write-only secrets (injected as job env) |
-| `GET /metrics` | Prometheus (`dokan_runs_*`) → Grafana |
-
-Job results POST to `DOKAN_RELAY_URL` on completion (mesh egress).
+## Why dokan
+- **Agent-operated.** your agent uploads, wires, triggers, reads logs over MCP. No UI.
+- **Zero LLM inside = zero token burn.** deterministic code, not LLM-in-the-loop. The platform never spends tokens to run your workflows.
+- **Deterministic + reliable.** one job = one clean Docker container, per-job CPU/mem caps, timeouts, retries, content-addressed cache (never recompute unchanged work).
+- **Real triggers.** cron + inbound webhooks (POST /hook/<token>, Stripe/Calendly/GitHub-ready).
+- **Token-frugal.** every MCP response engineered for an agent's context budget.
 
 ## Quickstart
-
+Prereqs: Docker running and a Rust toolchain. The daemon's default `DATABASE_URL` already points at the compose database, so there's nothing to configure.
 ```sh
-# 1. state store
-docker compose up -d
-
-# 2. build
-cargo build
-
-# 3. prove the wedge end-to-end (needs Docker; honors $DOCKER_HOST)
-export DOCKER_HOST=unix:///path/to/docker.sock   # Colima/Docker Desktop; omit if /var/run/docker.sock
-cargo test --test smoke -- --nocapture
+docker compose up -d            # Postgres state store (pgvector) on :5499
+cargo build --release
+./target/release/dokan          # HTTP daemon on 127.0.0.1:8088 — UI at /, MCP at /mcp
 ```
+Schema migrations apply automatically on boot.
 
-### Wire into Claude Code
-
-Local (stdio): see [.mcp.json](.mcp.json) — point `DOCKER_HOST` at your socket.
-
-Remote (HTTP):
-
-```sh
-dokan --transport http --addr 127.0.0.1:8088   # MCP at http://127.0.0.1:8088/mcp
+## Wire into your agent (MCP)
+Point your agent's MCP config at the daemon:
+```jsonc
+"dokan": { "type": "http", "url": "http://127.0.0.1:8088/mcp" }
 ```
+Your agent now has the full dokan toolset over MCP.
 
-## Config
-
-| Flag / env | Default |
+## MCP surface (token-frugal)
+| Tool | Returns |
 |---|---|
-| `--transport` / `DOKAN_TRANSPORT` | `http` (`stdio` for local agents) |
-| `--addr` / `DOKAN_ADDR` | `127.0.0.1:8088` |
-| `--database-url` / `DATABASE_URL` | `postgres://dokan:dokan@127.0.0.1:5499/dokan` |
-| `DOCKER_HOST` | local socket if unset |
+| search_script | ranked IDs + 1-line desc |
+| upload_script | script_id + version |
+| run_script | run_id immediately, never blocks |
+| read_logs / wait_for | cursor logs / long-poll to terminal + tail |
+| schedule / list_schedules | cron a script (6-field) |
+| compose_flow / run_flow | declarative DAG, wired over MCP |
+| create_webhook | inbound HTTP trigger to a script/flow |
+| set_secret / list_secrets | write-only secrets, injected as job env |
+| cancel · list_runs · get_script | … |
 
-## Worker / semantic / ops config (P1–P3)
+Server instructions ship in-band so the agent self-limits.
 
-| Flag / env | Purpose |
-|---|---|
-| `--caps` / `DOKAN_CAPS` | runtimes this worker serves (routing) |
-| `--concurrency` / `DOKAN_CONCURRENCY` | max concurrent jobs |
-| `--warm-idle` / `DOKAN_WARM_IDLE` | warm containers kept per image |
-| `--embed` / `DOKAN_EMBED` | enable semantic search |
-| `--relay-url` / `DOKAN_RELAY_URL` | mesh egress endpoint |
-| `--token` / `DOKAN_TOKEN` | bearer token for the HTTP surface |
+## How it works
+Single Rust daemon (axum + rmcp MCP server, stdio or Streamable HTTP). State in Postgres. Execution via Docker: one job, one clean container (python:3.12-slim / node:22-slim / alpine), discarded after, per-job caps + hard timeout. Logs stream into Postgres, served cursor-paginated. Thin operator cockpit at / + Prometheus at /metrics.
 
-## Roadmap (per PRD §12)
-
-- **P0 — Proof** ✅ agent-operated run+logs over MCP.
-- **P1 — Engine** ✅ `SKIP LOCKED` queue, warm pool, capability routing, cron, retries, resource caps.
-- **P2 — Flows** ✅ declarative `compose_flow`, DAG, step-boundary durability, retries.
-- **P3 — Scale/ops** ✅ semantic registry (fastembed+pgvector), Prometheus metrics, thin UI + SSE, secrets, relay egress, bearer auth. Multi-worker = run more processes vs the same Postgres.
-- **P4 — Enterprise** (next) — SSO/OAuth 2.1 (available via rmcp), audit, HA, persistent-service engine, micro-VM isolation, Loki shipping + Grafana dashboards.
+## Status
+Active development, built and run in production by the team that makes it (we run our own agent fleet's automation on dokan). **Ready for: demos, design partners, technical early adopters.** Not yet turnkey multi-tenant enterprise (no SSO/RBAC/HA), out of scope while we serve internal teams. Honest about where it is.
 
 ## License
+Apache-2.0. Use it, embed it, build on it.
 
-Apache-2.0.
+---
+*Part of the [tsukumo](https://tsukumo.ch) suite: open tools for running AI agents well at scale.*
