@@ -58,6 +58,7 @@ pub fn webhook_router(state: AppState) -> Router {
 async fn webhook_fire(
     State(s): State<AppState>,
     Path(token): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
     let Some((kind, target_id, agent_id)) =
@@ -82,14 +83,53 @@ async fn webhook_fire(
             Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "enqueue failed").into_response(),
         }
     } else {
+        // Idempotency: webhook providers (Stripe/Calendly/GitHub) deliver at-least-once and
+        // RETRY on a slow/non-2xx response — without this, each retry spawns a duplicate run.
+        // Collapse an identical redelivery to the first run: dedup on a provider delivery-id
+        // header if present, else on a hash of (token + body) so a verbatim replay matches.
+        let idem = webhook_idempotency_key(&token, &headers, &body);
+        if let Ok(Some((existing, status))) = s.db.find_run_by_idempotency(&idem).await {
+            metrics::counter!("dokan_webhook_dedup_total").increment(1);
+            return (
+                StatusCode::OK,
+                Json(json!({"run_id": existing, "status": status, "idempotent": true})),
+            )
+                .into_response();
+        }
         match s.db.insert_run(target_id, &input, agent_id.as_deref()).await {
             Ok(id) => {
+                let _ = s.db.set_run_idempotency(id, &idem).await;
                 metrics::counter!("dokan_webhook_fires_total", "target" => "script").increment(1);
                 (StatusCode::ACCEPTED, Json(json!({"run_id": id, "status": "pending"}))).into_response()
             }
             Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "enqueue failed").into_response(),
         }
     }
+}
+
+/// Idempotency key for an inbound webhook delivery. Prefers a provider delivery-id header
+/// (Stripe/GitHub/generic) so legitimate distinct events with identical bodies aren't
+/// collapsed; falls back to a hash of (token + raw body) so a verbatim retry of a provider
+/// that sends no delivery id still dedups. Namespaced by token so two webhooks never collide.
+/// Best-effort (check-then-insert, mirroring the MCP run path): near-simultaneous retries can
+/// still race to two runs, but real provider retries are seconds apart.
+fn webhook_idempotency_key(token: &str, headers: &HeaderMap, body: &[u8]) -> String {
+    const DELIVERY_HEADERS: [&str; 4] =
+        ["idempotency-key", "x-idempotency-key", "x-github-delivery", "x-request-id"];
+    for h in DELIVERY_HEADERS {
+        if let Some(v) = headers.get(h).and_then(|v| v.to_str().ok()) {
+            let v = v.trim();
+            if !v.is_empty() {
+                return format!("wh:{token}:{h}:{v}");
+            }
+        }
+    }
+    use sha2::{Digest, Sha256};
+    let mut hsh = Sha256::new();
+    hsh.update(token.as_bytes());
+    hsh.update([0x1f]);
+    hsh.update(body);
+    format!("wh:{token}:body:{:x}", hsh.finalize())
 }
 
 /// Bearer-token gate (RBAC slice). No-op when DOKAN_TOKEN is unset. Full OAuth 2.1 is

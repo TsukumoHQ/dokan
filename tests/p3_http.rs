@@ -310,6 +310,24 @@ async fn webhook_fires_without_bearer() -> anyhow::Result<()> {
     let miss = cli.post(format!("{base}/hook/nope")).json(&json!({})).send().await?;
     assert_eq!(miss.status(), 404, "unknown webhook token rejected");
 
+    // Idempotency: an at-least-once provider redelivers the SAME body — must dedup to the
+    // first run (200 + idempotent), not enqueue a second.
+    let again = cli
+        .post(format!("{base}/hook/{hook_token}"))
+        .json(&json!({"event": "ping"}))
+        .send()
+        .await?;
+    assert_eq!(again.status(), 200, "identical redelivery dedups (200, not a fresh 202)");
+    let again_body: serde_json::Value = again.json().await?;
+    assert_eq!(again_body["idempotent"], json!(true), "marked idempotent: {again_body}");
+    assert_eq!(again_body["run_id"].as_i64(), Some(run_id), "same run_id, no new run");
+    let n: i64 = sqlx::query("SELECT count(*) AS n FROM runs WHERE script_id = $1")
+        .bind(script_id)
+        .fetch_one(&pool)
+        .await?
+        .get("n");
+    assert_eq!(n, 1, "exactly one run despite two identical deliveries");
+
     // The enqueued run executes to completion (daemon is an executor).
     let mut done = false;
     for _ in 0..60 {
