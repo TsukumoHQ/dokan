@@ -59,6 +59,8 @@ pub struct Run {
     pub script_name: String,
     pub script_description: Option<String>,
     pub script_created_by: Option<String>,
+    /// Latest transient progress line (from the `::dokan:progress::` channel), if any.
+    pub progress: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -267,6 +269,29 @@ impl Db {
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
+        let out = rows
+            .into_iter()
+            .map(|r| ScriptSummary {
+                id: r.get("id"),
+                name: r.get("name"),
+                runtime: r.get("runtime"),
+                description: r.get("description"),
+            })
+            .collect();
+        Ok((out, total))
+    }
+
+    /// Catalog: every script, newest first (token-frugal — id + name + runtime + 1-line
+    /// desc, no bodies). Lets an agent enumerate input-driven scripts (search needs a query;
+    /// list_schedules is crons only), so it can spot duplicates/orphans.
+    pub async fn list_scripts(&self, limit: i64) -> Result<(Vec<ScriptSummary>, i64)> {
+        let total: i64 = sqlx::query_scalar("SELECT count(*) FROM scripts")
+            .fetch_one(&self.pool)
+            .await?;
+        let rows = sqlx::query("SELECT id, name, runtime, description FROM scripts ORDER BY id DESC LIMIT $1")
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
         let out = rows
             .into_iter()
             .map(|r| ScriptSummary {
@@ -498,6 +523,27 @@ impl Db {
         Ok(())
     }
 
+    /// Set a run's transient progress line (from the `::dokan:progress::` channel).
+    /// Latest-wins: overwritten on each emit and surfaced live on the run row, never logged.
+    pub async fn update_run_progress(&self, id: i64, msg: &str) -> Result<()> {
+        sqlx::query("UPDATE runs SET progress = $2 WHERE id = $1")
+            .bind(id)
+            .bind(msg)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// A run's latest progress line, if any.
+    pub async fn run_progress(&self, id: i64) -> Result<Option<String>> {
+        let v: Option<String> = sqlx::query_scalar("SELECT progress FROM runs WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?
+            .flatten();
+        Ok(v)
+    }
+
     /// Find a prior run by idempotency key: (run_id, status). Exactly-once intent — a
     /// repeated run_script with the same key returns this instead of a duplicate.
     pub async fn find_run_by_idempotency(&self, key: &str) -> Result<Option<(i64, String)>> {
@@ -609,7 +655,7 @@ impl Db {
     pub async fn list_runs(&self, status: Option<&str>, limit: i64) -> Result<Vec<Run>> {
         let rows = if let Some(st) = status {
             sqlx::query(
-                "SELECT r.id, r.script_id, r.status, r.exit_code, r.error, r.created_at, \
+                "SELECT r.id, r.script_id, r.status, r.exit_code, r.error, r.created_at, r.progress, \
                      s.name AS script_name, s.description AS script_description, \
                      s.created_by AS script_created_by \
                  FROM runs r JOIN scripts s ON s.id = r.script_id \
@@ -621,7 +667,7 @@ impl Db {
             .await?
         } else {
             sqlx::query(
-                "SELECT r.id, r.script_id, r.status, r.exit_code, r.error, r.created_at, \
+                "SELECT r.id, r.script_id, r.status, r.exit_code, r.error, r.created_at, r.progress, \
                      s.name AS script_name, s.description AS script_description, \
                      s.created_by AS script_created_by \
                  FROM runs r JOIN scripts s ON s.id = r.script_id \
@@ -643,6 +689,7 @@ impl Db {
                 script_name: r.get("script_name"),
                 script_description: r.get("script_description"),
                 script_created_by: r.get("script_created_by"),
+                progress: r.get("progress"),
             })
             .collect())
     }
@@ -708,6 +755,23 @@ impl Db {
              WHERE status = 'running' AND started_at < now() - make_interval(secs => $1)",
         )
         .bind(lease_secs)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected())
+    }
+
+    /// Fail runs stuck `pending` past `max_age_secs` — never claimed (no live worker serves
+    /// the runtime, or they were enqueued by a since-dead control-plane). Bounds zombie
+    /// accumulation. Distinct from the orphan reaper, which reclaims *running* rows; this
+    /// retires never-started ones. Threshold is generous, so a healthy backlog (which drains
+    /// in seconds) is never touched. Returns the number failed.
+    pub async fn fail_stale_pending(&self, max_age_secs: f64) -> Result<u64> {
+        let r = sqlx::query(
+            "UPDATE runs SET status = 'failed', error = 'unclaimed: pending past timeout', \
+                finished_at = now() \
+             WHERE status = 'pending' AND created_at < now() - make_interval(secs => $1)",
+        )
+        .bind(max_age_secs)
         .execute(&self.pool)
         .await?;
         Ok(r.rows_affected())
@@ -1308,6 +1372,77 @@ impl Db {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    // ---- webhooks (inbound HTTP triggers) ----
+
+    /// Register an inbound webhook. `kind` is "script" | "flow", `target_id` the script/flow.
+    pub async fn insert_webhook(
+        &self,
+        token: &str,
+        kind: &str,
+        target_id: i64,
+        agent_id: Option<&str>,
+    ) -> Result<i64> {
+        let id = sqlx::query_scalar(
+            "INSERT INTO webhooks (token, target_kind, target_id, agent_id) \
+             VALUES ($1, $2, $3, $4) RETURNING id",
+        )
+        .bind(token)
+        .bind(kind)
+        .bind(target_id)
+        .bind(agent_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    /// Resolve a webhook token to its target: (kind, target_id, agent_id). The token is the
+    /// capability — this is the only auth the /hook endpoint applies.
+    pub async fn find_webhook_by_token(
+        &self,
+        token: &str,
+    ) -> Result<Option<(String, i64, Option<String>)>> {
+        let row = sqlx::query(
+            "SELECT target_kind, target_id, agent_id FROM webhooks WHERE token = $1",
+        )
+        .bind(token)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| (r.get("target_kind"), r.get("target_id"), r.get("agent_id"))))
+    }
+
+    pub async fn list_webhooks(&self) -> Result<Vec<serde_json::Value>> {
+        let rows = sqlx::query(
+            "SELECT id, token, target_kind, target_id, agent_id, created_at \
+             FROM webhooks ORDER BY id DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let created: chrono::DateTime<chrono::Utc> = r.get("created_at");
+                serde_json::json!({
+                    "webhook_id": r.get::<i64, _>("id"),
+                    "token": r.get::<String, _>("token"),
+                    "kind": r.get::<String, _>("target_kind"),
+                    "target_id": r.get::<i64, _>("target_id"),
+                    "agent_id": r.get::<Option<String>, _>("agent_id"),
+                    "created_at": created.to_rfc3339(),
+                })
+            })
+            .collect())
+    }
+
+    /// Delete a webhook by id. Returns true if a row was removed.
+    pub async fn delete_webhook(&self, id: i64) -> Result<bool> {
+        let n = sqlx::query("DELETE FROM webhooks WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        Ok(n > 0)
     }
 
     /// Batch-insert log lines in ONE round-trip via UNNEST — a chatty job no longer pays a

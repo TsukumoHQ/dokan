@@ -6,6 +6,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, Sse};
@@ -38,6 +39,54 @@ pub fn operator_router(state: AppState) -> Router {
         .route("/api/schedules", get(list_schedules))
         .route("/api/secrets", get(list_secrets).post(set_secret))
         .with_state(state)
+}
+
+/// Inbound webhook router. Mounted OUTSIDE the bearer gate — an external service (Stripe,
+/// GitHub…) can't send DOKAN_TOKEN, so the unguessable token in the URL is the auth. The
+/// request body becomes the run's input. Keep this separate so the auth layer never wraps it.
+pub fn webhook_router(state: AppState) -> Router {
+    Router::new()
+        .route("/hook/{token}", post(webhook_fire))
+        .with_state(state)
+}
+
+/// Fire an inbound webhook: resolve the token → enqueue the target script/flow with the
+/// POST body as input. Non-blocking (202 + id); the worker/flow engine runs it.
+async fn webhook_fire(
+    State(s): State<AppState>,
+    Path(token): Path<String>,
+    body: Bytes,
+) -> impl IntoResponse {
+    let Some((kind, target_id, agent_id)) =
+        s.db.find_webhook_by_token(&token).await.ok().flatten()
+    else {
+        // Same response for unknown vs malformed: don't leak which tokens exist.
+        return (StatusCode::NOT_FOUND, "no such webhook").into_response();
+    };
+    // Body → input: parse JSON if we can, else wrap the raw text so the script still sees it.
+    let input = serde_json::from_slice::<serde_json::Value>(&body)
+        .unwrap_or_else(|_| json!({ "raw": String::from_utf8_lossy(&body) }));
+
+    if kind == "flow" {
+        let Some(spec) = s.db.get_flow_spec(target_id).await.ok().flatten() else {
+            return (StatusCode::NOT_FOUND, "flow gone").into_response();
+        };
+        match s.db.insert_flow_run(target_id, &spec, &input).await {
+            Ok(id) => {
+                metrics::counter!("dokan_webhook_fires_total", "target" => "flow").increment(1);
+                (StatusCode::ACCEPTED, Json(json!({"flow_run_id": id, "status": "pending"}))).into_response()
+            }
+            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "enqueue failed").into_response(),
+        }
+    } else {
+        match s.db.insert_run(target_id, &input, agent_id.as_deref()).await {
+            Ok(id) => {
+                metrics::counter!("dokan_webhook_fires_total", "target" => "script").increment(1);
+                (StatusCode::ACCEPTED, Json(json!({"run_id": id, "status": "pending"}))).into_response()
+            }
+            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "enqueue failed").into_response(),
+        }
+    }
 }
 
 /// Bearer-token gate (RBAC slice). No-op when DOKAN_TOKEN is unset. Full OAuth 2.1 is
@@ -162,6 +211,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
   td.script .sdesc{margin-top:.2rem; font-size:.78rem; color:var(--fg-dim); line-height:1.4;
     overflow:hidden; text-overflow:ellipsis; display:-webkit-box; -webkit-line-clamp:2;
     -webkit-box-orient:vertical}
+  td.script .sprog{margin-top:.2rem; font-size:.78rem; color:var(--accent); font-family:var(--mono);
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:36ch}
   td.exit{font-family:var(--mono); color:var(--fg-faint); text-align:right}
   .badge{display:inline-flex; align-items:center; gap:.45rem; font-size:.8rem}
   .badge .sdot{box-shadow:0 0 0 3px color-mix(in srgb,currentColor 14%,transparent)}
@@ -451,6 +502,7 @@ function renderRows(recent){
     +`<span class=sid>#${r.script_id}</span>`
     +(r.created_by?`<span class=sby>${esc(r.created_by)}</span>`:'')
     +(r.script_desc?`<div class=sdesc>${esc(r.script_desc)}</div>`:'')
+    +(r.progress&&live?`<div class=sprog title="live progress">▸ ${esc(r.progress)}</div>`:'')
     +`</td>`
     +`<td><span class=badge><span class=sdot></span>${esc(r.status)}</span></td>`
     +`<td class=when title="${esc(r.created_at||'')}">${esc(ago(r.created_at))}</td>`
@@ -621,7 +673,7 @@ async fn list_runs(State(s): State<AppState>, Query(q): Query<ListQ>) -> impl In
             "run_id": r.id, "script_id": r.script_id, "status": r.status,
             "exit": r.exit_code, "error": r.error, "created_at": r.created_at.to_rfc3339(),
             "script_name": r.script_name, "script_desc": r.script_description,
-            "created_by": r.script_created_by,
+            "created_by": r.script_created_by, "progress": r.progress,
         }))
         .collect();
     Json(json!({"counts": counts_obj, "recent": recent}))

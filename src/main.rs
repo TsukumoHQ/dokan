@@ -81,6 +81,11 @@ struct Cli {
     /// Bearer token required on the HTTP surface (MCP + UI). Unset = open.
     #[arg(long, env = "DOKAN_TOKEN")]
     token: Option<String>,
+
+    /// Fail runs stuck `pending` longer than this (never claimed — no capable worker, or a
+    /// dead enqueuer). 0 = keep forever. Generous so a healthy backlog is never touched.
+    #[arg(long, default_value_t = 1800.0, env = "DOKAN_PENDING_TIMEOUT_SECS")]
+    pending_timeout_secs: f64,
 }
 
 #[tokio::main]
@@ -249,10 +254,23 @@ async fn main() -> Result<()> {
         {
             let db = db.clone();
             let lease = (exec::DEFAULT_TIMEOUT_SECS * 2) as f64; // 2× the hard job timeout
+            let pending_to = cli.pending_timeout_secs;
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
                 loop {
                     tick.tick().await;
+                    // Retire pending runs that were never claimed (zombies), bounding the
+                    // queue. Opt-out with 0.
+                    if pending_to > 0.0 {
+                        match db.fail_stale_pending(pending_to).await {
+                            Ok(n) if n > 0 => {
+                                tracing::warn!(runs = n, "failed stale pending runs (unclaimed)");
+                                metrics::counter!("dokan_runs_unclaimed_total").increment(n);
+                            }
+                            Err(e) => tracing::error!("fail_stale_pending: {e}"),
+                            _ => {}
+                        }
+                    }
                     match db.reap_orphan_runs(lease).await {
                         Ok(n) if n > 0 => {
                             tracing::warn!(runs = n, "reaped orphaned runs (dead worker)");
@@ -329,10 +347,15 @@ async fn serve_http(
         metrics: metrics_handle,
     };
     // MCP control plane + thin operator UI, behind one bearer-token gate.
-    let app = axum::Router::new()
+    let protected = axum::Router::new()
         .nest_service("/mcp", service)
-        .merge(http::operator_router(state))
+        .merge(http::operator_router(state.clone()))
         .layer(axum::middleware::from_fn_with_state(token, http::auth));
+    // Inbound webhooks sit OUTSIDE the bearer gate (the URL token is their auth), so an
+    // external service can reach /hook/<token> without DOKAN_TOKEN.
+    let app = axum::Router::new()
+        .merge(http::webhook_router(state))
+        .merge(protected);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("dokan listening: MCP http://{addr}/mcp · UI http://{addr}/");
@@ -350,6 +373,7 @@ fn describe_metrics() {
     metrics::describe_counter!("dokan_run_attempts_total", Unit::Count, "Execution attempts (includes retries) labeled by attempt number");
     metrics::describe_counter!("dokan_runs_retried_total", Unit::Count, "Runs requeued for a transient-failure retry");
     metrics::describe_counter!("dokan_runs_reaped_total", Unit::Count, "Runs reclaimed from a dead worker (stuck running past the lease)");
+    metrics::describe_counter!("dokan_runs_unclaimed_total", Unit::Count, "Runs failed for sitting pending past the timeout (never claimed)");
     metrics::describe_counter!("dokan_flow_runs_reaped_total", Unit::Count, "Flow runs reclaimed from a dead engine (stale heartbeat past the lease)");
     metrics::describe_counter!("dokan_runs_finished_total", Unit::Count, "Runs reaching a terminal status, by status");
     metrics::describe_counter!("dokan_run_internal_errors_total", Unit::Count, "Runs that failed inside dokan (could not execute) rather than the script exiting nonzero");

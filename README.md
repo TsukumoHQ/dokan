@@ -1,4 +1,6 @@
-<p align="center"><img src="assets/wordmark.png" alt="dokan" width="280"></p>
+<p align="center"><img src="assets/dokan-wordmark.png" alt="dokan" width="680"></p>
+
+# dokan (導管)
 
 <p align="center"><b>Your AI coding agent builds and runs the workflow. You don't click.</b></p>
 

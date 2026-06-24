@@ -32,6 +32,63 @@ async fn gc_old_deletes_terminal_runs_and_logs() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn webhook_insert_find_delete_roundtrip() -> anyhow::Result<()> {
+    let db = Db::connect(&db_url()).await?;
+    db.migrate().await?;
+
+    let (sid, _v) = db
+        .insert_script("wh-db", "bash", "echo hi", None, None, true, None)
+        .await?;
+    let token = dokan::crypto::random_token();
+    let id = db.insert_webhook(&token, "script", sid, Some("agent-x")).await?;
+
+    let found = db.find_webhook_by_token(&token).await?;
+    assert_eq!(
+        found,
+        Some(("script".to_string(), sid, Some("agent-x".to_string()))),
+        "token resolves to its target"
+    );
+    assert!(db.list_webhooks().await?.iter().any(|w| w["webhook_id"] == id));
+
+    assert!(db.delete_webhook(id).await?, "delete reports removal");
+    assert_eq!(db.find_webhook_by_token(&token).await?, None, "gone after delete");
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_scripts_enumerates_catalog() -> anyhow::Result<()> {
+    let db = Db::connect(&db_url()).await?;
+    db.migrate().await?;
+    let (a, _) = db.insert_script("cat-a", "bash", "echo a", None, None, true, None).await?;
+    let (b, _) = db.insert_script("cat-b", "python", "print(1)", None, None, true, None).await?;
+
+    let (rows, total) = db.list_scripts(500).await?;
+    assert!(total >= 2, "catalog counts all scripts");
+    let ids: Vec<i64> = rows.iter().map(|s| s.id).collect();
+    assert!(ids.contains(&a) && ids.contains(&b), "both scripts listed");
+    Ok(())
+}
+
+#[tokio::test]
+async fn fail_stale_pending_retires_zombies_but_spares_fresh() -> anyhow::Result<()> {
+    let db = Db::connect(&db_url()).await?;
+    db.migrate().await?;
+    let (sid, _) = db.insert_script("zombie", "bash", "echo z", None, None, true, None).await?;
+
+    // A fresh pending run is NOT retired by a generous timeout.
+    let keep = db.insert_run(sid, &serde_json::json!({}), None).await?;
+    db.fail_stale_pending(3600.0).await?;
+    assert_eq!(db.run_status(keep).await?.as_deref(), Some("pending"), "fresh pending survives");
+
+    // With a 0s timeout, an already-pending run is retired as unclaimed.
+    let zombie = db.insert_run(sid, &serde_json::json!({}), None).await?;
+    let n = db.fail_stale_pending(0.0).await?;
+    assert!(n >= 1, "retired at least the zombie");
+    assert_eq!(db.run_status(zombie).await?.as_deref(), Some("failed"), "zombie failed");
+    Ok(())
+}
+
+#[tokio::test]
 async fn gc_old_keeps_fresh_terminal_runs() -> anyhow::Result<()> {
     let db = Db::connect(&db_url()).await?;
     db.migrate().await?;

@@ -58,6 +58,24 @@ fn canonical_json(v: &serde_json::Value) -> String {
     }
 }
 
+/// Some MCP clients stringify object/array params instead of sending them inline.
+/// If a JSON value arrives as a string that itself parses to an object or array,
+/// decode it once — otherwise a `{...}` input reaches the job double-encoded
+/// (DOKAN_INPUT = a quoted JSON string, so one JSON.parse yields a string, not the
+/// object, and the job silently reads its fields as undefined). A scalar string
+/// (or anything that doesn't parse to a container) passes through untouched, so a
+/// legitimately-stringy input is never mangled.
+fn destringify(v: serde_json::Value) -> serde_json::Value {
+    if let serde_json::Value::String(s) = &v {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
+            if parsed.is_object() || parsed.is_array() {
+                return parsed;
+            }
+        }
+    }
+    v
+}
+
 /// Content-address a run: hash(runtime + source + canonical(input) + secrets generation).
 /// Same inputs ⇒ same key ⇒ recallable (dokan jobs are deterministic).
 pub(crate) fn run_cache_key(
@@ -94,6 +112,12 @@ pub struct SearchArgs {
     /// Search query, matched against script name + description.
     pub query: String,
     /// Max results (default 10).
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListScriptsArgs {
+    /// Max rows (default 50, max 500).
     pub limit: Option<i64>,
 }
 
@@ -195,6 +219,21 @@ pub struct RunFlowArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct FlowRunArgs {
     pub flow_run_id: i64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CreateWebhookArgs {
+    /// What to trigger: "script" or "flow".
+    pub target: String,
+    /// The script_id or flow_id to run when the webhook fires.
+    pub target_id: i64,
+    /// Optional agent tag — provenance + scoped secrets for the triggered run.
+    pub agent_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DeleteWebhookArgs {
+    pub webhook_id: i64,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -322,6 +361,20 @@ impl Dokan {
         }))
     }
 
+    #[tool(description = "List all scripts (newest first): id + name + runtime + 1-line desc, no bodies. The catalog of input-driven scripts — search needs a query, list_schedules is crons only. Use to spot duplicates/orphans. Cursor-light: returns up to limit with a \"showing X of Y\" note.")]
+    async fn list_scripts(
+        &self,
+        Parameters(a): Parameters<ListScriptsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let limit = a.limit.unwrap_or(50).clamp(1, 500);
+        let (rows, total) = self.db.list_scripts(limit).await.map_err(internal)?;
+        let items: Vec<_> = rows
+            .iter()
+            .map(|s| json!({"id": s.id, "name": s.name, "runtime": s.runtime, "desc": s.description}))
+            .collect();
+        ok(json!({"scripts": items, "note": format!("showing {} of {}", rows.len(), total)}))
+    }
+
     #[tool(description = "Fetch a script's metadata. Source body included only when include_source=true.")]
     async fn get_script(
         &self,
@@ -344,7 +397,7 @@ impl Dokan {
         ok(v)
     }
 
-    #[tool(description = "Upload a script. Returns script_id + version. Runtime: python|node|bash. INPUT CONTRACT: the script reads its input from the DOKAN_INPUT env var (a JSON string) — NOT stdin or argv. Secrets set via set_secret arrive as their own env vars (e.g. $OPENAI_API_KEY). A nonzero exit is treated as the script's own deterministic verdict (e.g. a monitor finding) and is NOT retried; only a container/infra failure retries. Pass upsert=true to re-provision by name idempotently (no duplicate rows on respawn). STRUCTURED RESULT: print a line `::dokan:result:: {json}` on stdout to attach a structured result to the run — it is captured (not logged), returned by wait_for/read_logs, and POSTed to the relay, so a monitor's finding reaches the agent event-driven.")]
+    #[tool(description = "Upload a script. Returns script_id + version. Runtime: python|node|bash. INPUT CONTRACT: the script reads its input from the DOKAN_INPUT env var (a JSON string) — NOT stdin or argv. Secrets set via set_secret arrive as their own env vars (e.g. $OPENAI_API_KEY). A nonzero exit is treated as the script's own deterministic verdict (e.g. a monitor finding) and is NOT retried; only a container/infra failure retries. Pass upsert=true to re-provision by name idempotently (no duplicate rows on respawn). STRUCTURED RESULT: print a line `::dokan:result:: {json}` on stdout to attach a structured result to the run — it is captured (not logged), returned by wait_for/read_logs, and POSTed to the relay, so a monitor's finding reaches the agent event-driven. PROGRESS: print `::dokan:progress:: <text>` to set the run's live status line (latest wins, overwritten each emit) — surfaced by list_runs/read_logs/wait_for and the UI, NOT logged. Use it in a long loop (e.g. `meeting 3/6`) so the operator sees current state without paging logs; flush stdout (Python: print(..., flush=True)) so it lands live.")]
     async fn upload_script(
         &self,
         Parameters(a): Parameters<UploadArgs>,
@@ -509,7 +562,7 @@ impl Dokan {
                 return ok(json!({"run_id": run_id, "status": status, "idempotent": true}));
             }
         }
-        let input = a.input.unwrap_or(json!({}));
+        let input = destringify(a.input.unwrap_or(json!({})));
         // Run-or-recall: if opted in and an identical run already succeeded, return its
         // result instead of spawning a container. The key folds in the secrets generation,
         // so a secret change invalidates env-dependent recalls.
@@ -608,6 +661,10 @@ impl Dokan {
         if let Some(r) = self.db.run_result(a.run_id).await.ok().flatten() {
             out["result"] = r;
         }
+        // Latest progress line (live status of a long run), if the job emitted one.
+        if let Some(p) = self.db.run_progress(a.run_id).await.ok().flatten() {
+            out["progress"] = json!(p);
+        }
         ok(out)
     }
 
@@ -651,6 +708,9 @@ impl Dokan {
         if let Some(r) = self.db.run_result(a.run_id).await.ok().flatten() {
             out["result"] = r;
         }
+        if let Some(p) = self.db.run_progress(a.run_id).await.ok().flatten() {
+            out["progress"] = json!(p);
+        }
         ok(out)
     }
 
@@ -678,6 +738,10 @@ impl Dokan {
                 if let Some(e) = &r.error {
                     o["error"] = json!(e);
                 }
+                // Latest progress line — the cheap "what is this long run doing now" signal.
+                if let Some(p) = &r.progress {
+                    o["progress"] = json!(p);
+                }
                 o
             })
             .collect();
@@ -696,12 +760,13 @@ impl Dokan {
         &self,
         Parameters(a): Parameters<ComposeFlowArgs>,
     ) -> Result<CallToolResult, McpError> {
-        if let Err(e) = crate::flow::validate_spec(&a.spec) {
+        let spec = destringify(a.spec);
+        if let Err(e) = crate::flow::validate_spec(&spec) {
             return ok(json!({"error": "invalid_spec", "detail": e}));
         }
         let id = self
             .db
-            .insert_flow(&a.name, &a.spec)
+            .insert_flow(&a.name, &spec)
             .await
             .map_err(internal)?;
         ok(json!({"flow_id": id, "status": "composed"}))
@@ -715,7 +780,7 @@ impl Dokan {
         let Some(spec) = self.db.get_flow_spec(a.flow_id).await.map_err(internal)? else {
             return ok(json!({"error": "flow_not_found", "id": a.flow_id}));
         };
-        let input = a.input.unwrap_or(json!({}));
+        let input = destringify(a.input.unwrap_or(json!({})));
         let id = self
             .db
             .insert_flow_run(a.flow_id, &spec, &input)
@@ -784,7 +849,7 @@ impl Dokan {
         if self.db.get_script(a.script_id).await.map_err(internal)?.is_none() {
             return ok(json!({"error": "script_not_found", "id": a.script_id}));
         }
-        let input = a.input.unwrap_or(json!({}));
+        let input = destringify(a.input.unwrap_or(json!({})));
         let id = self
             .db
             .insert_schedule(a.script_id, &a.cron, &input)
@@ -804,6 +869,46 @@ impl Dokan {
             .map(|s| json!({"schedule_id": s.id, "script_id": s.script_id, "script": s.script_name, "cron": s.cron}))
             .collect();
         ok(json!({"schedules": items}))
+    }
+
+    #[tool(description = "Register an inbound webhook so an external service can trigger a script/flow over HTTP. An external POST to /hook/<token> enqueues the target with the request body as input (non-blocking). target is \"script\" or \"flow\". Returns the token + path. The unguessable URL token is the auth (the endpoint is outside the bearer gate). dokan owns only the endpoint — making a local daemon publicly reachable (tunnel/relay) is the operator's concern.")]
+    async fn create_webhook(
+        &self,
+        Parameters(a): Parameters<CreateWebhookArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        if a.target != "script" && a.target != "flow" {
+            return ok(json!({"error": "bad_target", "detail": "target must be \"script\" or \"flow\""}));
+        }
+        let exists = if a.target == "flow" {
+            self.db.get_flow_spec(a.target_id).await.map_err(internal)?.is_some()
+        } else {
+            self.db.get_script(a.target_id).await.map_err(internal)?.is_some()
+        };
+        if !exists {
+            return ok(json!({"error": format!("{}_not_found", a.target), "id": a.target_id}));
+        }
+        let token = crate::crypto::random_token();
+        let id = self
+            .db
+            .insert_webhook(&token, &a.target, a.target_id, a.agent_id.as_deref())
+            .await
+            .map_err(internal)?;
+        ok(json!({"webhook_id": id, "token": token, "path": format!("/hook/{token}"), "status": "created"}))
+    }
+
+    #[tool(description = "List inbound webhooks: id, token (the URL secret), target kind + id, agent. Operator-only surface.")]
+    async fn list_webhooks(&self) -> Result<CallToolResult, McpError> {
+        let rows = self.db.list_webhooks().await.map_err(internal)?;
+        ok(json!({"webhooks": rows}))
+    }
+
+    #[tool(description = "Revoke an inbound webhook by id (its /hook/<token> URL stops working).")]
+    async fn delete_webhook(
+        &self,
+        Parameters(a): Parameters<DeleteWebhookArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let deleted = self.db.delete_webhook(a.webhook_id).await.map_err(internal)?;
+        ok(json!({"webhook_id": a.webhook_id, "deleted": deleted}))
     }
 
     #[tool(description = "Set a secret, injected as an env var into every job container (e.g. OPENAI_API_KEY). Write-only: values are never returned or logged. Upsert by name.")]
@@ -941,7 +1046,7 @@ impl ServerHandler for Dokan {
 
 #[cfg(test)]
 mod tests {
-    use super::{canonical_json, run_cache_key, validate_cron};
+    use super::{canonical_json, destringify, run_cache_key, validate_cron};
     use serde_json::json;
 
     #[test]
@@ -966,6 +1071,24 @@ mod tests {
             run_cache_key("bash", "digestB", "s", &i1, 0),
             "image digest invalidates"
         );
+    }
+
+    #[test]
+    fn destringify_decodes_client_stringified_objects() {
+        // The bug: an MCP client sends the input object as a JSON *string*. Left as-is it
+        // reaches the job double-encoded (DOKAN_INPUT = a quoted JSON string).
+        assert_eq!(destringify(json!(r#"{"write":true}"#)), json!({"write": true}));
+        assert_eq!(destringify(json!("[1,2,3]")), json!([1, 2, 3]));
+        // A real object passes through unchanged (idempotent — applying it twice is safe).
+        let obj = json!({"write": true});
+        assert_eq!(destringify(obj.clone()), obj);
+        assert_eq!(destringify(destringify(json!(r#"{"write":true}"#))), obj);
+        // A scalar string is NOT mangled, even when it happens to parse as a JSON scalar.
+        assert_eq!(destringify(json!("hello")), json!("hello"));
+        assert_eq!(destringify(json!("123")), json!("123"));
+        assert_eq!(destringify(json!("true")), json!("true"));
+        // Non-string values are untouched.
+        assert_eq!(destringify(json!(42)), json!(42));
     }
 
     #[test]
