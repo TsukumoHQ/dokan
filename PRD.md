@@ -132,6 +132,8 @@ The control plane's MCP server **is the product API.** It must obey a strict tok
 
 **Transport:** MCP **Streamable HTTP** for remote agents (single endpoint; SSE used *internally* for server→client streaming), **stdio** for local. HTTP+SSE transport is deprecated — do not build on it. Claude Code: `stdio` local, `http` remote.
 
+**Tool-set is static per binary — reconnect on ship.** dokan's tools are compiled into the daemon (`#[tool]` methods on `Dokan`), so adding a tool means a **new binary → daemon restart**, which tears down every Streamable-HTTP MCP session. A dead session can't be pushed to, and `notifications/tools/list_changed` only helps a *live* server whose tool set mutates in-process — ours doesn't — so dokan deliberately does **not** advertise `tools.listChanged` (advertising a capability it never exercises would mislead clients). The contract is therefore operational: after a tool ship + restart, connected agents must **reconnect** their dokan MCP (Claude Code: `/mcp`; a relay/gateway proxy: refresh its upstream connection) to re-`initialize` and pick up the new `tools/list`. **Announce the restart on the fleet channel** so agents reconnect instead of running against a stale tool list. A true zero-reconnect story would need a stable MCP gateway in front of the daemon that survives restarts and re-exposes tools — an edge/relay concern, out of the single-binary scope.
+
 ---
 
 ## 8. Observability & UI
