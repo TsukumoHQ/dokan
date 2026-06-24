@@ -20,13 +20,13 @@ Think *Sidekiq/cron for AI agents*: the agent scripts the mechanical 80%, dokan 
 - **Token-frugal.** every MCP response engineered for an agent's context budget.
 
 ## Quickstart
-Prereqs: Docker running and a Rust toolchain. The daemon's default `DATABASE_URL` already points at the compose database, so there's nothing to configure.
+Prereqs: a Rust toolchain and Docker running. The daemon talks to the default Docker socket — set `DOCKER_HOST` if you run colima / podman / a remote engine. Its default `DATABASE_URL` already points at the compose database, so there's nothing to configure.
 ```sh
 docker compose up -d            # Postgres state store (pgvector) on :5499
 cargo build --release
 ./target/release/dokan          # HTTP daemon on 127.0.0.1:8088 — UI at /, MCP at /mcp
 ```
-Schema migrations apply automatically on boot.
+Schema migrations apply automatically on boot. Verify it's up: open <http://127.0.0.1:8088/> (the operator cockpit) — once it loads, an agent can wire MCP and run scripts.
 
 ## Wire into your agent (MCP)
 Point your agent's MCP config at the daemon:
