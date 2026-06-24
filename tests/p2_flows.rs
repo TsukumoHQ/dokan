@@ -330,3 +330,53 @@ async fn cyclic_flow_rejected() -> anyhow::Result<()> {
     c.cancel().await?;
     Ok(())
 }
+
+/// Flagship demo (examples/flagship) as a CI contract: intake → score(map) → summarize →
+/// alert(when). Proves the headline shape end-to-end — map fan-out over a batch, a structured
+/// `::dokan:result::`, and a `when` branch TAKEN on a flagged batch. Deterministic
+/// (network:false) so the numbers are exact: 5 orders, the NG high-value one scores 81 ≥ 70.
+#[tokio::test]
+async fn flagship_demo_flow() -> anyhow::Result<()> {
+    let c = spawn().await?;
+    let up = |name: &str, src: &str| {
+        json!({"name": name, "runtime": "node", "source": src, "network": false, "upsert": true})
+    };
+    let intake = call(&c, "upload_script", up("fl-intake",
+        "function input(){try{let v=JSON.parse(process.env.DOKAN_INPUT||'{}');return typeof v==='string'?JSON.parse(v):v;}catch{return{};}}\n\
+         const inp=input();const n=Number(inp.flow_input?.count??inp.count??5)||5;const GEO=['CH','FR','US','NG','DE'];\n\
+         console.log(JSON.stringify(Array.from({length:n},(_,i)=>({id:1000+i,amount:50+i*120,country:GEO[i%GEO.length]}))));\n")).await["script_id"].as_i64().unwrap();
+    let score = call(&c, "upload_script", up("fl-score",
+        "function input(){try{let v=JSON.parse(process.env.DOKAN_INPUT||'{}');return typeof v==='string'?JSON.parse(v):v;}catch{return{};}}\n\
+         const o=input().step||{};const g={NG:40,US:10}[o.country]??5;console.log(String(Math.min(100,Math.round((o.amount||0)/10)+g)));\n")).await["script_id"].as_i64().unwrap();
+    let summarize = call(&c, "upload_script", up("fl-summarize",
+        "function input(){try{let v=JSON.parse(process.env.DOKAN_INPUT||'{}');return typeof v==='string'?JSON.parse(v):v;}catch{return{};}}\n\
+         const inp=input();const orders=JSON.parse(inp.deps?.intake||'[]');const scores=JSON.parse(inp.deps?.score||'[]').map(Number);\n\
+         const T=70;const flagged=scores.filter(s=>s>=T).length;const m=scores.length?Math.max(...scores):0;\n\
+         console.log(`::dokan:result:: ${JSON.stringify({orders:orders.length,flagged,max_score:m,threshold:T})}`);\n\
+         console.log(flagged>0?'FLAGGED':'CLEAN');\n")).await["script_id"].as_i64().unwrap();
+    let alert = call(&c, "upload_script", up("fl-alert",
+        "console.log('::dokan:result:: '+JSON.stringify({alerted:true,action:'routed high-risk orders to manual review'}));\n")).await["script_id"].as_i64().unwrap();
+
+    let flow = call(&c, "compose_flow", json!({
+        "name": "fraud-triage",
+        "spec": { "steps": [
+            {"id":"intake","script_id": intake},
+            {"id":"score","script_id": score, "depends_on":["intake"], "map":"deps.intake"},
+            {"id":"summarize","script_id": summarize, "depends_on":["intake","score"]},
+            {"id":"alert","script_id": alert, "depends_on":["summarize"], "when":{"ref":"deps.summarize","op":"eq","value":"FLAGGED"}}
+        ]}
+    })).await;
+    let flow_id = flow["flow_id"].as_i64().expect(&flow.to_string());
+
+    let fr = call(&c, "run_flow", json!({"flow_id": flow_id, "input": {"count": 5}})).await;
+    let last = poll_flow(&c, fr["flow_run_id"].as_i64().unwrap()).await;
+    assert_eq!(last["status"], "succeeded", "flagship flow succeeds: {last}");
+
+    let steps = last["steps"].as_array().unwrap();
+    assert_eq!(step(steps, "score")["map"], json!({"n": 5, "ok": 5, "failed": 0}), "map fans out 5: {last}");
+    assert_eq!(step(steps, "summarize")["out"], "FLAGGED", "batch flags (NG order scores 81): {last}");
+    assert_eq!(step(steps, "alert")["status"], "succeeded", "when-branch alert runs on FLAGGED: {last}");
+
+    c.cancel().await?;
+    Ok(())
+}
