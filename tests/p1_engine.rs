@@ -187,6 +187,39 @@ async fn stringified_object_input_is_not_double_encoded() -> anyhow::Result<()> 
     Ok(())
 }
 
+/// The `::dokan:progress::` channel sets a live, latest-wins status line on the run —
+/// surfaced by read_logs/list_runs but NOT written to the log stream (so an operator sees
+/// "step 3/3" without paging the whole log). Regular stdout still logs normally.
+#[tokio::test]
+async fn progress_channel_sets_latest_and_is_not_logged() -> anyhow::Result<()> {
+    let c = spawn().await?;
+    let sid = upload(
+        &c,
+        "bash",
+        "echo '::dokan:progress:: step 1/3'\n\
+         echo regular-log-line\n\
+         echo '::dokan:progress:: step 3/3'\n\
+         echo '::dokan:result:: {\"done\":true}'\n",
+    )
+    .await;
+    let run = call(&c, "run_script", json!({"script_id": sid})).await?;
+    let run_id = run["run_id"].as_i64().unwrap();
+    assert_eq!(wait_status(&c, run_id, 60).await, "succeeded", "ran");
+    let r = call(&c, "read_logs", json!({"run_id": run_id, "after_cursor": 0, "limit": 500})).await?;
+    assert_eq!(r["progress"], json!("step 3/3"), "latest progress wins: {r}");
+    assert_eq!(r["result"], json!({"done": true}), "result still captured: {r}");
+    let text = r["lines"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|l| l.as_str()).collect::<Vec<_>>().join("\n"))
+        .unwrap_or_default();
+    assert!(text.contains("regular-log-line"), "normal stdout is logged: {text}");
+    assert!(!text.contains("step 1/3"), "progress not in logs: {text}");
+    assert!(!text.contains("step 3/3"), "progress not in logs: {text}");
+    assert!(!text.contains("::dokan:progress::"), "progress sentinel not logged: {text}");
+    c.cancel().await?;
+    Ok(())
+}
+
 /// upsert=true re-provisions a script by name: same id back, no duplicate rows, no-op
 /// when the source is unchanged, version bump when it changes. (Terrain P2.)
 #[tokio::test]

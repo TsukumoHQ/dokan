@@ -211,6 +211,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
   td.script .sdesc{margin-top:.2rem; font-size:.78rem; color:var(--fg-dim); line-height:1.4;
     overflow:hidden; text-overflow:ellipsis; display:-webkit-box; -webkit-line-clamp:2;
     -webkit-box-orient:vertical}
+  td.script .sprog{margin-top:.2rem; font-size:.78rem; color:var(--accent); font-family:var(--mono);
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:36ch}
   td.exit{font-family:var(--mono); color:var(--fg-faint); text-align:right}
   .badge{display:inline-flex; align-items:center; gap:.45rem; font-size:.8rem}
   .badge .sdot{box-shadow:0 0 0 3px color-mix(in srgb,currentColor 14%,transparent)}
@@ -500,6 +502,7 @@ function renderRows(recent){
     +`<span class=sid>#${r.script_id}</span>`
     +(r.created_by?`<span class=sby>${esc(r.created_by)}</span>`:'')
     +(r.script_desc?`<div class=sdesc>${esc(r.script_desc)}</div>`:'')
+    +(r.progress&&live?`<div class=sprog title="live progress">▸ ${esc(r.progress)}</div>`:'')
     +`</td>`
     +`<td><span class=badge><span class=sdot></span>${esc(r.status)}</span></td>`
     +`<td class=when title="${esc(r.created_at||'')}">${esc(ago(r.created_at))}</td>`
@@ -670,7 +673,7 @@ async fn list_runs(State(s): State<AppState>, Query(q): Query<ListQ>) -> impl In
             "run_id": r.id, "script_id": r.script_id, "status": r.status,
             "exit": r.exit_code, "error": r.error, "created_at": r.created_at.to_rfc3339(),
             "script_name": r.script_name, "script_desc": r.script_description,
-            "created_by": r.script_created_by,
+            "created_by": r.script_created_by, "progress": r.progress,
         }))
         .collect();
     Json(json!({"counts": counts_obj, "recent": recent}))
