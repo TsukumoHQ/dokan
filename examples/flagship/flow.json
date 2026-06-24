@@ -1,0 +1,16 @@
+{
+  "name": "fraud-triage",
+  "spec": {
+    "steps": [
+      { "id": "intake", "script_id": "$INTAKE" },
+      { "id": "score", "script_id": "$SCORE", "depends_on": ["intake"], "map": "deps.intake" },
+      { "id": "summarize", "script_id": "$SUMMARIZE", "depends_on": ["intake", "score"] },
+      {
+        "id": "alert",
+        "script_id": "$ALERT",
+        "depends_on": ["summarize"],
+        "when": { "ref": "deps.summarize", "op": "eq", "value": "FLAGGED" }
+      }
+    ]
+  }
+}
