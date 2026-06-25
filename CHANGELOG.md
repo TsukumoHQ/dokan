@@ -8,6 +8,20 @@ from `0.1.0` onward.
 
 ## [Unreleased]
 
+## [0.1.2] — 2026-06-26
+
+### Added
+- **Last-result-as-input** (stateful monitors on a stateless runtime). `upload_script`
+  accepts optional `feed_prev_result` (default `false`). When `true`, dokan injects the
+  most-recent prior run's structured result of the same script into the next run's
+  `DOKAN_INPUT.prev_result` (any exit code — a monitor's exit-1 verdict still carries its
+  state; `null` on the first run). Lets a monitor keep a cross-run diff
+  (`read prev_result.state → diff → emit new state + exit nonzero on change`) without host
+  files or an external store — staying deterministic and isolated. `false` = unchanged
+  behavior for every existing script. Surfaced on `get_script`.
+
+[0.1.2]: https://github.com/TsukumoHQ/dokan/releases/tag/v0.1.2
+
 ## [0.1.1] — 2026-06-25
 
 ### Added
@@ -64,5 +78,5 @@ OSS hygiene; a GA designation comes later.
   unauthenticated on loopback. Not yet turnkey multi-tenant (no SSO/RBAC/HA).
   See [SECURITY.md](SECURITY.md).
 
-[Unreleased]: https://github.com/TsukumoHQ/dokan/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/TsukumoHQ/dokan/compare/v0.1.2...HEAD
 [0.1.0]: https://github.com/TsukumoHQ/dokan/releases/tag/v0.1.0

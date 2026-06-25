@@ -154,6 +154,8 @@ pub struct UploadArgs {
     pub mem_limit_mb: Option<i64>,
     /// Optional per-job CPU cap in cores (e.g. 4.0); null = the executor's global default.
     pub cpu_limit: Option<f64>,
+    /// Opt-in: feed the previous run's structured result into the next run as DOKAN_INPUT.prev_result (for stateful monitors).
+    pub feed_prev_result: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -395,6 +397,7 @@ impl Dokan {
             "desc": s.description, "created_by": s.created_by, "version": s.version,
             "network": s.network, "created_at": s.created_at.to_rfc3339(),
             "mem_limit_mb": s.mem_limit_mb, "cpu_limit": s.cpu_limit,
+            "feed_prev_result": s.feed_prev_result,
         });
         if a.include_source.unwrap_or(false) {
             v["source"] = json!(s.source);
@@ -431,6 +434,7 @@ impl Dokan {
                         a.network.unwrap_or(true),
                         a.mem_limit_mb,
                         a.cpu_limit,
+                        a.feed_prev_result.unwrap_or(false),
                         embedding,
                     )
                     .await
@@ -452,6 +456,7 @@ impl Dokan {
                 a.network.unwrap_or(true),
                 a.mem_limit_mb,
                 a.cpu_limit,
+                a.feed_prev_result.unwrap_or(false),
                 embedding,
             )
             .await

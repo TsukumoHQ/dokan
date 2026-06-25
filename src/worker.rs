@@ -68,12 +68,25 @@ impl Worker {
                             let attempt = db.mark_attempt(job.run_id).await.unwrap_or(1);
                             metrics::counter!("dokan_run_attempts_total",
                                 "attempt" => attempt.to_string()).increment(1);
+                            // Stateful monitors: feed the most-recent prior structured result
+                            // of THIS script into the input as `prev_result` (null on first run).
+                            let job_input = if job.feed_prev_result {
+                                let prev = db.last_result_for_script(job.script_id, job.run_id).await.ok().flatten();
+                                let mut v = job.input.clone();
+                                match v.as_object_mut() {
+                                    Some(obj) => { obj.insert("prev_result".into(), prev.unwrap_or(serde_json::Value::Null)); }
+                                    None => { v = serde_json::json!({ "input": job.input, "prev_result": prev }); }
+                                }
+                                v
+                            } else {
+                                job.input.clone()
+                            };
                             exec.run(
                                 &db,
                                 job.run_id,
                                 &job.runtime,
                                 &job.source,
-                                &job.input,
+                                &job_input,
                                 job.agent_id.as_deref(),
                                 job.network,
                                 job.mem_limit_mb,
