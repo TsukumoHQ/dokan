@@ -8,6 +8,34 @@ from `0.1.0` onward.
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-06-26
+
+### Added
+- **Run artifacts — input files.** Feed a job real documents (a PDF, dataset, `.md`)
+  without stuffing them into `DOKAN_INPUT`. New `upload_blob(data, filename?)` stores
+  bytes in a content-addressed blob store (blake3; re-uploading identical bytes dedups
+  to one row) and returns a handle. Pass handles to `run_script` via
+  `files={"<name>": "<handle>"}`; dokan materializes each file **read-only at
+  `/input/<name>`** in the container. `download_blob(handle)` fetches bytes back. Blob
+  shas fold into the run's receipt (and the cache key), so a job that reads `/input`
+  stays a pure function of its declared inputs — **determinism, cache, and a portable
+  receipt are preserved**, unlike a host bind-mount. Cap: 32 MiB per blob.
+- This is the "upload into the job, don't mount the host out" design (`docs/specs/
+  v0.2.0-run-artifacts.md`) — the convergent pattern of E2B / Modal / OpenAI Code
+  Interpreter, kept hermetic à la Bazel/Nix.
+
+### Changed
+- A run carrying input files bypasses the warm pool and cold-creates a one-off container
+  with the `/input` bind (same mechanism as a per-script cap override). No-files runs are
+  byte-identical to before. The only bind-mount in dokan is of a dokan-owned,
+  content-addressed, ephemeral dir — not a user host path.
+
+### Notes
+- Output artifacts (`/output` capture) are deferred to a follow-up. `run_flow files:`
+  (flow-level inputs visible to every step) is stubbed (`TODO`).
+
+[0.2.0]: https://github.com/TsukumoHQ/dokan/releases/tag/v0.2.0
+
 ## [0.1.2] — 2026-06-26
 
 ### Added
@@ -78,5 +106,5 @@ OSS hygiene; a GA designation comes later.
   unauthenticated on loopback. Not yet turnkey multi-tenant (no SSO/RBAC/HA).
   See [SECURITY.md](SECURITY.md).
 
-[Unreleased]: https://github.com/TsukumoHQ/dokan/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/TsukumoHQ/dokan/compare/v0.2.0...HEAD
 [0.1.0]: https://github.com/TsukumoHQ/dokan/releases/tag/v0.1.0

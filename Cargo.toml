@@ -1,6 +1,6 @@
 [package]
 name = "dokan"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "Agent-operated, MCP-first runtime for deterministic scripts in Docker. Zero LLM inside."

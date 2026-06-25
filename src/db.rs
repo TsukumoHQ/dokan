@@ -88,6 +88,9 @@ pub struct ClaimedJob {
     pub cpu_limit: Option<f64>,
     /// Opt-in: feed the previous run's structured result into the next run.
     pub feed_prev_result: bool,
+    /// Content-addressed input files to materialize read-only at /input/<name>:
+    /// { "<dest-name>": "<sha>" }. None/empty → no /input mount (the common path).
+    pub input_blobs: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -448,17 +451,76 @@ impl Db {
         input: &serde_json::Value,
         agent_id: Option<&str>,
     ) -> Result<i64> {
+        self.insert_run_with_blobs(script_id, input, agent_id, None)
+            .await
+    }
+
+    /// Insert a run that may carry an `input_blobs` map ({ "<dest-name>": "<sha>" }). The
+    /// executor materializes those content-addressed blobs read-only at /input/<name> before
+    /// exec. `None` (the common path) is byte-identical to a plain run.
+    pub async fn insert_run_with_blobs(
+        &self,
+        script_id: i64,
+        input: &serde_json::Value,
+        agent_id: Option<&str>,
+        input_blobs: Option<&serde_json::Value>,
+    ) -> Result<i64> {
         let id: i64 = sqlx::query_scalar(
-            "INSERT INTO runs (script_id, input, status, agent_id) \
-             VALUES ($1, $2, 'pending', $3) RETURNING id",
+            "INSERT INTO runs (script_id, input, status, agent_id, input_blobs) \
+             VALUES ($1, $2, 'pending', $3, $4) RETURNING id",
         )
         .bind(script_id)
         .bind(input)
         .bind(agent_id)
+        .bind(input_blobs)
         .fetch_one(&self.pool)
         .await?;
         self.notify_runs().await;
         Ok(id)
+    }
+
+    // ---- blobs (run artifacts, v0.2.2): content-addressed input store ----
+
+    /// Store bytes content-addressed by their sha256 hex. Re-storing identical bytes is a
+    /// no-op (dedup) that just bumps `last_used_at`. Returns (sha, size).
+    pub async fn put_blob(&self, bytes: &[u8]) -> Result<(String, i64)> {
+        let sha = crate::receipt::sha256_hex(bytes);
+        let size = bytes.len() as i64;
+        sqlx::query(
+            "INSERT INTO blobs (sha, bytes, size) VALUES ($1, $2, $3) \
+             ON CONFLICT (sha) DO UPDATE SET last_used_at = now()",
+        )
+        .bind(&sha)
+        .bind(bytes)
+        .bind(size)
+        .execute(&self.pool)
+        .await?;
+        Ok((sha, size))
+    }
+
+    /// Fetch a blob's bytes by sha (bumps `last_used_at` so GC sees it as live).
+    pub async fn get_blob(&self, sha: &str) -> Result<Option<Vec<u8>>> {
+        let bytes: Option<Vec<u8>> = sqlx::query_scalar("SELECT bytes FROM blobs WHERE sha = $1")
+            .bind(sha)
+            .fetch_optional(&self.pool)
+            .await?;
+        if bytes.is_some() {
+            let _ = sqlx::query("UPDATE blobs SET last_used_at = now() WHERE sha = $1")
+                .bind(sha)
+                .execute(&self.pool)
+                .await;
+        }
+        Ok(bytes)
+    }
+
+    /// Whether a blob with this sha exists — for validating run_script `files` handles
+    /// before a run is created.
+    pub async fn blob_exists(&self, sha: &str) -> Result<bool> {
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM blobs WHERE sha = $1")
+            .bind(sha)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(n > 0)
     }
 
     /// Wake any listening worker (Perf #1). Best-effort — a missed notify is covered by the
@@ -750,7 +812,7 @@ impl Db {
              ) \
              UPDATE runs SET status = 'running', started_at = now() \
              FROM c WHERE runs.id = c.id \
-             RETURNING runs.id, runs.script_id, runs.input, runs.agent_id, \
+             RETURNING runs.id, runs.script_id, runs.input, runs.agent_id, runs.input_blobs, \
                  (SELECT runtime FROM scripts WHERE id = runs.script_id) AS runtime, \
                  (SELECT source  FROM scripts WHERE id = runs.script_id) AS source, \
                  (SELECT network FROM scripts WHERE id = runs.script_id) AS network, \
@@ -772,6 +834,7 @@ impl Db {
             mem_limit_mb: r.get("mem_limit_mb"),
             cpu_limit: r.get("cpu_limit"),
             feed_prev_result: r.get("feed_prev_result"),
+            input_blobs: r.get::<Option<serde_json::Value>, _>("input_blobs"),
         }))
     }
 

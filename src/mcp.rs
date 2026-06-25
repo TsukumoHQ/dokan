@@ -76,14 +76,31 @@ fn destringify(v: serde_json::Value) -> serde_json::Value {
     v
 }
 
-/// Content-address a run: hash(runtime + source + canonical(input) + secrets generation).
-/// Same inputs ⇒ same key ⇒ recallable (dokan jobs are deterministic).
+/// Canonical, order-stable "name:sha,name:sha" rendering of a run's input-blob map
+/// ({ "<dest-name>": "<sha>" }), sorted by name. Folded into the cache key + the receipt so
+/// identical (source+input+image+files) recall, and a changed file misses. None/empty → "".
+pub(crate) fn canonical_input_blobs(input_blobs: Option<&serde_json::Value>) -> String {
+    let Some(map) = input_blobs.and_then(|v| v.as_object()) else {
+        return String::new();
+    };
+    let mut pairs: Vec<String> = map
+        .iter()
+        .map(|(name, sha)| format!("{name}:{}", sha.as_str().unwrap_or_default()))
+        .collect();
+    pairs.sort();
+    pairs.join(",")
+}
+
+/// Content-address a run: hash(runtime + source + canonical(input) + secrets generation +
+/// input blobs). Same inputs ⇒ same key ⇒ recallable (dokan jobs are deterministic). A
+/// changed input file (different sha) shifts the key, so the cache stays correct.
 pub(crate) fn run_cache_key(
     runtime: &str,
     image_digest: &str,
     source: &str,
     input: &serde_json::Value,
     secrets_gen: i64,
+    input_blobs: Option<&serde_json::Value>,
 ) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
@@ -96,6 +113,8 @@ pub(crate) fn run_cache_key(
     h.update(canonical_json(input).as_bytes());
     h.update([0x1f]);
     h.update(secrets_gen.to_le_bytes());
+    h.update([0x1f]);
+    h.update(canonical_input_blobs(input_blobs).as_bytes());
     format!("{:x}", h.finalize())
 }
 
@@ -175,6 +194,26 @@ pub struct RunArgs {
     /// Exactly-once key: if a run with this key already exists, return it instead of
     /// enqueuing a duplicate. Use for safe retries of the enqueue call itself.
     pub idempotency_key: Option<String>,
+    /// Run artifacts (input files): a map { "<dest-name>": "<handle>" } where each handle
+    /// comes from upload_blob. Each file is materialized READ-ONLY at /input/<dest-name>
+    /// in the container before exec. Unknown handle → loud error, no run created. The blob
+    /// shas enter the cache key + receipt, so the run stays a pure function of its inputs.
+    /// Dest names must be plain filenames (no "/" or "..").
+    pub files: Option<std::collections::HashMap<String, String>>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct UploadBlobArgs {
+    /// File bytes, base64-encoded (MCP is JSON, so binary arrives base64). Cap: 32 MiB decoded.
+    pub data: String,
+    /// Optional original filename — advisory only (the content address is the bytes' sha).
+    pub filename: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DownloadBlobArgs {
+    /// The blob handle (sha) returned by upload_blob.
+    pub handle: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -561,7 +600,48 @@ impl Dokan {
         }
     }
 
-    #[tool(description = "Trigger a script run. Returns run_id immediately; never blocks. Poll with read_logs or wait_for.")]
+    #[tool(description = "Upload a file's bytes into dokan's content-addressed store and get a reusable handle. Bytes arrive base64 in `data` (MCP is JSON). The handle = the bytes' sha; re-uploading identical bytes returns the same handle and stores nothing new (dedup). Pass the handle in run_script files={\"<name>\": \"<handle>\"} to materialize it read-only at /input/<name>. Cap: 32 MiB per blob. Returns {handle, sha, size}.")]
+    async fn upload_blob(
+        &self,
+        Parameters(a): Parameters<UploadBlobArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(a.data.as_bytes())
+            .map_err(|e| McpError::invalid_params(format!("data is not valid base64: {e}"), None))?;
+        // Cap per-blob at 32 MiB (spec §5) — reject loudly rather than bloat Postgres bytea.
+        const MAX_BLOB_BYTES: usize = 32 * 1024 * 1024;
+        if bytes.len() > MAX_BLOB_BYTES {
+            return Err(McpError::invalid_params(
+                format!(
+                    "blob too large: {} bytes (cap {} bytes / 32 MiB)",
+                    bytes.len(),
+                    MAX_BLOB_BYTES
+                ),
+                None,
+            ));
+        }
+        let (sha, size) = self.db.put_blob(&bytes).await.map_err(internal)?;
+        let _ = &a.filename; // advisory only; the content address is the bytes' sha
+        ok(json!({ "handle": sha, "sha": sha, "size": size }))
+    }
+
+    #[tool(description = "Fetch a blob's bytes by handle (the sha from upload_blob). Returns {data (base64), size}, or an error if the handle is unknown.")]
+    async fn download_blob(
+        &self,
+        Parameters(a): Parameters<DownloadBlobArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        use base64::Engine;
+        match self.db.get_blob(&a.handle).await.map_err(internal)? {
+            Some(bytes) => {
+                let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                ok(json!({ "data": data, "size": bytes.len() }))
+            }
+            None => ok(json!({ "error": "unknown_blob_handle", "handle": a.handle })),
+        }
+    }
+
+    #[tool(description = "Trigger a script run. Returns run_id immediately; never blocks. Poll with read_logs or wait_for. INPUT FILES: pass files={\"<name>\": \"<handle>\"} (handles from upload_blob) to materialize each file READ-ONLY at /input/<name> in the container — the way to feed a job a real document (a PDF, dataset, .md). The blob shas enter the cache key + receipt, so the run stays deterministic. Unknown handle → loud error, no run created.")]
     async fn run_script(
         &self,
         Parameters(a): Parameters<RunArgs>,
@@ -579,13 +659,39 @@ impl Dokan {
             }
         }
         let input = destringify(a.input.unwrap_or(json!({})));
+        // Run artifacts: validate every file handle exists BEFORE a run is created (unknown
+        // handle → loud error, no run). Build the content-addressed input_blobs map
+        // { "<dest-name>": "<sha>" } stored on the run and folded into the cache key + receipt.
+        let input_blobs: Option<serde_json::Value> = match &a.files {
+            Some(files) if !files.is_empty() => {
+                let mut map = serde_json::Map::with_capacity(files.len());
+                for (name, handle) in files {
+                    if name.is_empty() || name.contains('/') || name.contains("..") {
+                        return ok(json!({
+                            "error": "invalid_file_name", "name": name,
+                            "hint": "dest names must be plain filenames (no '/' or '..')"
+                        }));
+                    }
+                    if !self.db.blob_exists(handle).await.map_err(internal)? {
+                        return ok(json!({
+                            "error": "unknown_blob_handle", "name": name, "handle": handle,
+                            "hint": "upload the file with upload_blob first; no run was created"
+                        }));
+                    }
+                    map.insert(name.clone(), json!(handle));
+                }
+                Some(serde_json::Value::Object(map))
+            }
+            _ => None,
+        };
         // Run-or-recall: if opted in and an identical run already succeeded, return its
-        // result instead of spawning a container. The key folds in the secrets generation,
-        // so a secret change invalidates env-dependent recalls.
+        // result instead of spawning a container. The key folds in the secrets generation +
+        // input blobs, so a secret change or a changed input file invalidates env-dependent
+        // recalls.
         let cache_key = if a.cache.unwrap_or(false) {
             let secrets_gen = self.db.secrets_generation().await.map_err(internal)?;
             let digest = self.exec.image_digest(&script.runtime).unwrap_or_default();
-            let key = run_cache_key(&script.runtime, &digest, &script.source, &input, secrets_gen);
+            let key = run_cache_key(&script.runtime, &digest, &script.source, &input, secrets_gen, input_blobs.as_ref());
             if let Some((run_id, exit, result)) =
                 self.db.find_cached_run(&key).await.map_err(internal)?
             {
@@ -626,7 +732,7 @@ impl Dokan {
         // Enqueue only — a worker claims it from the queue (FOR UPDATE SKIP LOCKED).
         let run_id = self
             .db
-            .insert_run(a.script_id, &input, a.agent_id.as_deref())
+            .insert_run_with_blobs(a.script_id, &input, a.agent_id.as_deref(), input_blobs.as_ref())
             .await
             .map_err(internal)?;
         if let Some(key) = &cache_key {
@@ -1062,7 +1168,7 @@ impl ServerHandler for Dokan {
 
 #[cfg(test)]
 mod tests {
-    use super::{canonical_json, destringify, run_cache_key, validate_cron};
+    use super::{canonical_input_blobs, canonical_json, destringify, run_cache_key, validate_cron};
     use serde_json::json;
 
     #[test]
@@ -1078,14 +1184,39 @@ mod tests {
     fn cache_key_stable_and_input_sensitive() {
         let i1 = json!({"a": 1, "b": 2});
         let i2 = json!({"b": 2, "a": 1}); // same content, different order
-        let k = |i: &serde_json::Value, g: i64| run_cache_key("bash", "sha-d", "src", i, g);
+        let k = |i: &serde_json::Value, g: i64| run_cache_key("bash", "sha-d", "src", i, g, None);
         assert_eq!(k(&i1, 0), k(&i2, 0), "input key-order doesn't change the cache key");
         assert_ne!(k(&i1, 0), k(&json!({"a": 9}), 0), "different input -> different key");
         assert_ne!(k(&i1, 0), k(&i1, 1), "secrets generation invalidates");
         assert_ne!(
-            run_cache_key("bash", "digestA", "s", &i1, 0),
-            run_cache_key("bash", "digestB", "s", &i1, 0),
+            run_cache_key("bash", "digestA", "s", &i1, 0, None),
+            run_cache_key("bash", "digestB", "s", &i1, 0, None),
             "image digest invalidates"
+        );
+    }
+
+    #[test]
+    fn input_blobs_participate_in_cache_key() {
+        // Same canonicalization regardless of map key order; sorted "name:sha".
+        let a = json!({ "note.txt": "sha1", "data.csv": "sha2" });
+        let b = json!({ "data.csv": "sha2", "note.txt": "sha1" });
+        assert_eq!(canonical_input_blobs(Some(&a)), canonical_input_blobs(Some(&b)));
+        assert_eq!(canonical_input_blobs(None), "");
+        let i = json!({});
+        let base = run_cache_key("bash", "d", "src", &i, 0, None);
+        let with_file = run_cache_key("bash", "d", "src", &i, 0, Some(&a));
+        assert_ne!(base, with_file, "declaring an input file shifts the key");
+        // A changed file content (different sha) misses; identical files hit.
+        let changed = json!({ "note.txt": "sha9", "data.csv": "sha2" });
+        assert_ne!(
+            run_cache_key("bash", "d", "src", &i, 0, Some(&a)),
+            run_cache_key("bash", "d", "src", &i, 0, Some(&changed)),
+            "a changed input file invalidates the cache"
+        );
+        assert_eq!(
+            run_cache_key("bash", "d", "src", &i, 0, Some(&a)),
+            run_cache_key("bash", "d", "src", &i, 0, Some(&b)),
+            "same files (any order) recall"
         );
     }
 

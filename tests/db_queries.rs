@@ -139,3 +139,66 @@ async fn gc_old_keeps_fresh_terminal_runs() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn blob_roundtrip() -> anyhow::Result<()> {
+    // Run artifacts (v0.2.2): content-addressed input store. put_blob is content-addressed
+    // (same bytes → same sha, deduped to one row); get_blob round-trips the bytes.
+    let db = Db::connect(&db_url()).await?;
+    db.migrate().await?;
+
+    let (sha1, size1) = db.put_blob(b"hello").await?;
+    let (sha2, size2) = db.put_blob(b"hello").await?; // re-upload: dedup, same handle
+    assert_eq!(sha1, sha2, "identical bytes → identical content address");
+    assert_eq!(size1, 5);
+    assert_eq!(size2, 5);
+
+    // Exactly one row for that sha (dedup, not a second insert).
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM blobs WHERE sha = $1")
+        .bind(&sha1)
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(rows, 1, "dedup: a single stored row for identical bytes");
+
+    assert!(db.blob_exists(&sha1).await?, "blob_exists sees the stored blob");
+    assert_eq!(db.get_blob(&sha1).await?.as_deref(), Some(&b"hello"[..]), "bytes round-trip");
+
+    // Different bytes → a different content address.
+    let (sha_other, _) = db.put_blob(b"world").await?;
+    assert_ne!(sha1, sha_other, "different bytes → different sha");
+
+    assert_eq!(db.get_blob("deadbeef-not-a-real-sha").await?, None, "missing handle → None");
+    Ok(())
+}
+
+#[tokio::test]
+async fn run_with_input_file_validates_and_persists_blobs() -> anyhow::Result<()> {
+    // The wiring an executor relies on: a handle validates, then a run created with an
+    // input_blobs map persists it — the source the executor reads to materialize /input.
+    // Deterministic (no Docker); reads the column directly so it doesn't drain the shared
+    // pending queue the way a claim_run would (which could flake parallel tests).
+    let db = Db::connect(&db_url()).await?;
+    db.migrate().await?;
+
+    let (sha, _) = db.put_blob(b"note body").await?;
+    assert!(db.blob_exists(&sha).await?, "the file handle validates before a run is created");
+    let (sid, _) = db
+        .insert_script("input-file-run", "bash", "cat /input/note.txt", None, None, true, None, None, false, None)
+        .await?;
+    let input_blobs = serde_json::json!({ "note.txt": sha });
+    let run_id = db
+        .insert_run_with_blobs(sid, &serde_json::json!({}), None, Some(&input_blobs))
+        .await?;
+
+    let stored: Option<serde_json::Value> =
+        sqlx::query_scalar("SELECT input_blobs FROM runs WHERE id = $1")
+            .bind(run_id)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        stored.as_ref().and_then(|v| v.get("note.txt")).and_then(|v| v.as_str()),
+        Some(sha.as_str()),
+        "run carries the content-addressed input handle for the executor to materialize"
+    );
+    Ok(())
+}

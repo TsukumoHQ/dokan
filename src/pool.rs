@@ -9,7 +9,7 @@
 //! here — so the pool is hand-rolled (PRD §9: "implement the Manager yourself").
 
 use anyhow::{anyhow, Result};
-use bollard::models::{ContainerCreateBody, HostConfig};
+use bollard::models::{ContainerCreateBody, HostConfig, Mount, MountType};
 use bollard::query_parameters::{CreateContainerOptionsBuilder, CreateImageOptionsBuilder, StartContainerOptions};
 use bollard::Docker;
 use futures_util::StreamExt;
@@ -89,39 +89,58 @@ impl WarmPool {
     /// job — never warmed/reused. Caller discards it after the run.
     pub async fn acquire_isolated(&self, image: &str) -> Result<String> {
         let id = self
-            .create_one(image, self.mem_bytes, self.nano_cpus, /*isolated=*/ true)
+            .create_one(image, self.mem_bytes, self.nano_cpus, /*isolated=*/ true, None)
             .await?;
         metrics::counter!("dokan_pool_acquire_total", "result" => "isolated").increment(1);
         Ok(id)
     }
 
-    /// Cold-create a one-off container with EXPLICIT resource caps (per-script override).
-    /// Bypasses the warm pool — which is global-only — so a heavier script can be given more
-    /// mem/cpu without polluting the shared buffer. `isolated` disables networking (the
-    /// network=false / deterministic path). Caller discards it after the run.
+    /// Cold-create a one-off container with EXPLICIT resource caps (per-script override) and,
+    /// optionally, a read-only `/input` bind-mount of `input_dir` (run artifacts). Bypasses
+    /// the warm pool — which is global-only and has no /input mount — so a heavier or
+    /// file-carrying run gets its own one-off container without polluting the shared buffer.
+    /// `isolated` disables networking (the network=false / deterministic path). Caller
+    /// discards it after the run.
     pub async fn acquire_with_caps(
         &self,
         image: &str,
         mem_bytes: i64,
         nano_cpus: i64,
         isolated: bool,
+        input_dir: Option<&str>,
     ) -> Result<String> {
-        let id = self.create_one(image, mem_bytes, nano_cpus, isolated).await?;
+        let id = self
+            .create_one(image, mem_bytes, nano_cpus, isolated, input_dir)
+            .await?;
         metrics::counter!("dokan_pool_acquire_total", "result" => "override").increment(1);
         Ok(id)
     }
 
     /// Shared container-create helper: a `sleep infinity` idle container with the given
     /// resource caps + hardening. When `isolated`, networking is disabled (network_mode=none).
+    /// When `input_dir` is set, that dokan-owned host dir is bind-mounted READ-ONLY at
+    /// `/input` (run artifacts) — the only legitimate bind in dokan, of content-addressed,
+    /// ephemeral input bytes (not a user host path), so hermeticity is preserved.
     async fn create_one(
         &self,
         image: &str,
         mem_bytes: i64,
         nano_cpus: i64,
         isolated: bool,
+        input_dir: Option<&str>,
     ) -> Result<String> {
         self.ensure_image(image).await?;
         self.resolve_digest(image).await;
+        // Read-only /input bind of the per-run, dokan-controlled materialization dir.
+        let mounts = input_dir.map(|dir| {
+            vec![Mount {
+                target: Some("/input".to_string()),
+                source: Some(dir.to_string()),
+                typ: Some(MountType::BIND),
+                read_only: Some(true),
+                ..Default::default()
+            }]
+        });
         let host_config = HostConfig {
             memory: Some(mem_bytes),
             nano_cpus: Some(nano_cpus),
@@ -132,6 +151,7 @@ impl WarmPool {
             security_opt: Some(vec!["no-new-privileges".to_string()]),
             // network=false → fully network-disabled (deterministic). Else default networking.
             network_mode: if isolated { Some("none".to_string()) } else { None },
+            mounts,
             ..Default::default()
         };
         let body = ContainerCreateBody {
@@ -263,7 +283,7 @@ impl WarmPool {
     async fn create_idle(&self, image: &str) -> Result<String> {
         let t0 = std::time::Instant::now();
         let id = self
-            .create_one(image, self.mem_bytes, self.nano_cpus, /*isolated=*/ false)
+            .create_one(image, self.mem_bytes, self.nano_cpus, /*isolated=*/ false, None)
             .await?;
         metrics::counter!("dokan_pool_containers_created_total").increment(1);
         metrics::histogram!("dokan_pool_create_seconds").record(t0.elapsed().as_secs_f64());

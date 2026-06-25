@@ -316,7 +316,7 @@ impl FlowEngine {
             {
                 let _permit = self.slots.acquire().await;
                 self.exec
-                    .run(&self.db, run_id, &script.runtime, &script.source, &comp_run_input, None, script.network, script.mem_limit_mb, script.cpu_limit)
+                    .run(&self.db, run_id, &script.runtime, &script.source, &comp_run_input, None, script.network, script.mem_limit_mb, script.cpu_limit, None)
                     .await;
             }
             // Surface a compensation whose own script failed instead of silently marking it done.
@@ -376,7 +376,7 @@ impl FlowEngine {
         let cache_key = if step.cache {
             let secrets_gen = self.db.secrets_generation().await.unwrap_or(0);
             let digest = self.exec.image_digest(&script.runtime).unwrap_or_default();
-            let key = crate::mcp::run_cache_key(&script.runtime, &digest, &script.source, &step_input, secrets_gen);
+            let key = crate::mcp::run_cache_key(&script.runtime, &digest, &script.source, &step_input, secrets_gen, None);
             if let Ok(Some((cached_run_id, _exit, _result))) = self.db.find_cached_run(&key).await {
                 let out = self.db.last_stdout(cached_run_id).await.ok().flatten();
                 let _ = self
@@ -440,6 +440,8 @@ impl FlowEngine {
                         script.network,
                         script.mem_limit_mb,
                         script.cpu_limit,
+                        // TODO(v0.2.x): run_flow files — flow-level input artifacts visible to every step.
+                        None,
                     )
                     .await;
             }
