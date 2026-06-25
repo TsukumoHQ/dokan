@@ -10,9 +10,11 @@ from `0.1.0` onward.
 
 ## [0.1.0] — 2026-06-25
 
-First tagged release. dokan has been built and run in production against the
-team's own agent fleet; this version makes the public presentation match that
-reality (a real tag, release, and a <15-minute quickstart).
+**First tagged release — beta / preview.** dokan has been built and run in
+production against the team's own agent fleet; this version makes the public
+presentation match that reality (a real tag, release, and a <15-minute
+quickstart). It is published as honest beta/preview — the release exists for
+OSS hygiene; a GA designation comes later.
 
 ### Added
 - **Deterministic Docker job execution.** One job = one fresh, network-isolated
