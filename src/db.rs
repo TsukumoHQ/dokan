@@ -35,6 +35,10 @@ pub struct Script {
     pub created_by: Option<String>,
     /// false = run network-disabled → soundly deterministic/cacheable.
     pub network: bool,
+    /// Per-script memory cap override (MiB); None = executor global default.
+    pub mem_limit_mb: Option<i64>,
+    /// Per-script CPU cap override (cores); None = executor global default.
+    pub cpu_limit: Option<f64>,
     pub version: i32,
     pub created_at: DateTime<Utc>,
 }
@@ -75,6 +79,10 @@ pub struct ClaimedJob {
     pub agent_id: Option<String>,
     /// false = run network-disabled (deterministic script).
     pub network: bool,
+    /// Per-script memory cap override (MiB); None = executor global default.
+    pub mem_limit_mb: Option<i64>,
+    /// Per-script CPU cap override (cores); None = executor global default.
+    pub cpu_limit: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -169,12 +177,14 @@ impl Db {
         description: Option<&str>,
         created_by: Option<&str>,
         network: bool,
+        mem_limit_mb: Option<i64>,
+        cpu_limit: Option<f64>,
         embedding: Option<Vec<f32>>,
     ) -> Result<(i64, i32)> {
         let vec = embedding.map(pgvector::Vector::from);
         let row = sqlx::query(
-            "INSERT INTO scripts (name, runtime, source, description, created_by, network, embedding) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, version",
+            "INSERT INTO scripts (name, runtime, source, description, created_by, network, mem_limit_mb, cpu_limit, embedding) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id, version",
         )
         .bind(name)
         .bind(runtime)
@@ -182,6 +192,8 @@ impl Db {
         .bind(description)
         .bind(created_by)
         .bind(network)
+        .bind(mem_limit_mb)
+        .bind(cpu_limit)
         .bind(vec)
         .fetch_one(&self.pool)
         .await?;
@@ -222,7 +234,8 @@ impl Db {
 
     pub async fn get_script(&self, id: i64) -> Result<Option<Script>> {
         let row = sqlx::query(
-            "SELECT id, name, runtime, source, description, created_by, network, version, created_at \
+            "SELECT id, name, runtime, source, description, created_by, network, \
+                    mem_limit_mb, cpu_limit, version, created_at \
              FROM scripts WHERE id = $1",
         )
         .bind(id)
@@ -236,6 +249,8 @@ impl Db {
             description: r.get("description"),
             created_by: r.get("created_by"),
             network: r.get("network"),
+            mem_limit_mb: r.get("mem_limit_mb"),
+            cpu_limit: r.get("cpu_limit"),
             version: r.get("version"),
             created_at: r.get("created_at"),
         }))
@@ -372,12 +387,15 @@ impl Db {
         description: Option<&str>,
         created_by: Option<&str>,
         network: bool,
+        mem_limit_mb: Option<i64>,
+        cpu_limit: Option<f64>,
         embedding: Option<Vec<f32>>,
     ) -> Result<i32> {
         let vec = embedding.map(pgvector::Vector::from);
         let version: i32 = sqlx::query_scalar(
             "UPDATE scripts SET runtime = $2, source = $3, description = $4, created_by = $5, \
-                 network = $6, embedding = $7, version = version + 1 WHERE id = $1 RETURNING version",
+                 network = $6, mem_limit_mb = $7, cpu_limit = $8, embedding = $9, \
+                 version = version + 1 WHERE id = $1 RETURNING version",
         )
         .bind(id)
         .bind(runtime)
@@ -385,6 +403,8 @@ impl Db {
         .bind(description)
         .bind(created_by)
         .bind(network)
+        .bind(mem_limit_mb)
+        .bind(cpu_limit)
         .bind(vec)
         .fetch_one(&self.pool)
         .await?;
@@ -709,7 +729,9 @@ impl Db {
              RETURNING runs.id, runs.script_id, runs.input, runs.agent_id, \
                  (SELECT runtime FROM scripts WHERE id = runs.script_id) AS runtime, \
                  (SELECT source  FROM scripts WHERE id = runs.script_id) AS source, \
-                 (SELECT network FROM scripts WHERE id = runs.script_id) AS network",
+                 (SELECT network FROM scripts WHERE id = runs.script_id) AS network, \
+                 (SELECT mem_limit_mb FROM scripts WHERE id = runs.script_id) AS mem_limit_mb, \
+                 (SELECT cpu_limit FROM scripts WHERE id = runs.script_id) AS cpu_limit",
         )
         .bind(caps)
         .fetch_optional(&self.pool)
@@ -722,6 +744,8 @@ impl Db {
             input: r.get::<Option<serde_json::Value>, _>("input").unwrap_or(serde_json::json!({})),
             agent_id: r.get("agent_id"),
             network: r.get("network"),
+            mem_limit_mb: r.get("mem_limit_mb"),
+            cpu_limit: r.get("cpu_limit"),
         }))
     }
 

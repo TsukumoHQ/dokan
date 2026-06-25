@@ -17,7 +17,7 @@ async fn gc_old_deletes_terminal_runs_and_logs() -> anyhow::Result<()> {
 
     // A script + a finished run + a log line.
     let (sid, _v) = db
-        .insert_script("gc-test", "bash", "echo hi", Some("gc coverage"), None, true, None)
+        .insert_script("gc-test", "bash", "echo hi", Some("gc coverage"), None, true, None, None, None)
         .await?;
     let run_id = db.insert_run(sid, &serde_json::json!({}), None).await?;
     db.append_log(run_id, 0, "stdout", "a line").await?;
@@ -37,7 +37,7 @@ async fn webhook_insert_find_delete_roundtrip() -> anyhow::Result<()> {
     db.migrate().await?;
 
     let (sid, _v) = db
-        .insert_script("wh-db", "bash", "echo hi", None, None, true, None)
+        .insert_script("wh-db", "bash", "echo hi", None, None, true, None, None, None)
         .await?;
     let token = dokan::crypto::random_token();
     let id = db.insert_webhook(&token, "script", sid, Some("agent-x")).await?;
@@ -59,8 +59,8 @@ async fn webhook_insert_find_delete_roundtrip() -> anyhow::Result<()> {
 async fn list_scripts_enumerates_catalog() -> anyhow::Result<()> {
     let db = Db::connect(&db_url()).await?;
     db.migrate().await?;
-    let (a, _) = db.insert_script("cat-a", "bash", "echo a", None, None, true, None).await?;
-    let (b, _) = db.insert_script("cat-b", "python", "print(1)", None, None, true, None).await?;
+    let (a, _) = db.insert_script("cat-a", "bash", "echo a", None, None, true, None, None, None).await?;
+    let (b, _) = db.insert_script("cat-b", "python", "print(1)", None, None, true, None, None, None).await?;
 
     let (rows, total) = db.list_scripts(500).await?;
     assert!(total >= 2, "catalog counts all scripts");
@@ -73,7 +73,7 @@ async fn list_scripts_enumerates_catalog() -> anyhow::Result<()> {
 async fn fail_stale_pending_retires_zombies_but_spares_fresh() -> anyhow::Result<()> {
     let db = Db::connect(&db_url()).await?;
     db.migrate().await?;
-    let (sid, _) = db.insert_script("zombie", "bash", "echo z", None, None, true, None).await?;
+    let (sid, _) = db.insert_script("zombie", "bash", "echo z", None, None, true, None, None, None).await?;
 
     // A fresh pending run is NOT retired by a generous timeout.
     let keep = db.insert_run(sid, &serde_json::json!({}), None).await?;
@@ -94,7 +94,7 @@ async fn gc_old_keeps_fresh_terminal_runs() -> anyhow::Result<()> {
     db.migrate().await?;
 
     let (sid, _v) = db
-        .insert_script("gc-keep", "bash", "echo hi", None, None, true, None)
+        .insert_script("gc-keep", "bash", "echo hi", None, None, true, None, None, None)
         .await?;
     let run_id = db.insert_run(sid, &serde_json::json!({}), None).await?;
     db.finish_run(run_id, "succeeded", Some(0), None).await?;

@@ -189,12 +189,14 @@ impl Executor {
         input: &serde_json::Value,
         agent_id: Option<&str>,
         network: bool,
+        mem_limit_mb: Option<i64>,
+        cpu_limit: Option<f64>,
     ) {
         let t0 = std::time::Instant::now();
         metrics::gauge!("dokan_runs_active").increment(1.0);
         let mut terminal = "succeeded";
         if let Err(e) = self
-            .run_inner(db, run_id, runtime, source, input, agent_id, network)
+            .run_inner(db, run_id, runtime, source, input, agent_id, network, mem_limit_mb, cpu_limit)
             .await
         {
             // Err here = dokan-side failure (could not execute) — distinct from a script
@@ -222,6 +224,7 @@ impl Executor {
             .record(t0.elapsed().as_secs_f64());
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_inner(
         &self,
         db: &Db,
@@ -231,16 +234,33 @@ impl Executor {
         input: &serde_json::Value,
         agent_id: Option<&str>,
         network: bool,
+        mem_limit_mb: Option<i64>,
+        cpu_limit: Option<f64>,
     ) -> Result<()> {
         let (image, interp) =
             runtime_spec(runtime).ok_or_else(|| anyhow!("unknown runtime: {runtime}"))?;
 
-        // network=false → isolated, network-disabled container (deterministic). Else a warm
-        // container (the fast path; monitors that hit APIs use this).
-        let cid = if network {
-            self.pool.acquire(image).await?
+        // No override → the common path is 100% unchanged: a warm container (network), or an
+        // isolated network-disabled one (deterministic). Any per-script cap override skips the
+        // global-only warm pool and cold-creates a fresh one-off container with the override
+        // caps (a missing dimension falls back to the executor's global default).
+        let cid = if mem_limit_mb.is_none() && cpu_limit.is_none() {
+            if network {
+                self.pool.acquire(image).await?
+            } else {
+                self.pool.acquire_isolated(image).await?
+            }
         } else {
-            self.pool.acquire_isolated(image).await?
+            let (def_mem, def_cpu) = self.pool.limits();
+            let mem_bytes = mem_limit_mb
+                .map(|mb| mb.saturating_mul(1024 * 1024))
+                .unwrap_or(def_mem);
+            let nano_cpus = cpu_limit
+                .map(|c| (c * 1_000_000_000.0) as i64)
+                .unwrap_or(def_cpu);
+            self.pool
+                .acquire_with_caps(image, mem_bytes, nano_cpus, /*isolated=*/ !network)
+                .await?
         };
         self.active.lock().unwrap().insert(run_id, cid.clone());
 

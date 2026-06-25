@@ -76,6 +76,8 @@ impl Worker {
                                 &job.input,
                                 job.agent_id.as_deref(),
                                 job.network,
+                                job.mem_limit_mb,
+                                job.cpu_limit,
                             )
                             .await;
                             // Retry ONLY genuine infra/internal failures. A run that

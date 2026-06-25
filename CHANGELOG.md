@@ -8,6 +8,24 @@ from `0.1.0` onward.
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-06-25
+
+### Added
+- **Per-script resource override.** `upload_script` now accepts optional
+  `mem_limit_mb` (MiB) and `cpu_limit` (cores); a script with either set runs on
+  a fresh one-off container with those caps instead of the executor's global
+  `--mem-limit-mb` / `--cpu-limit` default. A missing dimension falls back to the
+  global default. Fixes heavier jobs that OOM'd (exit 137) under the shared cap —
+  e.g. a memory-hungry monitor — without raising the cap for every job.
+  Surfaced on `get_script`. `NULL` = global default (unchanged behavior).
+
+### Changed
+- Warm-pool container creation refactored into a shared `create_one` helper.
+  Scripts with an override **bypass the warm pool** (which stays global-only) and
+  cold-create a dedicated container, so the common no-override path is unchanged.
+
+[0.1.1]: https://github.com/TsukumoHQ/dokan/releases/tag/v0.1.1
+
 ## [0.1.0] — 2026-06-25
 
 **First tagged release — beta / preview.** dokan has been built and run in
@@ -46,5 +64,5 @@ OSS hygiene; a GA designation comes later.
   unauthenticated on loopback. Not yet turnkey multi-tenant (no SSO/RBAC/HA).
   See [SECURITY.md](SECURITY.md).
 
-[Unreleased]: https://github.com/TsukumoHQ/dokan/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/TsukumoHQ/dokan/compare/v0.1.1...HEAD
 [0.1.0]: https://github.com/TsukumoHQ/dokan/releases/tag/v0.1.0
