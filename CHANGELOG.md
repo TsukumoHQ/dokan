@@ -8,6 +8,20 @@ from `0.1.0` onward.
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-06-26
+
+### Added
+- **Cockpit redesign.** The operator UI is rebuilt as a sidebar-nav, hash-routed SPA
+  (still one self-contained HTML string, no external assets): dokan cyan `#22d3ee`
+  brand accent, OLED dark, panels for **Runs · Scripts · Schedules · Secrets ·
+  Artifacts · Flows**, and a tabbed run drawer — **Logs** (live SSE), **Receipt**
+  (deterministic/advisory badge + hashes + `input_blobs`), **Artifacts** (input files).
+  Scripts surface their flags (network, mem/cpu override, `feed_prev_result`); Artifacts
+  shows the blob inventory. Accessible (focus rings, drawer focus-trap, reduced-motion).
+- `GET /api/scripts`, `GET /api/blobs`, `GET /api/runs/{id}/receipt`, and a `list_blobs`
+  MCP tool (blob inventory, token-frugal).
+
+
 ## [0.2.0] — 2026-06-26
 
 ### Added
@@ -106,5 +120,5 @@ OSS hygiene; a GA designation comes later.
   unauthenticated on loopback. Not yet turnkey multi-tenant (no SSO/RBAC/HA).
   See [SECURITY.md](SECURITY.md).
 
-[Unreleased]: https://github.com/TsukumoHQ/dokan/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/TsukumoHQ/dokan/compare/v0.2.1...HEAD
 [0.1.0]: https://github.com/TsukumoHQ/dokan/releases/tag/v0.1.0

@@ -141,6 +141,12 @@ pub struct ListScriptsArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListBlobsArgs {
+    /// Max rows (default 50, max 500).
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetScriptArgs {
     pub id: i64,
     /// When true, include the full source body (costly). Default false.
@@ -624,6 +630,25 @@ impl Dokan {
         let (sha, size) = self.db.put_blob(&bytes).await.map_err(internal)?;
         let _ = &a.filename; // advisory only; the content address is the bytes' sha
         ok(json!({ "handle": sha, "sha": sha, "size": size }))
+    }
+
+    #[tool(description = "Inventory the content-addressed blob store: handle (sha) + size + created/last-used timestamps, no bytes. The catalog of uploaded input artifacts — pair a handle with run_script files={\"<name>\": \"<handle>\"}. Most-recently-used first. Cursor-light: returns up to limit with a \"showing X of Y\" note.")]
+    async fn list_blobs(
+        &self,
+        Parameters(a): Parameters<ListBlobsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let limit = a.limit.unwrap_or(50).clamp(1, 500);
+        let (rows, total) = self.db.list_blobs(limit).await.map_err(internal)?;
+        let items: Vec<_> = rows
+            .iter()
+            .map(|b| json!({
+                "handle": b.sha,
+                "size": b.size,
+                "created_at": b.created_at.to_rfc3339(),
+                "last_used_at": b.last_used_at.to_rfc3339(),
+            }))
+            .collect();
+        ok(json!({"blobs": items, "note": format!("showing {} of {}", rows.len(), total)}))
     }
 
     #[tool(description = "Fetch a blob's bytes by handle (the sha from upload_blob). Returns {data (base64), size}, or an error if the handle is unknown.")]
