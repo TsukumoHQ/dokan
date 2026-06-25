@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "Agent-operated, MCP-first runtime for deterministic scripts in Docker. Zero LLM inside."
+repository = "https://github.com/TsukumoHQ/dokan"
+homepage = "https://github.com/TsukumoHQ/dokan"
+readme = "README.md"
+keywords = ["mcp", "automation", "docker", "agent", "workflow"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }

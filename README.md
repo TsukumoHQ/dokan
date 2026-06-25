@@ -28,6 +28,13 @@ cargo build --release
 ```
 Schema migrations apply automatically on boot. Verify it's up: open <http://127.0.0.1:8088/> (the operator cockpit) — once it loads, an agent can wire MCP and run scripts.
 
+## Run your first job
+With the daemon up, run the flagship demo — it drives a real DAG over MCP exactly the way an agent does (uploads 4 deterministic steps, wires a flow with `map` fan-out + a `when` branch, runs it, prints the result). No secrets, no job network, fully reproducible. Needs `curl` + `jq`:
+```sh
+./examples/flagship/run.sh        # override the daemon with DOKAN_ADDR=host:port
+```
+That's the whole loop — upload → compose → run → read — in one command. See [`examples/flagship/`](examples/flagship/) for the steps and the expected output.
+
 ## Wire into your agent (MCP)
 Point your agent's MCP config at the daemon:
 ```jsonc
