@@ -39,6 +39,9 @@ pub struct Script {
     pub mem_limit_mb: Option<i64>,
     /// Per-script CPU cap override (cores); None = executor global default.
     pub cpu_limit: Option<f64>,
+    /// Opt-in: feed the previous run's structured result into the next run as
+    /// DOKAN_INPUT.prev_result (stateful monitors on the stateless runtime).
+    pub feed_prev_result: bool,
     pub version: i32,
     pub created_at: DateTime<Utc>,
 }
@@ -83,6 +86,8 @@ pub struct ClaimedJob {
     pub mem_limit_mb: Option<i64>,
     /// Per-script CPU cap override (cores); None = executor global default.
     pub cpu_limit: Option<f64>,
+    /// Opt-in: feed the previous run's structured result into the next run.
+    pub feed_prev_result: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -179,12 +184,13 @@ impl Db {
         network: bool,
         mem_limit_mb: Option<i64>,
         cpu_limit: Option<f64>,
+        feed_prev_result: bool,
         embedding: Option<Vec<f32>>,
     ) -> Result<(i64, i32)> {
         let vec = embedding.map(pgvector::Vector::from);
         let row = sqlx::query(
-            "INSERT INTO scripts (name, runtime, source, description, created_by, network, mem_limit_mb, cpu_limit, embedding) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id, version",
+            "INSERT INTO scripts (name, runtime, source, description, created_by, network, mem_limit_mb, cpu_limit, feed_prev_result, embedding) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id, version",
         )
         .bind(name)
         .bind(runtime)
@@ -194,6 +200,7 @@ impl Db {
         .bind(network)
         .bind(mem_limit_mb)
         .bind(cpu_limit)
+        .bind(feed_prev_result)
         .bind(vec)
         .fetch_one(&self.pool)
         .await?;
@@ -235,7 +242,7 @@ impl Db {
     pub async fn get_script(&self, id: i64) -> Result<Option<Script>> {
         let row = sqlx::query(
             "SELECT id, name, runtime, source, description, created_by, network, \
-                    mem_limit_mb, cpu_limit, version, created_at \
+                    mem_limit_mb, cpu_limit, feed_prev_result, version, created_at \
              FROM scripts WHERE id = $1",
         )
         .bind(id)
@@ -251,6 +258,7 @@ impl Db {
             network: r.get("network"),
             mem_limit_mb: r.get("mem_limit_mb"),
             cpu_limit: r.get("cpu_limit"),
+            feed_prev_result: r.get("feed_prev_result"),
             version: r.get("version"),
             created_at: r.get("created_at"),
         }))
@@ -389,13 +397,14 @@ impl Db {
         network: bool,
         mem_limit_mb: Option<i64>,
         cpu_limit: Option<f64>,
+        feed_prev_result: bool,
         embedding: Option<Vec<f32>>,
     ) -> Result<i32> {
         let vec = embedding.map(pgvector::Vector::from);
         let version: i32 = sqlx::query_scalar(
             "UPDATE scripts SET runtime = $2, source = $3, description = $4, created_by = $5, \
-                 network = $6, mem_limit_mb = $7, cpu_limit = $8, embedding = $9, \
-                 version = version + 1 WHERE id = $1 RETURNING version",
+                 network = $6, mem_limit_mb = $7, cpu_limit = $8, feed_prev_result = $9, \
+                 embedding = $10, version = version + 1 WHERE id = $1 RETURNING version",
         )
         .bind(id)
         .bind(runtime)
@@ -405,6 +414,7 @@ impl Db {
         .bind(network)
         .bind(mem_limit_mb)
         .bind(cpu_limit)
+        .bind(feed_prev_result)
         .bind(vec)
         .fetch_one(&self.pool)
         .await?;
@@ -659,6 +669,20 @@ impl Db {
         Ok(v)
     }
 
+    /// Most-recent PRIOR run of this script that emitted a structured result (any exit code),
+    /// before `before_run_id`. Powers last-result-as-input for stateful monitors.
+    pub async fn last_result_for_script(&self, script_id: i64, before_run_id: i64) -> Result<Option<serde_json::Value>> {
+        let r: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT result FROM runs WHERE script_id = $1 AND id < $2 AND result IS NOT NULL \
+             ORDER BY id DESC LIMIT 1",
+        )
+        .bind(script_id)
+        .bind(before_run_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(r)
+    }
+
     /// (status, exit_code) — the retry decision input. A present exit_code means the
     /// script ran to completion, so a `failed` status is its own deterministic verdict
     /// (exit≠0), NOT a transient infra failure: retrying it just burns compute and
@@ -731,7 +755,8 @@ impl Db {
                  (SELECT source  FROM scripts WHERE id = runs.script_id) AS source, \
                  (SELECT network FROM scripts WHERE id = runs.script_id) AS network, \
                  (SELECT mem_limit_mb FROM scripts WHERE id = runs.script_id) AS mem_limit_mb, \
-                 (SELECT cpu_limit FROM scripts WHERE id = runs.script_id) AS cpu_limit",
+                 (SELECT cpu_limit FROM scripts WHERE id = runs.script_id) AS cpu_limit, \
+                 (SELECT feed_prev_result FROM scripts WHERE id = runs.script_id) AS feed_prev_result",
         )
         .bind(caps)
         .fetch_optional(&self.pool)
@@ -746,6 +771,7 @@ impl Db {
             network: r.get("network"),
             mem_limit_mb: r.get("mem_limit_mb"),
             cpu_limit: r.get("cpu_limit"),
+            feed_prev_result: r.get("feed_prev_result"),
         }))
     }
 

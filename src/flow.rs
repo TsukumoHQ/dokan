@@ -300,10 +300,23 @@ impl FlowEngine {
             let Ok(run_id) = self.db.insert_run(comp_id, &comp_input, None).await else {
                 continue;
             };
+            // Stateful monitors: feed the compensation script's most-recent prior structured
+            // result into its input as `prev_result` (null on first run).
+            let comp_run_input = if script.feed_prev_result {
+                let prev = self.db.last_result_for_script(script.id, run_id).await.ok().flatten();
+                let mut v = comp_input.clone();
+                match v.as_object_mut() {
+                    Some(obj) => { obj.insert("prev_result".into(), prev.unwrap_or(serde_json::Value::Null)); }
+                    None => { v = serde_json::json!({ "input": comp_input, "prev_result": prev }); }
+                }
+                v
+            } else {
+                comp_input.clone()
+            };
             {
                 let _permit = self.slots.acquire().await;
                 self.exec
-                    .run(&self.db, run_id, &script.runtime, &script.source, &comp_input, None, script.network, script.mem_limit_mb, script.cpu_limit)
+                    .run(&self.db, run_id, &script.runtime, &script.source, &comp_run_input, None, script.network, script.mem_limit_mb, script.cpu_limit)
                     .await;
             }
             // Surface a compensation whose own script failed instead of silently marking it done.
@@ -398,6 +411,19 @@ impl FlowEngine {
                 let _ = self.db.set_run_cache_key(run_id, key).await;
             }
             let _ = self.db.set_step_running(flow_run_id, &step.step_id, run_id).await;
+            // Stateful monitors: feed this script's most-recent prior structured result into
+            // the step input as `prev_result` (null on first run).
+            let run_input = if script.feed_prev_result {
+                let prev = self.db.last_result_for_script(script.id, run_id).await.ok().flatten();
+                let mut v = step_input.clone();
+                match v.as_object_mut() {
+                    Some(obj) => { obj.insert("prev_result".into(), prev.unwrap_or(serde_json::Value::Null)); }
+                    None => { v = serde_json::json!({ "input": step_input, "prev_result": prev }); }
+                }
+                v
+            } else {
+                step_input.clone()
+            };
             // Drive the container to completion (this finishes the underlying run). Hold a
             // shared concurrency permit only while the container runs, so a wide map fan-out
             // is throttled to the same cap as the worker rather than spawning all at once.
@@ -409,7 +435,7 @@ impl FlowEngine {
                         run_id,
                         &script.runtime,
                         &script.source,
-                        &step_input,
+                        &run_input,
                         None,
                         script.network,
                         script.mem_limit_mb,

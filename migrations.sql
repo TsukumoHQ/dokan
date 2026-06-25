@@ -161,6 +161,8 @@ ALTER TABLE scripts ADD COLUMN IF NOT EXISTS network BOOLEAN NOT NULL DEFAULT tr
 -- Per-script resource overrides (v0.1.1): NULL = use the executor's global cap.
 ALTER TABLE scripts ADD COLUMN IF NOT EXISTS mem_limit_mb BIGINT;
 ALTER TABLE scripts ADD COLUMN IF NOT EXISTS cpu_limit    DOUBLE PRECISION;
+-- Stateful monitors (v0.1.2): feed the previous run's structured result into the next run.
+ALTER TABLE scripts ADD COLUMN IF NOT EXISTS feed_prev_result BOOLEAN NOT NULL DEFAULT false;
 -- Signed reproducibility receipt: proof of what produced a run's output.
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS receipt JSONB;
 
