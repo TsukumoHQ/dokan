@@ -28,6 +28,13 @@ cargo build --release
 ```
 Schema migrations apply automatically on boot. Verify it's up: open <http://127.0.0.1:8088/> (the operator cockpit) — once it loads, an agent can wire MCP and run scripts.
 
+## Run your first job
+With the daemon up, run the flagship demo — it drives a real DAG over MCP exactly the way an agent does (uploads 4 deterministic steps, wires a flow with `map` fan-out + a `when` branch, runs it, prints the result). No secrets, no job network, fully reproducible. Needs `curl` + `jq`:
+```sh
+./examples/flagship/run.sh        # override the daemon with DOKAN_ADDR=host:port
+```
+That's the whole loop — upload → compose → run → read — in one command. See [`examples/flagship/`](examples/flagship/) for the steps and the expected output.
+
 ## Wire into your agent (MCP)
 Point your agent's MCP config at the daemon:
 ```jsonc
@@ -54,7 +61,7 @@ Server instructions ship in-band so the agent self-limits.
 Single Rust daemon (axum + rmcp MCP server, stdio or Streamable HTTP). State in Postgres. Execution via Docker: one job, one clean container (python:3.12-slim / node:22-slim / alpine), discarded after, per-job caps + hard timeout. Logs stream into Postgres, served cursor-paginated. Thin operator cockpit at / + Prometheus at /metrics.
 
 ## Status
-Active development, built and run in production by the team that makes it (we run our own agent fleet's automation on dokan). **Ready for: demos, design partners, technical early adopters.** Not yet turnkey multi-tenant enterprise (no SSO/RBAC/HA), out of scope while we serve internal teams. Honest about where it is.
+**v0.1.0 — beta / preview.** Active development, built and run in production by the team that makes it (we run our own agent fleet's automation on dokan). **Ready for: demos, design partners, technical early adopters.** Not yet turnkey multi-tenant enterprise (no SSO/RBAC/HA), out of scope while we serve internal teams. Honest about where it is.
 
 ## License
 Apache-2.0. Use it, embed it, build on it.
