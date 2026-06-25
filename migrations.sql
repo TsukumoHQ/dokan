@@ -158,6 +158,9 @@ ALTER TABLE runs ADD COLUMN IF NOT EXISTS progress TEXT;
 -- result is a pure function of (image digest, source, input, secrets) — soundly cacheable.
 -- Default true keeps existing monitors (which hit APIs) working.
 ALTER TABLE scripts ADD COLUMN IF NOT EXISTS network BOOLEAN NOT NULL DEFAULT true;
+-- Per-script resource overrides (v0.1.1): NULL = use the executor's global cap.
+ALTER TABLE scripts ADD COLUMN IF NOT EXISTS mem_limit_mb BIGINT;
+ALTER TABLE scripts ADD COLUMN IF NOT EXISTS cpu_limit    DOUBLE PRECISION;
 -- Signed reproducibility receipt: proof of what produced a run's output.
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS receipt JSONB;
 

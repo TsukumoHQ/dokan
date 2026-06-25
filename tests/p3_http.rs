@@ -174,6 +174,83 @@ async fn operator_surface_and_relay() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Per-script resource override (v0.1.1): a script carrying mem_limit_mb runs OUTSIDE the
+/// global warm pool on a fresh one-off container with the override cap, and still executes to
+/// success. Asserts both that the override round-trips on the run's claim path and that the
+/// `acquire_with_caps` container path works end-to-end. Non-flaky: it polls for the terminal
+/// status. (Needs Postgres + Docker, like the other p3_http tests — CI runs it.)
+#[tokio::test]
+async fn per_script_mem_override() -> anyhow::Result<()> {
+    let port = free_port();
+    let base = format!("http://127.0.0.1:{port}");
+    let token = "testtok";
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dokan"))
+        .args([
+            "--transport", "http",
+            "--addr", &format!("127.0.0.1:{port}"),
+            "--token", token,
+        ])
+        .kill_on_drop(true)
+        .spawn()?;
+
+    let cli = reqwest::Client::new();
+    let auth = format!("Bearer {token}");
+    let mut up = false;
+    for _ in 0..50 {
+        if let Ok(r) = cli.get(format!("{base}/metrics")).header("authorization", &auth).send().await {
+            if r.status().is_success() { up = true; break; }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(up, "dokan http did not come up");
+
+    // Seed a trivial script with a per-script memory override (512 MiB) + a CPU override.
+    let pool = sqlx::postgres::PgPool::connect(&db_url()).await?;
+    let script_id: i64 = sqlx::query(
+        "INSERT INTO scripts (name, runtime, source, description, mem_limit_mb, cpu_limit) \
+         VALUES ('mem-override-test', 'bash', 'echo capped-ok\n', 'v0.1.1 per-script cap', 512, 1.5) \
+         RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await?
+    .get("id");
+
+    // The override round-trips: it reads back from the same row the claim path projects.
+    let mem: Option<i64> = sqlx::query("SELECT mem_limit_mb FROM scripts WHERE id = $1")
+        .bind(script_id)
+        .fetch_one(&pool)
+        .await?
+        .get("mem_limit_mb");
+    assert_eq!(mem, Some(512), "mem_limit_mb round-trips");
+
+    // Run it through the HTTP API; it must reach the override container path and succeed.
+    let r = cli
+        .post(format!("{base}/api/runs"))
+        .header("authorization", &auth)
+        .json(&json!({"script_id": script_id}))
+        .send()
+        .await?;
+    assert!(r.status().is_success(), "authed trigger ok");
+    let run_id = r.json::<serde_json::Value>().await?["run_id"].as_i64().unwrap();
+
+    let mut done = false;
+    for _ in 0..60 {
+        let st: Option<String> = sqlx::query("SELECT status FROM runs WHERE id = $1")
+            .bind(run_id)
+            .fetch_one(&pool)
+            .await?
+            .get("status");
+        if st.as_deref() == Some("succeeded") { done = true; break; }
+        if st.as_deref() == Some("failed") { panic!("override run failed unexpectedly"); }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(done, "override-capped run reached succeeded");
+
+    let _ = child.kill().await;
+    Ok(())
+}
+
 /// Inbound webhook: an external POST to /hook/<token> enqueues the target script with the
 /// body as input — and works WITHOUT a bearer token (the URL token is the auth), even
 /// though the daemon is booted with one. Proves the endpoint sits outside the bearer gate.

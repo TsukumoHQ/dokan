@@ -88,22 +88,58 @@ impl WarmPool {
     /// Cold-create a one-off, NETWORK-DISABLED container for a deterministic (network=false)
     /// job — never warmed/reused. Caller discards it after the run.
     pub async fn acquire_isolated(&self, image: &str) -> Result<String> {
+        let id = self
+            .create_one(image, self.mem_bytes, self.nano_cpus, /*isolated=*/ true)
+            .await?;
+        metrics::counter!("dokan_pool_acquire_total", "result" => "isolated").increment(1);
+        Ok(id)
+    }
+
+    /// Cold-create a one-off container with EXPLICIT resource caps (per-script override).
+    /// Bypasses the warm pool — which is global-only — so a heavier script can be given more
+    /// mem/cpu without polluting the shared buffer. `isolated` disables networking (the
+    /// network=false / deterministic path). Caller discards it after the run.
+    pub async fn acquire_with_caps(
+        &self,
+        image: &str,
+        mem_bytes: i64,
+        nano_cpus: i64,
+        isolated: bool,
+    ) -> Result<String> {
+        let id = self.create_one(image, mem_bytes, nano_cpus, isolated).await?;
+        metrics::counter!("dokan_pool_acquire_total", "result" => "override").increment(1);
+        Ok(id)
+    }
+
+    /// Shared container-create helper: a `sleep infinity` idle container with the given
+    /// resource caps + hardening. When `isolated`, networking is disabled (network_mode=none).
+    async fn create_one(
+        &self,
+        image: &str,
+        mem_bytes: i64,
+        nano_cpus: i64,
+        isolated: bool,
+    ) -> Result<String> {
         self.ensure_image(image).await?;
         self.resolve_digest(image).await;
+        let host_config = HostConfig {
+            memory: Some(mem_bytes),
+            nano_cpus: Some(nano_cpus),
+            pids_limit: Some(PIDS_LIMIT),
+            // Harden: drop all Linux capabilities + block privilege escalation. Jobs are
+            // scripts hitting APIs; none need caps. Relax per-deployment if ever needed.
+            cap_drop: Some(vec!["ALL".to_string()]),
+            security_opt: Some(vec!["no-new-privileges".to_string()]),
+            // network=false → fully network-disabled (deterministic). Else default networking.
+            network_mode: if isolated { Some("none".to_string()) } else { None },
+            ..Default::default()
+        };
         let body = ContainerCreateBody {
             image: Some(image.to_string()),
+            // Idle until we exec the job into it; resource caps applied here.
             cmd: Some(vec!["sleep".into(), "infinity".into()]),
-            host_config: Some(HostConfig {
-                memory: Some(self.mem_bytes),
-                nano_cpus: Some(self.nano_cpus),
-                pids_limit: Some(PIDS_LIMIT),
-                // Harden: drop all Linux capabilities + block privilege escalation. Jobs are
-                // scripts hitting APIs; none need caps. Relax per-deployment if ever needed.
-                cap_drop: Some(vec!["ALL".to_string()]),
-                security_opt: Some(vec!["no-new-privileges".to_string()]),
-                network_mode: Some("none".to_string()),
-                ..Default::default()
-            }),
+            host_config: Some(host_config),
+            // Tag so a fresh executor can sweep containers orphaned by a crashed one.
             labels: Some(HashMap::from([("dokan.role".to_string(), "warm".to_string())])),
             ..Default::default()
         };
@@ -112,7 +148,6 @@ impl WarmPool {
         self.docker
             .start_container(&created.id, None::<StartContainerOptions>)
             .await?;
-        metrics::counter!("dokan_pool_acquire_total", "result" => "isolated").increment(1);
         Ok(created.id)
     }
 
@@ -227,34 +262,12 @@ impl WarmPool {
 
     async fn create_idle(&self, image: &str) -> Result<String> {
         let t0 = std::time::Instant::now();
-        self.ensure_image(image).await?;
-        self.resolve_digest(image).await;
-        let body = ContainerCreateBody {
-            image: Some(image.to_string()),
-            // Idle until we exec the job into it; resource caps applied here.
-            cmd: Some(vec!["sleep".into(), "infinity".into()]),
-            host_config: Some(HostConfig {
-                memory: Some(self.mem_bytes),
-                nano_cpus: Some(self.nano_cpus),
-                pids_limit: Some(PIDS_LIMIT),
-                // Harden: drop all Linux capabilities + block privilege escalation. Jobs are
-                // scripts hitting APIs; none need caps. Relax per-deployment if ever needed.
-                cap_drop: Some(vec!["ALL".to_string()]),
-                security_opt: Some(vec!["no-new-privileges".to_string()]),
-                ..Default::default()
-            }),
-            // Tag so a fresh executor can sweep containers orphaned by a crashed one.
-            labels: Some(HashMap::from([("dokan.role".to_string(), "warm".to_string())])),
-            ..Default::default()
-        };
-        let opts = CreateContainerOptionsBuilder::default().build();
-        let created = self.docker.create_container(Some(opts), body).await?;
-        self.docker
-            .start_container(&created.id, None::<StartContainerOptions>)
+        let id = self
+            .create_one(image, self.mem_bytes, self.nano_cpus, /*isolated=*/ false)
             .await?;
         metrics::counter!("dokan_pool_containers_created_total").increment(1);
         metrics::histogram!("dokan_pool_create_seconds").record(t0.elapsed().as_secs_f64());
-        Ok(created.id)
+        Ok(id)
     }
 
     fn spawn_filler(self: Arc<Self>) {

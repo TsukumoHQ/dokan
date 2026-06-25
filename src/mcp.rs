@@ -148,6 +148,12 @@ pub struct UploadArgs {
     /// for a pure-compute script: it runs network-disabled, making its output a deterministic
     /// function of its inputs — soundly cacheable (cache:true) and provable via its receipt.
     pub network: Option<bool>,
+    /// Optional per-job memory cap in MiB; null = the executor's global default. Raise it for a
+    /// heavier job that OOMs (exit 137) under the default cap. A script with any override runs
+    /// outside the warm pool on a fresh one-off container, so the common path is unaffected.
+    pub mem_limit_mb: Option<i64>,
+    /// Optional per-job CPU cap in cores (e.g. 4.0); null = the executor's global default.
+    pub cpu_limit: Option<f64>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -388,6 +394,7 @@ impl Dokan {
             "id": s.id, "name": s.name, "runtime": s.runtime,
             "desc": s.description, "created_by": s.created_by, "version": s.version,
             "network": s.network, "created_at": s.created_at.to_rfc3339(),
+            "mem_limit_mb": s.mem_limit_mb, "cpu_limit": s.cpu_limit,
         });
         if a.include_source.unwrap_or(false) {
             v["source"] = json!(s.source);
@@ -422,6 +429,8 @@ impl Dokan {
                         a.description.as_deref(),
                         a.created_by.as_deref(),
                         a.network.unwrap_or(true),
+                        a.mem_limit_mb,
+                        a.cpu_limit,
                         embedding,
                     )
                     .await
@@ -441,6 +450,8 @@ impl Dokan {
                 a.description.as_deref(),
                 a.created_by.as_deref(),
                 a.network.unwrap_or(true),
+                a.mem_limit_mb,
+                a.cpu_limit,
                 embedding,
             )
             .await
