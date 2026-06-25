@@ -68,6 +68,33 @@ pub struct Run {
     pub script_created_by: Option<String>,
     /// Latest transient progress line (from the `::dokan:progress::` channel), if any.
     pub progress: Option<String>,
+    /// Content-addressed input files this run carries ({name: sha}), if any — drives the
+    /// operator UI's artifact indicator.
+    pub input_blobs: Option<serde_json::Value>,
+}
+
+/// Catalog row with runtime-policy flags — for the operator UI's Scripts panel and the
+/// list_scripts surface that needs more than name+desc. Still bodiless (no source).
+#[derive(Debug, Clone)]
+pub struct ScriptFull {
+    pub id: i64,
+    pub name: String,
+    pub runtime: String,
+    pub description: Option<String>,
+    pub network: bool,
+    pub mem_limit_mb: Option<i64>,
+    pub cpu_limit: Option<f64>,
+    pub feed_prev_result: bool,
+}
+
+/// Inventory row of the content-addressed blob store (no bytes) — for the Artifacts panel
+/// and the list_blobs MCP tool.
+#[derive(Debug, Clone)]
+pub struct BlobMeta {
+    pub sha: String,
+    pub size: i64,
+    pub created_at: DateTime<Utc>,
+    pub last_used_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone)]
@@ -325,6 +352,60 @@ impl Db {
                 name: r.get("name"),
                 runtime: r.get("runtime"),
                 description: r.get("description"),
+            })
+            .collect();
+        Ok((out, total))
+    }
+
+    /// Catalog with runtime-policy flags (network, resource overrides, feed_prev_result) —
+    /// for the operator UI's Scripts panel. Newest first; still bodiless. Returns (rows, total).
+    pub async fn list_scripts_full(&self, limit: i64) -> Result<(Vec<ScriptFull>, i64)> {
+        let total: i64 = sqlx::query_scalar("SELECT count(*) FROM scripts")
+            .fetch_one(&self.pool)
+            .await?;
+        let rows = sqlx::query(
+            "SELECT id, name, runtime, description, network, mem_limit_mb, cpu_limit, feed_prev_result \
+             FROM scripts ORDER BY id DESC LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        let out = rows
+            .into_iter()
+            .map(|r| ScriptFull {
+                id: r.get("id"),
+                name: r.get("name"),
+                runtime: r.get("runtime"),
+                description: r.get("description"),
+                network: r.get("network"),
+                mem_limit_mb: r.get("mem_limit_mb"),
+                cpu_limit: r.get("cpu_limit"),
+                feed_prev_result: r.get("feed_prev_result"),
+            })
+            .collect();
+        Ok((out, total))
+    }
+
+    /// Inventory of the content-addressed blob store (no bytes) — for the Artifacts panel and
+    /// the list_blobs MCP tool. Most-recently-used first. Returns (rows, total).
+    pub async fn list_blobs(&self, limit: i64) -> Result<(Vec<BlobMeta>, i64)> {
+        let total: i64 = sqlx::query_scalar("SELECT count(*) FROM blobs")
+            .fetch_one(&self.pool)
+            .await?;
+        let rows = sqlx::query(
+            "SELECT sha, size, created_at, last_used_at FROM blobs \
+             ORDER BY last_used_at DESC LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        let out = rows
+            .into_iter()
+            .map(|r| BlobMeta {
+                sha: r.get("sha"),
+                size: r.get("size"),
+                created_at: r.get("created_at"),
+                last_used_at: r.get("last_used_at"),
             })
             .collect();
         Ok((out, total))
@@ -762,6 +843,7 @@ impl Db {
         let rows = if let Some(st) = status {
             sqlx::query(
                 "SELECT r.id, r.script_id, r.status, r.exit_code, r.error, r.created_at, r.progress, \
+                     r.input_blobs, \
                      s.name AS script_name, s.description AS script_description, \
                      s.created_by AS script_created_by \
                  FROM runs r JOIN scripts s ON s.id = r.script_id \
@@ -774,6 +856,7 @@ impl Db {
         } else {
             sqlx::query(
                 "SELECT r.id, r.script_id, r.status, r.exit_code, r.error, r.created_at, r.progress, \
+                     r.input_blobs, \
                      s.name AS script_name, s.description AS script_description, \
                      s.created_by AS script_created_by \
                  FROM runs r JOIN scripts s ON s.id = r.script_id \
@@ -796,6 +879,7 @@ impl Db {
                 script_description: r.get("script_description"),
                 script_created_by: r.get("script_created_by"),
                 progress: r.get("progress"),
+                input_blobs: r.get::<Option<serde_json::Value>, _>("input_blobs"),
             })
             .collect())
     }
