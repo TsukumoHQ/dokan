@@ -233,3 +233,18 @@ CREATE TABLE IF NOT EXISTS webhooks (
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_webhooks_token ON webhooks (token);
+
+-- Run artifacts (v0.2.2): content-addressed input blobs. An agent uploads a file's bytes
+-- once (upload_blob → sha handle, deduped here), then a run references it by handle in its
+-- `files` map; the executor materializes the bytes read-only at /input/<name> in the
+-- container. The sha (content address) enters the run's cache key + receipt, so the job
+-- stays a pure function of its declared inputs.
+-- TODO(v0.2.x): output artifacts — capture /output files back into `blobs` + a runs.artifacts column.
+CREATE TABLE IF NOT EXISTS blobs (
+    sha          TEXT        PRIMARY KEY,           -- blake3/sha256 hex of bytes
+    bytes        BYTEA       NOT NULL,
+    size         BIGINT      NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_used_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS input_blobs JSONB;  -- { "<dest-name>": "<sha>" }

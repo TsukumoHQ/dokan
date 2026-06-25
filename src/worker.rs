@@ -91,6 +91,7 @@ impl Worker {
                                 job.network,
                                 job.mem_limit_mb,
                                 job.cpu_limit,
+                                job.input_blobs.as_ref(),
                             )
                             .await;
                             // Retry ONLY genuine infra/internal failures. A run that

@@ -137,6 +137,7 @@ impl Executor {
         result: &Option<serde_json::Value>,
         exit_code: i64,
         network: bool,
+        input_blobs: Option<&serde_json::Value>,
     ) -> serde_json::Value {
         use crate::receipt::sha256_hex;
         let digest = self.pool.digest(image).unwrap_or_else(|| image.to_string());
@@ -148,9 +149,14 @@ impl Executor {
                 .unwrap_or_default()
                 .as_bytes(),
         );
+        // Content-addressed inputs: a canonical, order-stable "name:sha,name:sha" string of
+        // the run's declared input files, so the receipt proves the output is a function of
+        // (source, input, image, secrets, input-blobs) — portable to any executor that can
+        // fetch those blobs by handle.
+        let blobs_canon = canonical_input_blobs(input_blobs);
         // The signed payload is a canonical, order-stable string of the binding.
         let payload = format!(
-            "v1|{digest}|{}|{}|{secrets_gen}|{output_hash}|{exit_code}|{network}",
+            "v1|{digest}|{}|{}|{secrets_gen}|{output_hash}|{exit_code}|{network}|{blobs_canon}",
             sha256_hex(source.as_bytes()),
             sha256_hex(input.to_string().as_bytes()),
         );
@@ -165,6 +171,7 @@ impl Executor {
             "exit": exit_code,
             "network": network,
             "deterministic": !network,
+            "input_blobs": input_blobs.cloned().unwrap_or(serde_json::Value::Null),
             "alg": "hmac-sha256",
             "sig": sig,
         })
@@ -180,6 +187,7 @@ impl Executor {
 
     /// Full lifecycle: acquire warm container → exec → stream logs → exit code → discard.
     /// Drives to completion; the worker spawns this. Failures are recorded against the run.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run(
         &self,
         db: &Db,
@@ -191,12 +199,13 @@ impl Executor {
         network: bool,
         mem_limit_mb: Option<i64>,
         cpu_limit: Option<f64>,
+        input_blobs: Option<&serde_json::Value>,
     ) {
         let t0 = std::time::Instant::now();
         metrics::gauge!("dokan_runs_active").increment(1.0);
         let mut terminal = "succeeded";
         if let Err(e) = self
-            .run_inner(db, run_id, runtime, source, input, agent_id, network, mem_limit_mb, cpu_limit)
+            .run_inner(db, run_id, runtime, source, input, agent_id, network, mem_limit_mb, cpu_limit, input_blobs)
             .await
         {
             // Err here = dokan-side failure (could not execute) — distinct from a script
@@ -236,15 +245,24 @@ impl Executor {
         network: bool,
         mem_limit_mb: Option<i64>,
         cpu_limit: Option<f64>,
+        input_blobs: Option<&serde_json::Value>,
     ) -> Result<()> {
         let (image, interp) =
             runtime_spec(runtime).ok_or_else(|| anyhow!("unknown runtime: {runtime}"))?;
 
-        // No override → the common path is 100% unchanged: a warm container (network), or an
-        // isolated network-disabled one (deterministic). Any per-script cap override skips the
-        // global-only warm pool and cold-creates a fresh one-off container with the override
-        // caps (a missing dimension falls back to the executor's global default).
-        let cid = if mem_limit_mb.is_none() && cpu_limit.is_none() {
+        // Run artifacts: if the run carries input files, materialize their content-addressed
+        // bytes into a per-run, dokan-owned host dir (~/.dokan/runs/<id>/input/) and bind it
+        // read-only at /input. A run WITH files (like one with cap overrides) must bypass the
+        // warm pool — a warm container has no /input mount — so it goes through a one-off
+        // create below. Empty/absent map → no mount, the common path is untouched.
+        let input_dir = materialize_input(db, run_id, input_blobs).await?;
+        let has_files = input_dir.is_some();
+
+        // No override AND no files → the common path is 100% unchanged: a warm container
+        // (network), or an isolated network-disabled one (deterministic). Otherwise skip the
+        // global-only warm pool and cold-create a fresh one-off container with the override
+        // caps and/or the /input bind (a missing cap dimension falls back to the global default).
+        let cid = if mem_limit_mb.is_none() && cpu_limit.is_none() && !has_files {
             if network {
                 self.pool.acquire(image).await?
             } else {
@@ -259,17 +277,25 @@ impl Executor {
                 .map(|c| (c * 1_000_000_000.0) as i64)
                 .unwrap_or(def_cpu);
             self.pool
-                .acquire_with_caps(image, mem_bytes, nano_cpus, /*isolated=*/ !network)
+                .acquire_with_caps(image, mem_bytes, nano_cpus, /*isolated=*/ !network, input_dir.as_deref())
                 .await?
         };
         self.active.lock().unwrap().insert(run_id, cid.clone());
 
         let result = self
-            .exec_job(db, run_id, &cid, image, interp, source, input, agent_id, network)
+            .exec_job(db, run_id, &cid, image, interp, source, input, agent_id, network, input_blobs)
             .await;
 
         // Run clean, discard — never reuse a dirty container.
         self.pool.discard(&cid).await;
+        // Best-effort cleanup of the per-run input materialization dir (the bytes live durably
+        // in the CAS `blobs` table; this is just the ephemeral on-host copy).
+        // TODO(v0.2.x): output artifacts — capture /output here before the dir is removed.
+        if let Some(dir) = &input_dir {
+            if let Some(run_root) = std::path::Path::new(dir).parent() {
+                let _ = tokio::fs::remove_dir_all(run_root).await;
+            }
+        }
         result
     }
 
@@ -285,6 +311,7 @@ impl Executor {
         input: &serde_json::Value,
         agent_id: Option<&str>,
         network: bool,
+        input_blobs: Option<&serde_json::Value>,
     ) -> Result<()> {
         let src_b64 = base64::engine::general_purpose::STANDARD.encode(source);
         let bootstrap = format!(
@@ -378,7 +405,7 @@ impl Executor {
         // Signed reproducibility receipt: binds (image digest, source, input, secrets gen) to
         // (output, exit). Sound proof for network=false runs; advisory for networked ones.
         let receipt = self
-            .build_receipt(db, image, source, input, &result, exit_code, network)
+            .build_receipt(db, image, source, input, &result, exit_code, network, input_blobs)
             .await;
         let _ = db.set_run_receipt(run_id, &receipt).await;
         if let Some(r) = &result {
@@ -397,6 +424,48 @@ impl Executor {
         self.finalize(run_id, status, Some(exit_code as i32), result).await;
         Ok(())
     }
+}
+
+/// Canonical, order-stable "name:sha,name:sha" rendering of a run's input-blob map — folded
+/// into the receipt's signed payload. Same canonicalization the cache key uses, so the two
+/// agree on what set of files a run declared. None/empty → "".
+fn canonical_input_blobs(input_blobs: Option<&serde_json::Value>) -> String {
+    crate::mcp::canonical_input_blobs(input_blobs)
+}
+
+/// Materialize a run's content-addressed input files into a per-run, dokan-owned host dir
+/// (`$HOME/.dokan/runs/<run_id>/input/`) and return that dir for a read-only `/input` bind.
+/// The bytes live durably in the CAS `blobs` table; this is the ephemeral on-host copy the
+/// container reads. None when the run declares no files (the common, no-mount path).
+async fn materialize_input(
+    db: &Db,
+    run_id: i64,
+    input_blobs: Option<&serde_json::Value>,
+) -> Result<Option<String>> {
+    let Some(map) = input_blobs.and_then(|v| v.as_object()) else {
+        return Ok(None);
+    };
+    if map.is_empty() {
+        return Ok(None);
+    }
+    let home = std::env::var("HOME").map_err(|_| anyhow!("HOME unset; cannot materialize /input"))?;
+    let dir = format!("{home}/.dokan/runs/{run_id}/input");
+    tokio::fs::create_dir_all(&dir).await?;
+    for (name, sha_v) in map {
+        // The dest name lands as /input/<name>; keep it a plain filename (no traversal).
+        if name.is_empty() || name.contains('/') || name.contains("..") {
+            return Err(anyhow!("invalid input file name: {name:?}"));
+        }
+        let sha = sha_v
+            .as_str()
+            .ok_or_else(|| anyhow!("input_blobs[{name}] is not a string handle"))?;
+        let bytes = db
+            .get_blob(sha)
+            .await?
+            .ok_or_else(|| anyhow!("input blob not found for handle {sha}"))?;
+        tokio::fs::write(format!("{dir}/{name}"), &bytes).await?;
+    }
+    Ok(Some(dir))
 }
 
 /// Map a "container vanished" (404) Docker error into a clean, retryable infra error: the
