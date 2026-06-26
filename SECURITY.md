@@ -53,9 +53,11 @@ that and are **not** vulnerabilities:
   timeout — a runaway or OOM job is killed, not allowed to starve the host.
 - **Write-only secrets.** Secret values are never returned by any MCP tool,
   never logged, and not echoed back; `list_secrets` exposes names only.
-- **Signed run receipts.** Completed runs carry a receipt signed with
-  `DOKAN_RECEIPT_KEY`, so a run's result can be verified as produced by this
-  executor.
+- **Tamper-evident run receipts.** Completed runs carry a receipt keyed with
+  `DOKAN_RECEIPT_KEY` (HMAC), so a run's result can be checked as produced by
+  this executor by anyone holding the key. This is integrity/tamper-evidence,
+  **not** a public, third-party-verifiable signature — that needs an asymmetric
+  scheme (on the roadmap).
 - **Inbound webhook tokens.** `POST /hook/<token>` triggers require an
   unguessable per-webhook token.
 

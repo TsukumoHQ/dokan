@@ -15,9 +15,24 @@ Think *Sidekiq/cron for AI agents*: the agent scripts the mechanical 80%, dokan 
 ## Why dokan
 - **Agent-operated.** your agent uploads, wires, triggers, reads logs over MCP. No UI.
 - **Zero LLM inside = zero token burn.** deterministic code, not LLM-in-the-loop. The platform never spends tokens to run your workflows.
-- **Deterministic + reliable.** one job = one clean Docker container, per-job CPU/mem caps, timeouts, retries, content-addressed cache (never recompute unchanged work).
+- **Deterministic + reproducible.** one job = one clean container, network-disabled by default, per-job CPU/mem caps, timeouts, retries. Identical inputs hit a content-addressed cache instead of recomputing, and every run carries a tamper-evident receipt.
 - **Real triggers.** cron + inbound webhooks (POST /hook/<token>, Stripe/Calendly/GitHub-ready).
-- **Token-frugal.** every MCP response engineered for an agent's context budget.
+- **Token-frugal.** every MCP response is shaped for an agent's context budget — IDs over payloads, paginated logs, counts over dumps.
+
+## How it works
+
+```mermaid
+flowchart LR
+  agent["your coding agent"] -- MCP --> dokan["dokan daemon<br/>(Rust · axum + rmcp)"]
+  dokan -- state --> pg[("Postgres")]
+  dokan -- one job, one container --> c1["job container<br/>(network-off by default)"]
+  c1 -- "stdout · ::dokan:result::" --> dokan
+  dokan -- "result POST" --> relay["your agent / relay"]
+  human["operator (optional)"] -. watch .-> cockpit["cockpit /"]
+  cockpit --- dokan
+```
+
+A single Rust daemon (axum + an rmcp MCP server, stdio or Streamable HTTP). State lives in Postgres. Execution is one job → one fresh container (`python:3.12-slim` / `node:22-slim` / `alpine`), discarded after the run, with per-job caps and a hard timeout. Logs stream into Postgres, served cursor-paginated. A thin operator cockpit runs at `/`, Prometheus at `/metrics`. **No LLM runs inside dokan** — the agent is the only place tokens are spent.
 
 ## Quickstart
 Prereqs: a Rust toolchain and Docker running. The daemon talks to the default Docker socket — set `DOCKER_HOST` if you run colima / podman / a remote engine. Its default `DATABASE_URL` already points at the compose database, so there's nothing to configure.
@@ -42,26 +57,72 @@ Point your agent's MCP config at the daemon:
 ```
 Your agent now has the full dokan toolset over MCP.
 
+## Core concepts
+
+### Scripts
+A script is code in `python` | `node` | `bash`. It reads its input from the **`DOKAN_INPUT`** env var (a JSON string — not stdin, not argv). Secrets arrive as their own env vars. `upload_script(..., upsert=true)` re-provisions by name idempotently, so a respawning agent never leaves orphan duplicates. A script's nonzero exit is treated as the script's **own deterministic verdict** (e.g. a monitor finding) and is *not* retried — only a genuine infra failure (container vanished / timeout) retries.
+
+### Flows (DAG)
+`compose_flow` wires scripts into a validated, acyclic graph; `run_flow` runs it and the engine drives the DAG. Each step is one container run that sees `{flow_input, deps, step}` as its `DOKAN_INPUT`.
+
+```mermaid
+flowchart LR
+  intake["intake"] --> score["score<br/>(map: one run per order)"]
+  score --> summarize["summarize<br/>(structured result + branch token)"]
+  summarize -- "when deps.summarize == FLAGGED" --> alert["alert"]
+  summarize -- else --> done(["done"])
+```
+
+The engine gives you:
+- **`map` fan-out** — one child run per item; the parent collapses the children into a `{n, ok, failed}` count instead of listing each.
+- **`when` branches** — a step runs only if a predicate over an upstream result holds.
+- **`compensate` (saga rollback)** — a step can declare a compensating action that runs if a later step fails, so a partially-applied flow unwinds cleanly.
+- **retries** with backoff on transient failures.
+- **step-boundary durability** — progress is committed at each step, so a crashed engine resumes; succeeded steps are skipped. Steps must be idempotent (a dying step re-runs).
+
+### Schedules & triggers
+- **`schedule(script_id, cron)`** — **6-field cron with leading seconds** (`0 */5 * * * *` = every 5 min). A 5-field expression is rejected loudly rather than silently never firing. Each tick enqueues a run.
+- **`create_webhook`** — an external `POST /hook/<token>` enqueues a script or flow with the request body as input. The unguessable URL token is the auth (the endpoint sits outside the bearer gate).
+
+### Secrets
+`set_secret(name, value)` once → injected as an env var into every job container (e.g. `$OPENAI_API_KEY`). **Write-only**: values are never returned or logged; `list_secrets` shows names only.
+
+### Resource limits
+Per-job caps default to **1024 MiB / 2.0 CPU**, set globally on the daemon. A single heavier script can override them — `upload_script(..., mem_limit_mb, cpu_limit)` — and only that script runs on a dedicated container with the raised cap; everything else is untouched.
+
+### Structured results & stateful monitors
+A job prints a line `::dokan:result:: {json}` on stdout; dokan captures the **last** one as the run's structured result. It is returned by `wait_for`/`read_logs` and POSTed to the relay on completion — so a monitor emits a finding and the agent reacts **event-driven**, no polling.
+
+For a monitor that should fire **only when something changes**, set `upload_script(..., feed_prev_result=true)`: dokan feeds the previous run's structured result into the next run as `DOKAN_INPUT.prev_result`. The monitor reads `prev_result.state`, diffs against the current state, emits the new state, and exits nonzero on a change — a cross-run diff with no host files and no external store, on a stateless runtime.
+
+### Run artifacts (input files)
+To hand a job a real document — a PDF, a dataset, a big `.md` — without stuffing it into `DOKAN_INPUT` (an env var, ~100 KB): `upload_blob(bytes)` stores it in a content-addressed blob store (re-uploading identical bytes deduplicates) and returns a handle; `run_script(..., files={"doc.md": "<handle>"})` materializes each file **read-only at `/input/<name>`** in the container. The blob hashes fold into the run's cache key and receipt, so a job that reads `/input` stays a pure function of its declared inputs.
+
+### Determinism & receipts
+A `network=false` job is a **pure function of its inputs** — source + `DOKAN_INPUT` + input-file blobs + the pinned image digest. Two consequences:
+- **Content-addressed cache.** `run_script(..., cache=true)` recalls a prior identical success instead of recomputing — no container spawned.
+- **Tamper-evident receipt.** every run carries a receipt binding (image digest, source hash, input hash, output hash, input-blob hashes) under an HMAC keyed by `DOKAN_RECEIPT_KEY`. It detects tampering for anyone holding the key; it is *not* a public, third-party-verifiable signature (that would need an asymmetric scheme — on the roadmap). A networked job's receipt is advisory, since its output can depend on the outside world.
+
 ## MCP surface (token-frugal)
 | Tool | Returns |
 |---|---|
-| search_script | ranked IDs + 1-line desc |
-| upload_script | script_id + version |
-| run_script | run_id immediately, never blocks |
-| read_logs / wait_for | cursor logs / long-poll to terminal + tail |
-| schedule / list_schedules | cron a script (6-field) |
-| compose_flow / run_flow | declarative DAG, wired over MCP |
-| create_webhook | inbound HTTP trigger to a script/flow |
-| set_secret / list_secrets | write-only secrets, injected as job env |
-| cancel · list_runs · get_script | … |
+| search_script · list_scripts · get_script | ranked / listed IDs + 1-line desc; bodies only on request |
+| upload_script | script_id + version (flags: network, mem/cpu limit, feed_prev_result) |
+| run_script | run_id immediately, never blocks (input + `files` for /input artifacts) |
+| read_logs · wait_for | cursor logs / long-poll to terminal + tail + structured result |
+| schedule · list_schedules · unschedule | cron a script (6-field) |
+| compose_flow · run_flow · get_flow_run | declarative DAG; per-step status (map children collapsed to a count) |
+| create_webhook · list_webhooks · delete_webhook | inbound HTTP trigger to a script/flow |
+| upload_blob · download_blob · list_blobs | content-addressed input/output files |
+| get_receipt | a run's tamper-evident reproducibility receipt |
+| set_secret · list_secrets | write-only secrets, injected as job env |
+| on_result · list_triggers · delete_trigger | reactive triggers: enqueue a script when a result matches |
+| cancel · list_runs · list_executors | … |
 
 Server instructions ship in-band so the agent self-limits.
 
-## How it works
-Single Rust daemon (axum + rmcp MCP server, stdio or Streamable HTTP). State in Postgres. Execution via Docker: one job, one clean container (python:3.12-slim / node:22-slim / alpine), discarded after, per-job caps + hard timeout. Logs stream into Postgres, served cursor-paginated. Thin operator cockpit at / + Prometheus at /metrics.
-
 ## Status
-**v0.1.0 — beta / preview.** Active development, built and run in production by the team that makes it (we run our own agent fleet's automation on dokan). **Ready for: demos, design partners, technical early adopters.** Not yet turnkey multi-tenant enterprise (no SSO/RBAC/HA), out of scope while we serve internal teams. Honest about where it is.
+**v0.2.x — beta / preview.** Active development, built and run in production by the team that makes it (we run our own agent fleet's automation on dokan). **Ready for: demos, design partners, technical early adopters.** Not yet turnkey multi-tenant enterprise (no SSO/RBAC/HA, secrets are global to all jobs — see [SECURITY.md](SECURITY.md)). Honest about where it is.
 
 ## License
 Apache-2.0. Use it, embed it, build on it.
