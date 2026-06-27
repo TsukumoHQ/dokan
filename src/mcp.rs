@@ -344,6 +344,12 @@ pub struct GetReceiptArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReproduceArgs {
+    /// The prior run to reproduce. Its receipt is the binding the new run is diffed against.
+    pub run_id: i64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct WhoamiArgs {
     /// Your agent id — to report your scoped secrets + quota usage. Optional.
     pub agent_id: Option<String>,
@@ -1083,6 +1089,81 @@ impl Dokan {
             Some(r) => ok(r),
             None => ok(json!({"error": "no_receipt", "run_id": a.run_id})),
         }
+    }
+
+    #[tool(description = "Reproduce a prior run: re-run its EXACT script source + input with caching DISABLED (forces a real container, never a recall), so the new run's receipt can be diffed against the original to verify determinism. Non-blocking: returns new_run_id immediately — poll it, then get_receipt on both and compare source_sha256/input_sha256/output_sha256. Refuses with source_drift (no run created) if the script's source changed since the original — those exact bytes are gone. Still runs but warns if the original used the network or the secrets generation has moved.")]
+    async fn reproduce(
+        &self,
+        Parameters(a): Parameters<ReproduceArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        // The original receipt is the binding we reproduce + diff against. No receipt → nothing
+        // to verify against.
+        let Some(receipt) = self.db.run_receipt(a.run_id).await.map_err(internal)? else {
+            return ok(json!({"error": "no_receipt", "run_id": a.run_id}));
+        };
+        // Recover the snapshotted input + input-blobs + script id from the original run row.
+        let Some((script_id, input, input_blobs, agent_id)) =
+            self.db.run_reproduce_inputs(a.run_id).await.map_err(internal)?
+        else {
+            return ok(json!({"error": "run_not_found", "run_id": a.run_id}));
+        };
+        // Source is NOT snapshotted per-run — claim_run reads it live from `scripts`, so a
+        // re-enqueue would run whatever the source is NOW. Recompute the current source hash and
+        // refuse if it drifted from the receipt: the original bytes can't be reproduced.
+        let Some(script) = self.db.get_script(script_id).await.map_err(internal)? else {
+            return ok(json!({"error": "script_not_found", "id": script_id}));
+        };
+        let current_source_sha = crate::receipt::sha256_hex(script.source.as_bytes());
+        let original_source_sha = receipt
+            .get("source_sha256")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        if current_source_sha != original_source_sha {
+            return ok(json!({
+                "error": "source_drift",
+                "original_run_id": a.run_id,
+                "script_id": script_id,
+                "original_source_sha256": original_source_sha,
+                "current_source_sha256": current_source_sha,
+                "note": "script source changed since the original run; exact bytes can't be reproduced — no run created",
+            }));
+        }
+        // Determinism guards — still reproduce, but warn: these can make the receipts differ
+        // for reasons unrelated to the source.
+        let mut warnings: Vec<String> = Vec::new();
+        if receipt.get("network").and_then(|v| v.as_bool()).unwrap_or(false) {
+            warnings.push(
+                "original run had network enabled — output is not guaranteed deterministic".into(),
+            );
+        }
+        let current_secrets_gen = self.db.secrets_generation().await.map_err(internal)?;
+        let original_secrets_gen = receipt
+            .get("secrets_generation")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(-1);
+        if current_secrets_gen != original_secrets_gen {
+            warnings.push(format!(
+                "secrets generation moved ({original_secrets_gen} → {current_secrets_gen}) — a secret-dependent run may differ"
+            ));
+        }
+        // Re-enqueue a fresh run with caching DISABLED (no cache_key set) → the worker always
+        // spawns a real container, never a recall. Reuses the standard enqueue path; no exec
+        // logic is duplicated.
+        let new_run_id = self
+            .db
+            .insert_run_with_blobs(script_id, &input, agent_id.as_deref(), input_blobs.as_ref())
+            .await
+            .map_err(internal)?;
+        let mut out = json!({
+            "original_run_id": a.run_id,
+            "new_run_id": new_run_id,
+            "status": "running",
+            "note": "poll new_run_id, then get_receipt on both and diff source_sha256/input_sha256/output_sha256",
+        });
+        if !warnings.is_empty() {
+            out["warning"] = json!(warnings);
+        }
+        ok(out)
     }
 
     #[tool(description = "List secret names (values are write-only and never returned). Use to check which keys a job will see in its env.")]
