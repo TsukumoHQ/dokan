@@ -460,6 +460,54 @@ async fn deterministic_network_off_receipt_and_recall() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Run artifacts (output): capture_output mounts a writable /output; a job that writes a file
+/// there has it captured as a content-addressed blob, surfaced as output_blobs={name: sha} on
+/// wait_for, folded into the receipt, and downloadable via download_blob. (TSU-56.)
+#[tokio::test]
+async fn capture_output_files_are_blobbed_and_downloadable() -> anyhow::Result<()> {
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+
+    let c = spawn().await?;
+    const BODY: &str = "hello from /output\n";
+    // Write one file to /output. printf avoids a trailing-newline ambiguity.
+    let src = format!("printf '{}' > /output/result.txt\n", BODY.replace('\n', "\\n"));
+    let sid = upload(&c, "bash", &src).await;
+    let run = call(
+        &c,
+        "run_script",
+        json!({"script_id": sid, "agent_id": "test", "capture_output": true}),
+    )
+    .await?;
+    let run_id = run["run_id"].as_i64().unwrap();
+    let w = call(&c, "wait_for", json!({"run_id": run_id, "timeout": 60})).await?;
+    assert_eq!(w["status"], "succeeded", "ran: {w}");
+
+    // output_blobs maps the file name to its content address.
+    let ob = &w["output_blobs"];
+    assert!(ob.is_object(), "output_blobs present on wait_for: {w}");
+    let sha = ob["result.txt"].as_str().expect("result.txt captured");
+    let expected: String = {
+        let mut h = Sha256::new();
+        h.update(BODY.as_bytes());
+        h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    };
+    assert_eq!(sha, expected, "captured sha is the content address of the bytes: {w}");
+
+    // The same map is folded into the tamper-evident receipt.
+    let rec = call(&c, "get_receipt", json!({"run_id": run_id})).await?;
+    assert_eq!(rec["output_blobs"]["result.txt"], json!(sha), "receipt binds output blobs: {rec}");
+
+    // The captured sha is downloadable via the EXISTING blob download — bytes round-trip.
+    let dl = call(&c, "download_blob", json!({"handle": sha})).await?;
+    let data = dl["data"].as_str().expect("download_blob returns base64 data");
+    let bytes = base64::engine::general_purpose::STANDARD.decode(data)?;
+    assert_eq!(bytes, BODY.as_bytes(), "downloaded bytes match what the job wrote");
+
+    c.cancel().await?;
+    Ok(())
+}
+
 /// An idempotency key makes a repeated enqueue return the same run, not a duplicate. (T5.)
 #[tokio::test]
 async fn idempotency_key_dedups() -> anyhow::Result<()> {

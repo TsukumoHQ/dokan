@@ -187,7 +187,7 @@ async fn run_with_input_file_validates_and_persists_blobs() -> anyhow::Result<()
         .await?;
     let input_blobs = serde_json::json!({ "note.txt": sha });
     let run_id = db
-        .insert_run_with_blobs(sid, &serde_json::json!({}), None, Some(&input_blobs))
+        .insert_run_with_blobs(sid, &serde_json::json!({}), None, Some(&input_blobs), false)
         .await?;
 
     let stored: Option<serde_json::Value> =

@@ -316,7 +316,7 @@ impl FlowEngine {
             {
                 let _permit = self.slots.acquire().await;
                 self.exec
-                    .run(&self.db, run_id, &script.runtime, &script.source, &comp_run_input, None, script.network, script.mem_limit_mb, script.cpu_limit, None)
+                    .run(&self.db, run_id, &script.runtime, &script.source, &comp_run_input, None, script.network, script.mem_limit_mb, script.cpu_limit, None, false)
                     .await;
             }
             // Surface a compensation whose own script failed instead of silently marking it done.
@@ -442,6 +442,8 @@ impl FlowEngine {
                         script.cpu_limit,
                         // TODO(v0.2.x): run_flow files — flow-level input artifacts visible to every step.
                         None,
+                        // Flow steps don't opt into output capture (no per-step capture_output yet).
+                        false,
                     )
                     .await;
             }

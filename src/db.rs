@@ -118,6 +118,10 @@ pub struct ClaimedJob {
     /// Content-addressed input files to materialize read-only at /input/<name>:
     /// { "<dest-name>": "<sha>" }. None/empty → no /input mount (the common path).
     pub input_blobs: Option<serde_json::Value>,
+    /// Opt-in: mount a writable /output in the container and capture every file written there
+    /// as a content-addressed blob after exec (run artifacts — output files). Forces the
+    /// one-off container path (like input files / cap overrides). false = warm path unchanged.
+    pub capture_output: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -571,8 +575,8 @@ impl Db {
     pub async fn run_reproduce_inputs(
         &self,
         id: i64,
-    ) -> Result<Option<(i64, serde_json::Value, Option<serde_json::Value>, Option<String>)>> {
-        let row = sqlx::query("SELECT script_id, input, input_blobs, agent_id FROM runs WHERE id = $1")
+    ) -> Result<Option<(i64, serde_json::Value, Option<serde_json::Value>, Option<String>, bool)>> {
+        let row = sqlx::query("SELECT script_id, input, input_blobs, agent_id, capture_output FROM runs WHERE id = $1")
             .bind(id)
             .fetch_optional(&self.pool)
             .await?;
@@ -583,6 +587,7 @@ impl Db {
                     .unwrap_or(serde_json::json!({})),
                 r.get::<Option<serde_json::Value>, _>("input_blobs"),
                 r.get("agent_id"),
+                r.get("capture_output"),
             )
         }))
     }
@@ -595,28 +600,32 @@ impl Db {
         input: &serde_json::Value,
         agent_id: Option<&str>,
     ) -> Result<i64> {
-        self.insert_run_with_blobs(script_id, input, agent_id, None)
+        self.insert_run_with_blobs(script_id, input, agent_id, None, false)
             .await
     }
 
-    /// Insert a run that may carry an `input_blobs` map ({ "<dest-name>": "<sha>" }). The
-    /// executor materializes those content-addressed blobs read-only at /input/<name> before
-    /// exec. `None` (the common path) is byte-identical to a plain run.
+    /// Insert a run that may carry an `input_blobs` map ({ "<dest-name>": "<sha>" }) and/or opt
+    /// into output capture. The executor materializes input blobs read-only at /input/<name>
+    /// before exec, and (when `capture_output`) mounts a writable /output and captures whatever
+    /// the job writes there afterwards. The common path (None, false) is byte-identical to a
+    /// plain run.
     pub async fn insert_run_with_blobs(
         &self,
         script_id: i64,
         input: &serde_json::Value,
         agent_id: Option<&str>,
         input_blobs: Option<&serde_json::Value>,
+        capture_output: bool,
     ) -> Result<i64> {
         let id: i64 = sqlx::query_scalar(
-            "INSERT INTO runs (script_id, input, status, agent_id, input_blobs) \
-             VALUES ($1, $2, 'pending', $3, $4) RETURNING id",
+            "INSERT INTO runs (script_id, input, status, agent_id, input_blobs, capture_output) \
+             VALUES ($1, $2, 'pending', $3, $4, $5) RETURNING id",
         )
         .bind(script_id)
         .bind(input)
         .bind(agent_id)
         .bind(input_blobs)
+        .bind(capture_output)
         .fetch_one(&self.pool)
         .await?;
         self.notify_runs().await;
@@ -757,6 +766,27 @@ impl Db {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// Record a run's captured output-file map ({ "<relative-name>": "<sha>" }) — the content
+    /// addresses of the files the job wrote to /output. Mirrors `input_blobs` on the input side;
+    /// folded into the receipt so the output set is tamper-evident too.
+    pub async fn set_run_output_blobs(&self, id: i64, output_blobs: &serde_json::Value) -> Result<()> {
+        sqlx::query("UPDATE runs SET output_blobs = $2 WHERE id = $1")
+            .bind(id)
+            .bind(output_blobs)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// A run's captured output-file map, if any.
+    pub async fn run_output_blobs(&self, id: i64) -> Result<Option<serde_json::Value>> {
+        Ok(sqlx::query_scalar("SELECT output_blobs FROM runs WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?
+            .flatten())
     }
 
     /// Set a run's transient progress line (from the `::dokan:progress::` channel).
@@ -960,6 +990,7 @@ impl Db {
              UPDATE runs SET status = 'running', started_at = now() \
              FROM c WHERE runs.id = c.id \
              RETURNING runs.id, runs.script_id, runs.input, runs.agent_id, runs.input_blobs, \
+                 runs.capture_output, \
                  (SELECT runtime FROM scripts WHERE id = runs.script_id) AS runtime, \
                  (SELECT source  FROM scripts WHERE id = runs.script_id) AS source, \
                  (SELECT network FROM scripts WHERE id = runs.script_id) AS network, \
@@ -982,6 +1013,7 @@ impl Db {
             cpu_limit: r.get("cpu_limit"),
             feed_prev_result: r.get("feed_prev_result"),
             input_blobs: r.get::<Option<serde_json::Value>, _>("input_blobs"),
+            capture_output: r.get("capture_output"),
         }))
     }
 

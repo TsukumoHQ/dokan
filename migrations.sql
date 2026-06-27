@@ -248,3 +248,10 @@ CREATE TABLE IF NOT EXISTS blobs (
     last_used_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS input_blobs JSONB;  -- { "<dest-name>": "<sha>" }
+
+-- Run artifacts — OUTPUT files (TSU-56). Opt-in per run: capture_output mounts a writable
+-- /output in the container; after exec dokan captures every file there as a content-addressed
+-- blob and records the resulting { "<relative-name>": "<sha>" } map here (folded into the
+-- receipt). NULL/absent → no /output, the warm path is untouched.
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS capture_output BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS output_blobs JSONB;  -- { "<relative-name>": "<sha>" }

@@ -89,7 +89,7 @@ impl WarmPool {
     /// job — never warmed/reused. Caller discards it after the run.
     pub async fn acquire_isolated(&self, image: &str) -> Result<String> {
         let id = self
-            .create_one(image, self.mem_bytes, self.nano_cpus, /*isolated=*/ true, None)
+            .create_one(image, self.mem_bytes, self.nano_cpus, /*isolated=*/ true, None, None)
             .await?;
         metrics::counter!("dokan_pool_acquire_total", "result" => "isolated").increment(1);
         Ok(id)
@@ -108,9 +108,10 @@ impl WarmPool {
         nano_cpus: i64,
         isolated: bool,
         input_dir: Option<&str>,
+        output_dir: Option<&str>,
     ) -> Result<String> {
         let id = self
-            .create_one(image, mem_bytes, nano_cpus, isolated, input_dir)
+            .create_one(image, mem_bytes, nano_cpus, isolated, input_dir, output_dir)
             .await?;
         metrics::counter!("dokan_pool_acquire_total", "result" => "override").increment(1);
         Ok(id)
@@ -120,7 +121,9 @@ impl WarmPool {
     /// resource caps + hardening. When `isolated`, networking is disabled (network_mode=none).
     /// When `input_dir` is set, that dokan-owned host dir is bind-mounted READ-ONLY at
     /// `/input` (run artifacts) — the only legitimate bind in dokan, of content-addressed,
-    /// ephemeral input bytes (not a user host path), so hermeticity is preserved.
+    /// ephemeral input bytes (not a user host path), so hermeticity is preserved. When
+    /// `output_dir` is set, a dokan-owned host dir is bind-mounted WRITABLE at `/output` so the
+    /// job can emit files dokan captures (content-addressed) after exec.
     async fn create_one(
         &self,
         image: &str,
@@ -128,19 +131,31 @@ impl WarmPool {
         nano_cpus: i64,
         isolated: bool,
         input_dir: Option<&str>,
+        output_dir: Option<&str>,
     ) -> Result<String> {
         self.ensure_image(image).await?;
         self.resolve_digest(image).await;
-        // Read-only /input bind of the per-run, dokan-controlled materialization dir.
-        let mounts = input_dir.map(|dir| {
-            vec![Mount {
+        // Read-only /input bind + writable /output bind, each of a per-run, dokan-controlled dir.
+        let mut mount_list = Vec::new();
+        if let Some(dir) = input_dir {
+            mount_list.push(Mount {
                 target: Some("/input".to_string()),
                 source: Some(dir.to_string()),
                 typ: Some(MountType::BIND),
                 read_only: Some(true),
                 ..Default::default()
-            }]
-        });
+            });
+        }
+        if let Some(dir) = output_dir {
+            mount_list.push(Mount {
+                target: Some("/output".to_string()),
+                source: Some(dir.to_string()),
+                typ: Some(MountType::BIND),
+                read_only: Some(false),
+                ..Default::default()
+            });
+        }
+        let mounts = if mount_list.is_empty() { None } else { Some(mount_list) };
         let host_config = HostConfig {
             memory: Some(mem_bytes),
             nano_cpus: Some(nano_cpus),
@@ -283,7 +298,7 @@ impl WarmPool {
     async fn create_idle(&self, image: &str) -> Result<String> {
         let t0 = std::time::Instant::now();
         let id = self
-            .create_one(image, self.mem_bytes, self.nano_cpus, /*isolated=*/ false, None)
+            .create_one(image, self.mem_bytes, self.nano_cpus, /*isolated=*/ false, None, None)
             .await?;
         metrics::counter!("dokan_pool_containers_created_total").increment(1);
         metrics::histogram!("dokan_pool_create_seconds").record(t0.elapsed().as_secs_f64());

@@ -214,6 +214,13 @@ pub struct RunArgs {
     /// shas enter the cache key + receipt, so the run stays a pure function of its inputs.
     /// Dest names must be plain filenames (no "/" or "..").
     pub files: Option<std::collections::HashMap<String, String>>,
+    /// Output files (opt-in): when true, a writable /output is mounted in the container; after
+    /// exec dokan captures every file the job wrote there as a content-addressed blob and
+    /// records output_blobs = { "<relative-name>": "<sha>" } on the run (surfaced by wait_for /
+    /// read_logs, downloadable via download_blob, and folded into the receipt). Default false —
+    /// leaving it off keeps the run on the fast warm path. true forces the one-off container
+    /// path (like input files), so use it only when a job emits artifacts.
+    pub capture_output: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -700,7 +707,7 @@ impl Dokan {
         }
     }
 
-    #[tool(description = "Trigger a script run. Returns run_id immediately; never blocks. Poll with read_logs or wait_for. agent_id is REQUIRED: it tags provenance, selects the job's scoped secrets (global + this agent's), and meters your concurrency/compute quota — it is unauthenticated provenance, NOT an isolation/auth boundary (see SECURITY.md). INPUT FILES: pass files={\"<name>\": \"<handle>\"} (handles from upload_blob) to materialize each file READ-ONLY at /input/<name> in the container — the way to feed a job a real document (a PDF, dataset, .md). The blob shas enter the cache key + receipt, so the run stays deterministic. Unknown handle → loud error, no run created.")]
+    #[tool(description = "Trigger a script run. Returns run_id immediately; never blocks. Poll with read_logs or wait_for. agent_id is REQUIRED: it tags provenance, selects the job's scoped secrets (global + this agent's), and meters your concurrency/compute quota — it is unauthenticated provenance, NOT an isolation/auth boundary (see SECURITY.md). INPUT FILES: pass files={\"<name>\": \"<handle>\"} (handles from upload_blob) to materialize each file READ-ONLY at /input/<name> in the container — the way to feed a job a real document (a PDF, dataset, .md). The blob shas enter the cache key + receipt, so the run stays deterministic. Unknown handle → loud error, no run created. OUTPUT FILES: set capture_output=true to mount a writable /output — dokan captures every file the job writes there as a content-addressed blob and returns output_blobs={\"<name>\": \"<sha>\"} (on wait_for/read_logs, downloadable via download_blob, folded into the receipt). Opt-in (default off keeps the fast warm path).")]
     async fn run_script(
         &self,
         Parameters(a): Parameters<RunArgs>,
@@ -799,7 +806,7 @@ impl Dokan {
         // Enqueue only — a worker claims it from the queue (FOR UPDATE SKIP LOCKED).
         let run_id = self
             .db
-            .insert_run_with_blobs(a.script_id, &input, Some(aid), input_blobs.as_ref())
+            .insert_run_with_blobs(a.script_id, &input, Some(aid), input_blobs.as_ref(), a.capture_output.unwrap_or(false))
             .await
             .map_err(internal)?;
         if let Some(key) = &cache_key {
@@ -850,6 +857,11 @@ impl Dokan {
         if let Some(r) = self.db.run_result(a.run_id).await.ok().flatten() {
             out["result"] = r;
         }
+        // Captured output files ({name: sha}), if the run opted into capture_output — each sha is
+        // downloadable via download_blob.
+        if let Some(ob) = self.db.run_output_blobs(a.run_id).await.ok().flatten() {
+            out["output_blobs"] = ob;
+        }
         // Latest progress line (live status of a long run), if the job emitted one.
         if let Some(p) = self.db.run_progress(a.run_id).await.ok().flatten() {
             out["progress"] = json!(p);
@@ -896,6 +908,10 @@ impl Dokan {
         });
         if let Some(r) = self.db.run_result(a.run_id).await.ok().flatten() {
             out["result"] = r;
+        }
+        // Captured output files ({name: sha}) — each sha is downloadable via download_blob.
+        if let Some(ob) = self.db.run_output_blobs(a.run_id).await.ok().flatten() {
+            out["output_blobs"] = ob;
         }
         if let Some(p) = self.db.run_progress(a.run_id).await.ok().flatten() {
             out["progress"] = json!(p);
@@ -1138,7 +1154,7 @@ impl Dokan {
             return ok(json!({"error": "no_receipt", "run_id": a.run_id}));
         };
         // Recover the snapshotted input + input-blobs + script id from the original run row.
-        let Some((script_id, input, input_blobs, agent_id)) =
+        let Some((script_id, input, input_blobs, agent_id, capture_output)) =
             self.db.run_reproduce_inputs(a.run_id).await.map_err(internal)?
         else {
             return ok(json!({"error": "run_not_found", "run_id": a.run_id}));
@@ -1187,7 +1203,7 @@ impl Dokan {
         // logic is duplicated.
         let new_run_id = self
             .db
-            .insert_run_with_blobs(script_id, &input, agent_id.as_deref(), input_blobs.as_ref())
+            .insert_run_with_blobs(script_id, &input, agent_id.as_deref(), input_blobs.as_ref(), capture_output)
             .await
             .map_err(internal)?;
         let mut out = json!({
