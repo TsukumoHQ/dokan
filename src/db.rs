@@ -524,6 +524,29 @@ impl Db {
             .flatten())
     }
 
+    /// Recover the inputs needed to re-run a prior run: its script id, the input JSON, the
+    /// content-addressed input-blob map, and the triggering agent id. The source itself is
+    /// NOT snapshotted on the run (claim_run reads it live from `scripts`), so a reproduce
+    /// must re-check the script's current source hash against the receipt. None if no such run.
+    pub async fn run_reproduce_inputs(
+        &self,
+        id: i64,
+    ) -> Result<Option<(i64, serde_json::Value, Option<serde_json::Value>, Option<String>)>> {
+        let row = sqlx::query("SELECT script_id, input, input_blobs, agent_id FROM runs WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| {
+            (
+                r.get("script_id"),
+                r.get::<Option<serde_json::Value>, _>("input")
+                    .unwrap_or(serde_json::json!({})),
+                r.get::<Option<serde_json::Value>, _>("input_blobs"),
+                r.get("agent_id"),
+            )
+        }))
+    }
+
     // ---- runs ----
 
     pub async fn insert_run(
