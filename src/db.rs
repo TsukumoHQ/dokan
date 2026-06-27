@@ -505,7 +505,7 @@ impl Db {
         Ok(version)
     }
 
-    /// Store a run's signed reproducibility receipt.
+    /// Store a run's tamper-evident reproducibility receipt.
     pub async fn set_run_receipt(&self, id: i64, receipt: &serde_json::Value) -> Result<()> {
         sqlx::query("UPDATE runs SET receipt = $2 WHERE id = $1")
             .bind(id)

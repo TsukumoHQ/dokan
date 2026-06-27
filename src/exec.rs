@@ -127,7 +127,7 @@ impl Executor {
         self.pool.sweep_orphans().await
     }
 
-    /// Build the signed receipt for a finished run.
+    /// Build the tamper-evident (HMAC) receipt for a finished run.
     async fn build_receipt(
         &self,
         db: &Db,
@@ -154,7 +154,7 @@ impl Executor {
         // (source, input, image, secrets, input-blobs) — portable to any executor that can
         // fetch those blobs by handle.
         let blobs_canon = canonical_input_blobs(input_blobs);
-        // The signed payload is a canonical, order-stable string of the binding.
+        // The HMAC'd payload is a canonical, order-stable string of the binding.
         let payload = format!(
             "v1|{digest}|{}|{}|{secrets_gen}|{output_hash}|{exit_code}|{network}|{blobs_canon}",
             sha256_hex(source.as_bytes()),
@@ -402,8 +402,9 @@ impl Executor {
         let status = if exit_code == 0 { "succeeded" } else { "failed" };
         db.finish_run(run_id, status, Some(exit_code as i32), None)
             .await?;
-        // Signed reproducibility receipt: binds (image digest, source, input, secrets gen) to
-        // (output, exit). Sound proof for network=false runs; advisory for networked ones.
+        // Tamper-evident reproducibility receipt: binds (image digest, source, input, secrets gen)
+        // to (output, exit) under a keyed HMAC. Sound check for network=false runs; advisory for
+        // networked ones.
         let receipt = self
             .build_receipt(db, image, source, input, &result, exit_code, network, input_blobs)
             .await;
@@ -427,7 +428,7 @@ impl Executor {
 }
 
 /// Canonical, order-stable "name:sha,name:sha" rendering of a run's input-blob map — folded
-/// into the receipt's signed payload. Same canonicalization the cache key uses, so the two
+/// into the receipt's HMAC'd payload. Same canonicalization the cache key uses, so the two
 /// agree on what set of files a run declared. None/empty → "".
 fn canonical_input_blobs(input_blobs: Option<&serde_json::Value>) -> String {
     crate::mcp::canonical_input_blobs(input_blobs)
