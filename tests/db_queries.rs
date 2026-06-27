@@ -242,7 +242,11 @@ async fn insert_flow_run_idempotent_collapses_and_builds_steps_once() -> anyhow:
     let db = Db::connect(&db_url()).await?;
     db.migrate().await?;
 
-    let spec = serde_json::json!({"steps": [{"id": "a", "script_id": 0, "input": {}}]});
+    // A real script id — flow_steps.script_id has an FK to scripts(id).
+    let (script_id, _v) = db
+        .insert_script("idem-flow-step", "bash", "echo hi", None, None, true, None, None, false, None)
+        .await?;
+    let spec = serde_json::json!({"steps": [{"id": "a", "script_id": script_id, "input": {}}]});
     let flow_id: i64 = sqlx::query_scalar("INSERT INTO flows (name, spec) VALUES ($1, $2) RETURNING id")
         .bind(format!("idem-flow-{}", dokan::crypto::random_token()))
         .bind(&spec)
