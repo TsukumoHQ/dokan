@@ -15,14 +15,35 @@ pub struct Signer {
 }
 
 impl Signer {
-    /// Key from `DOKAN_RECEIPT_KEY`; if unset, a clearly-flagged dev key (don't trust those
-    /// receipts across hosts).
+    /// Key from `DOKAN_RECEIPT_KEY`; if unset, a clearly-flagged PUBLIC dev key (don't trust
+    /// those receipts — they are forgeable). Reaching the fallback in the daemon implies the
+    /// `DOKAN_DEV_INSECURE` escape hatch is set; `preflight_security` refuses to boot otherwise.
     pub fn from_env() -> Self {
-        let key = std::env::var("DOKAN_RECEIPT_KEY").unwrap_or_else(|_| {
-            tracing::warn!("DOKAN_RECEIPT_KEY unset — receipts HMAC'd with a non-secret dev key; tamper-evidence is void");
-            "dokan-dev-receipt-key".to_string()
-        });
+        let key = match std::env::var("DOKAN_RECEIPT_KEY") {
+            Ok(k) if !k.is_empty() => k,
+            _ => {
+                if crate::crypto::dev_insecure() {
+                    tracing::warn!(
+                        "DOKAN_RECEIPT_KEY unset and DOKAN_DEV_INSECURE set — receipts HMAC'd with \
+                         a PUBLIC dev key; they are NOT tamper-evident (anyone can forge them). \
+                         Dev/test only; never run this in production."
+                    );
+                } else {
+                    tracing::error!(
+                        "DOKAN_RECEIPT_KEY unset — receipts would use a public dev key and be \
+                         forgeable. Set DOKAN_RECEIPT_KEY, or DOKAN_DEV_INSECURE=1 for local dev."
+                    );
+                }
+                "dokan-dev-receipt-key".to_string()
+            }
+        };
         Self { key: key.into_bytes() }
+    }
+
+    /// Whether a non-empty `DOKAN_RECEIPT_KEY` is configured (vs. the public dev fallback).
+    /// Used by the boot-time fail-closed preflight.
+    pub fn key_configured() -> bool {
+        std::env::var("DOKAN_RECEIPT_KEY").map(|k| !k.is_empty()).unwrap_or(false)
     }
 
     pub fn sign(&self, payload: &str) -> String {

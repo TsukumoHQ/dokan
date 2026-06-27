@@ -19,6 +19,10 @@ jobs:
       DATABASE_URL: postgres://dokan:dokan@127.0.0.1:5499/dokan
       # Deterministic receipt signing in CI (otherwise a random dev key is used).
       DOKAN_RECEIPT_KEY: ci-receipt-key
+      # GAP-4 fail-closed: the daemon refuses to boot without DOKAN_SECRET_KEY /
+      # DOKAN_RECEIPT_KEY. CI sets no DOKAN_SECRET_KEY, so opt into the insecure dev
+      # defaults explicitly here (the spawned test daemons inherit this job env).
+      DOKAN_DEV_INSECURE: "1"
       CARGO_TERM_COLOR: always
 
     services:
