@@ -1,8 +1,10 @@
-//! Signed reproducibility receipts. A receipt binds a run's inputs (image digest, source,
-//! input, secrets generation) to its output (result hash, exit) and HMAC-signs the lot, so
-//! an agent can PROVE what produced a result — and verify that a recalled run is sound,
-//! not a stale or tampered cache hit. Only meaningful for network-disabled (deterministic)
-//! scripts, where the output really is a pure function of the inputs.
+//! Tamper-evident reproducibility receipts. A receipt binds a run's inputs (image digest,
+//! source, input, secrets generation) to its output (result hash, exit) under a keyed HMAC,
+//! so anyone holding `DOKAN_RECEIPT_KEY` can DETECT tampering and verify that a recalled run
+//! is sound — not a stale or altered cache hit. The HMAC is symmetric: it is tamper-evidence
+//! for key-holders, NOT a third-party-verifiable signature (that needs an asymmetric scheme —
+//! on the roadmap). Only meaningful for network-disabled (deterministic) scripts, where the
+//! output really is a pure function of the inputs.
 
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
@@ -17,7 +19,7 @@ impl Signer {
     /// receipts across hosts).
     pub fn from_env() -> Self {
         let key = std::env::var("DOKAN_RECEIPT_KEY").unwrap_or_else(|_| {
-            tracing::warn!("DOKAN_RECEIPT_KEY unset — receipts signed with a non-secret dev key");
+            tracing::warn!("DOKAN_RECEIPT_KEY unset — receipts HMAC'd with a non-secret dev key; tamper-evidence is void");
             "dokan-dev-receipt-key".to_string()
         });
         Self { key: key.into_bytes() }

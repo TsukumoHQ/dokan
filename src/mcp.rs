@@ -1074,7 +1074,7 @@ impl Dokan {
         ok(json!({"name": a.name, "scope": scope, "status": "set"}))
     }
 
-    #[tool(description = "Fetch a run's signed reproducibility receipt: the image digest, source/input/output hashes, secrets generation, exit, and an HMAC signature. Proves what produced the result; for a network=false (deterministic) run it certifies a recall is sound.")]
+    #[tool(description = "Fetch a run's tamper-evident reproducibility receipt: the image digest, source/input/output hashes, secrets generation, exit, and a keyed HMAC tag (alg+sig). The HMAC lets a DOKAN_RECEIPT_KEY holder detect tampering — it is NOT a third-party-verifiable signature. For a network=false (deterministic) run it attests a recall is sound.")]
     async fn get_receipt(
         &self,
         Parameters(a): Parameters<GetReceiptArgs>,

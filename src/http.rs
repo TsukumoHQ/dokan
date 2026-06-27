@@ -837,7 +837,7 @@ function loadReceipt(){
     if(r.status===404) return null; if(!r.ok) throw 0; return r.json();
   }).then(rc=>{
     el.dataset.loaded='1';
-    if(!rc){ el.innerHTML='<div class=empty><div class=big>No receipt</div><div>A signed receipt is written when the run finishes.</div></div>'; return; }
+    if(!rc){ el.innerHTML='<div class=empty><div class=big>No receipt</div><div>A tamper-evident receipt is written when the run finishes.</div></div>'; return; }
     const det=rc.deterministic;
     const badge=`<span class="detbadge ${det?'det':'adv'}">${det?'deterministic':'advisory'}</span>`;
     let h='<div class=rcpt>';
@@ -848,7 +848,7 @@ function loadReceipt(){
     h+=rrow('input sha256', shaCell(rc.input_sha256));
     h+=rrow('output sha256', shaCell(rc.output_sha256));
     h+=rrow('secrets generation', `<span class=tnum>${rc.secrets_generation??'—'}</span>`);
-    h+=rrow('signature ('+esc(rc.alg||'?')+')', shaCell(rc.sig));
+    h+=rrow('hmac ('+esc(rc.alg||'?')+')', shaCell(rc.sig));
     const ib=rc.input_blobs; const keys=ib&&typeof ib==='object'?Object.keys(ib):[];
     if(keys.length){
       let inner=keys.map(k=>`<div style="margin:.15rem 0">${esc(k)} → <span style="color:var(--fg-dim)">${esc(trunc(ib[k],16))}</span></div>`).join('');
@@ -1097,7 +1097,7 @@ async fn list_blobs(State(s): State<AppState>, Query(q): Query<ListQ>) -> impl I
     Json(json!({"blobs": blobs}))
 }
 
-/// A run's signed reproducibility receipt (404 if none yet — pending/running, or a run
+/// A run's tamper-evident reproducibility receipt (404 if none yet — pending/running, or a run
 /// whose receipt wasn't captured). Rendered in the drawer's Receipt tab.
 async fn run_receipt(State(s): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     match s.db.run_receipt(id).await.ok().flatten() {
