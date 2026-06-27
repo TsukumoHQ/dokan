@@ -59,31 +59,6 @@ impl Concurrency {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn concurrency_grows_clamps_and_shrinks() {
-        let c = Concurrency::new(2, 8);
-        assert_eq!(c.current(), 2);
-        assert_eq!(c.set(6), 6, "grow");
-        assert_eq!(c.set(100), 8, "clamp to max");
-        // Hold all 8 permits.
-        let mut held = Vec::new();
-        for _ in 0..8 {
-            held.push(c.acquire().await.unwrap());
-        }
-        // Shrink while all are in use: nothing is available to forget, so size is unchanged
-        // (in-use permits fall away only as they release).
-        assert_eq!(c.set(3), 8, "shrink is best-effort under full load");
-        // Release them, then shrink for real.
-        held.clear();
-        assert_eq!(c.set(3), 3, "forgets now-available permits");
-        assert_eq!(c.set(0), 1, "clamp to floor 1");
-    }
-}
-
 /// Autoscaler bounds + responsiveness.
 pub struct ScaleCfg {
     pub conc_floor: usize,
@@ -139,4 +114,29 @@ pub fn spawn_autoscaler(db: Db, exec: Arc<Executor>, conc: Arc<Concurrency>, cfg
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn concurrency_grows_clamps_and_shrinks() {
+        let c = Concurrency::new(2, 8);
+        assert_eq!(c.current(), 2);
+        assert_eq!(c.set(6), 6, "grow");
+        assert_eq!(c.set(100), 8, "clamp to max");
+        // Hold all 8 permits.
+        let mut held = Vec::new();
+        for _ in 0..8 {
+            held.push(c.acquire().await.unwrap());
+        }
+        // Shrink while all are in use: nothing is available to forget, so size is unchanged
+        // (in-use permits fall away only as they release).
+        assert_eq!(c.set(3), 8, "shrink is best-effort under full load");
+        // Release them, then shrink for real.
+        held.clear();
+        assert_eq!(c.set(3), 3, "forgets now-available permits");
+        assert_eq!(c.set(0), 1, "clamp to floor 1");
+    }
 }

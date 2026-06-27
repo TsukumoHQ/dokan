@@ -1269,11 +1269,10 @@ impl Db {
         let key = agent_id.map(String::from);
         {
             let c = self.secrets_cache.lock().unwrap();
-            if c.generation == secrets_gen {
-                if let Some(v) = c.by_agent.get(&key) {
+            if c.generation == secrets_gen
+                && let Some(v) = c.by_agent.get(&key) {
                     return Ok(v.clone());
                 }
-            }
         }
         let merged = self.load_secrets_for(agent_id).await?;
         let mut c = self.secrets_cache.lock().unwrap();

@@ -66,13 +66,11 @@ fn canonical_json(v: &serde_json::Value) -> String {
 /// (or anything that doesn't parse to a container) passes through untouched, so a
 /// legitimately-stringy input is never mangled.
 fn destringify(v: serde_json::Value) -> serde_json::Value {
-    if let serde_json::Value::String(s) = &v {
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
-            if parsed.is_object() || parsed.is_array() {
+    if let serde_json::Value::String(s) = &v
+        && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s)
+            && (parsed.is_object() || parsed.is_array()) {
                 return parsed;
             }
-        }
-    }
     v
 }
 
@@ -481,8 +479,8 @@ impl Dokan {
         // Idempotent re-provision: with upsert, reuse the script of the same name. No-op
         // when the source is unchanged (a respawned agent re-uploading the same thing),
         // update + version bump when it changed — never a duplicate row.
-        if a.upsert.unwrap_or(false) {
-            if let Some((id, source, version)) =
+        if a.upsert.unwrap_or(false)
+            && let Some((id, source, version)) =
                 self.db.find_script_by_name(&a.name).await.map_err(internal)?
             {
                 if source == a.source {
@@ -527,7 +525,6 @@ impl Dokan {
                     .map_err(internal)?;
                 return ok(json!({"script_id": id, "version": version, "status": "updated"}));
             }
-        }
         // Captured before insert so the duplicate-name warning can compare against it.
         let prior = self.db.find_script_by_name(&a.name).await.ok().flatten();
         let embedding = self.embed_script(&a.name, &a.description).await;

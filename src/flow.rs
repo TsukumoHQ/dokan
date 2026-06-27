@@ -175,14 +175,13 @@ impl FlowEngine {
                 }
                 let deps = build_deps(&step.depends_on, &outputs);
                 // `when` gate: false → skip.
-                if let Some(cond) = &step.when_cond {
-                    if !eval_when(cond, &input, &deps) {
+                if let Some(cond) = &step.when_cond
+                    && !eval_when(cond, &input, &deps) {
                         self.db.mark_step_skipped(flow_run_id, &step.step_id).await.ok();
                         metrics::counter!("dokan_flow_steps_finished_total", "status" => "skipped").increment(1);
                         progressed = true;
                         continue;
                     }
-                }
                 // `map` fan-out: expand into children, parent becomes `expanded`.
                 if let Some(mref) = step.map_ref.clone() {
                     self.expand(flow_run_id, &step, &input, &deps, &mref).await;
@@ -281,7 +280,7 @@ impl FlowEngine {
             .iter()
             .filter(|s| s.status == "succeeded" && !s.compensated && s.compensate.is_some())
             .collect();
-        to_comp.sort_by(|a, b| b.finished_at.cmp(&a.finished_at));
+        to_comp.sort_by_key(|s| std::cmp::Reverse(s.finished_at));
 
         for step in to_comp {
             let comp_id = step.compensate.unwrap();
@@ -519,18 +518,16 @@ fn resolve_ref(r: &str, flow_input: &serde_json::Value, deps: &serde_json::Value
         _ => return None,
     };
     for p in parts {
-        if let serde_json::Value::String(s) = &cur {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
+        if let serde_json::Value::String(s) = &cur
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
                 cur = v;
             }
-        }
         cur = cur.get(p).cloned()?;
     }
-    if let serde_json::Value::String(s) = &cur {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
+    if let serde_json::Value::String(s) = &cur
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
             return Some(v);
         }
-    }
     Some(cur)
 }
 
@@ -607,26 +604,22 @@ pub fn validate_spec(spec: &serde_json::Value) -> Result<(), String> {
         if st.get("script_id").and_then(|v| v.as_i64()).is_none() {
             return Err(format!("step {id} missing script_id"));
         }
-        if let Some(c) = st.get("compensate") {
-            if !c.is_i64() {
+        if let Some(c) = st.get("compensate")
+            && !c.is_i64() {
                 return Err(format!("step {id} compensate must be a script_id (int)"));
             }
-        }
-        if let Some(m) = st.get("map") {
-            if !m.is_string() {
+        if let Some(m) = st.get("map")
+            && !m.is_string() {
                 return Err(format!("step {id} map must be a string ref"));
             }
-        }
-        if let Some(r) = st.get("retries") {
-            if r.as_u64().is_none() {
+        if let Some(r) = st.get("retries")
+            && r.as_u64().is_none() {
                 return Err(format!("step {id} retries must be a non-negative int"));
             }
-        }
-        if let Some(c) = st.get("cache") {
-            if !c.is_boolean() {
+        if let Some(c) = st.get("cache")
+            && !c.is_boolean() {
                 return Err(format!("step {id} cache must be a boolean"));
             }
-        }
         if let Some(w) = st.get("when") {
             if w.get("ref").and_then(|v| v.as_str()).is_none() {
                 return Err(format!("step {id} when needs a string ref"));
@@ -670,11 +663,10 @@ fn has_cycle(edges: &HashMap<String, Vec<String>>) -> bool {
             for d in deps {
                 match state.get(d.as_str()).copied().unwrap_or(0) {
                     1 => return true,
-                    0 => {
-                        if dfs(d, edges, state) {
+                    0
+                        if dfs(d, edges, state) => {
                             return true;
                         }
-                    }
                     _ => {}
                 }
             }

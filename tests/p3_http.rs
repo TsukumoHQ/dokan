@@ -67,12 +67,11 @@ async fn operator_surface_and_relay() -> anyhow::Result<()> {
     // Wait for boot (authed /metrics).
     let mut up = false;
     for _ in 0..50 {
-        if let Ok(r) = cli.get(format!("{base}/metrics")).header("authorization", &auth).send().await {
-            if r.status().is_success() {
+        if let Ok(r) = cli.get(format!("{base}/metrics")).header("authorization", &auth).send().await
+            && r.status().is_success() {
                 up = true;
                 break;
             }
-        }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     assert!(up, "dokan http did not come up");
@@ -110,12 +109,11 @@ async fn operator_surface_and_relay() -> anyhow::Result<()> {
             .await?
             .json()
             .await?;
-        if let Some(arr) = body["recent"].as_array() {
-            if arr.iter().any(|r| r["run_id"].as_i64() == Some(run_id) && r["status"] == "succeeded") {
+        if let Some(arr) = body["recent"].as_array()
+            && arr.iter().any(|r| r["run_id"].as_i64() == Some(run_id) && r["status"] == "succeeded") {
                 succeeded = true;
                 break;
             }
-        }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     assert!(succeeded, "triggered run reached succeeded");
@@ -202,9 +200,8 @@ async fn per_script_mem_override() -> anyhow::Result<()> {
     let auth = format!("Bearer {token}");
     let mut up = false;
     for _ in 0..50 {
-        if let Ok(r) = cli.get(format!("{base}/metrics")).header("authorization", &auth).send().await {
-            if r.status().is_success() { up = true; break; }
-        }
+        if let Ok(r) = cli.get(format!("{base}/metrics")).header("authorization", &auth).send().await
+            && r.status().is_success() { up = true; break; }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     assert!(up, "dokan http did not come up");
@@ -279,9 +276,8 @@ async fn webhook_fires_without_bearer() -> anyhow::Result<()> {
     let auth = format!("Bearer {token}");
     let mut up = false;
     for _ in 0..50 {
-        if let Ok(r) = cli.get(format!("{base}/metrics")).header("authorization", &auth).send().await {
-            if r.status().is_success() { up = true; break; }
-        }
+        if let Ok(r) = cli.get(format!("{base}/metrics")).header("authorization", &auth).send().await
+            && r.status().is_success() { up = true; break; }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     assert!(up, "dokan http did not come up");
@@ -310,7 +306,7 @@ async fn webhook_fires_without_bearer() -> anyhow::Result<()> {
         .await?;
     assert_eq!(resp.status(), 202, "webhook accepted without bearer");
     let body: serde_json::Value = resp.json().await?;
-    let run_id = body["run_id"].as_i64().expect(&body.to_string());
+    let run_id = body["run_id"].as_i64().unwrap_or_else(|| panic!("{}", body.to_string()));
 
     // An unknown token is 404.
     let miss = cli.post(format!("{base}/hook/nope")).json(&json!({})).send().await?;
@@ -368,9 +364,8 @@ async fn webhook_flow_target_dedups() -> anyhow::Result<()> {
     let cli = reqwest::Client::new();
     let mut up = false;
     for _ in 0..50 {
-        if let Ok(r) = cli.get(format!("{base}/metrics")).send().await {
-            if r.status().is_success() { up = true; break; }
-        }
+        if let Ok(r) = cli.get(format!("{base}/metrics")).send().await
+            && r.status().is_success() { up = true; break; }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     assert!(up, "dokan http did not come up");
@@ -399,7 +394,7 @@ async fn webhook_flow_target_dedups() -> anyhow::Result<()> {
         .await?;
     assert_eq!(first.status(), 202, "first flow webhook accepted");
     let first_body: serde_json::Value = first.json().await?;
-    let flow_run_id = first_body["flow_run_id"].as_i64().expect(&first_body.to_string());
+    let flow_run_id = first_body["flow_run_id"].as_i64().unwrap_or_else(|| panic!("{}", first_body.to_string()));
 
     // Identical redelivery -> 200 + idempotent + the SAME flow_run_id, no second flow_run.
     let again = cli
