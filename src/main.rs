@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 // Modules now live in the `dokan` library crate (see src/lib.rs); the binary drives them.
@@ -18,6 +18,11 @@ use dokan::{crypto, embed, exec, flow, http, receipt, scale};
 #[derive(Parser, Debug)]
 #[command(name = "dokan", version, about = "Agent-operated script runtime (MCP-first)")]
 struct Cli {
+    /// Optional subcommand. With NO subcommand, dokan boots the daemon (default behavior) — so
+    /// `dokan --transport http --addr ...` is unchanged, which is how launchd invokes it.
+    #[command(subcommand)]
+    command: Option<Commands>,
+
     /// Transport: `stdio` for a local agent, `http` for remote agents.
     #[arg(long, default_value = "http", env = "DOKAN_TRANSPORT")]
     transport: String,
@@ -88,6 +93,19 @@ struct Cli {
     pending_timeout_secs: f64,
 }
 
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Self-update from the latest TsukumoHQ/dokan GitHub release.
+    Update {
+        /// Bypass the dev-build and no-downgrade guards.
+        #[arg(long)]
+        force: bool,
+        /// Report whether an update is available and exit; do not install.
+        #[arg(long)]
+        check: bool,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -97,6 +115,14 @@ async fn main() -> Result<()> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "dokan=info".into()))
         .with_writer(std::io::stderr)
         .init();
+
+    // Subcommand routing. `update` runs the self-updater and EXITS before any daemon work or the
+    // security preflight — it must work on a binary that isn't configured to serve. With no
+    // subcommand we fall through to the daemon path, byte-for-byte unchanged.
+    if let Some(Commands::Update { force, check }) = cli.command {
+        let code = dokan::update::run(force, check).await;
+        std::process::exit(code);
+    }
 
     // Fail closed on missing crypto keys (GAP-4). Refuse to boot insecurely unless the
     // operator explicitly opts in with DOKAN_DEV_INSECURE=1. Runs before any DB/Docker work

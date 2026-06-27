@@ -15,4 +15,5 @@ pub mod mcp;
 pub mod pool;
 pub mod receipt;
 pub mod scale;
+pub mod update;
 pub mod worker;
