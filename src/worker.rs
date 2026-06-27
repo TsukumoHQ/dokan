@@ -102,8 +102,7 @@ impl Worker {
                             // NULL exit_code (couldn't execute / timeout) is transient.
                             if let Ok(Some((status, exit_code))) =
                                 db.run_outcome(job.run_id).await
-                            {
-                                if status == "failed"
+                                && status == "failed"
                                     && exit_code.is_none()
                                     && attempt < MAX_ATTEMPTS
                                 {
@@ -111,7 +110,6 @@ impl Worker {
                                     metrics::counter!("dokan_runs_retried_total").increment(1);
                                     let _ = db.requeue(job.run_id).await;
                                 }
-                            }
                         });
                     }
                     Ok(None) => {

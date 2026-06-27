@@ -60,14 +60,14 @@ jobs:
           docker pull python:3.12-slim
           docker pull node:22-slim
 
-      # --- informational (repo carries pre-existing fmt/clippy debt; not gated yet) ---
+      # rustfmt stays informational for now (repo carries pre-existing fmt churn).
       - name: rustfmt (informational)
         run: cargo fmt --all --check
         continue-on-error: true
 
-      - name: clippy (informational)
-        run: cargo clippy --all-targets
-        continue-on-error: true
+      # clippy is now GATED — the pre-existing debt was cleared, so keep it clean.
+      - name: clippy (gated)
+        run: cargo clippy --all-targets -- -D warnings
 
       # --- hard gates ---
       - name: Build

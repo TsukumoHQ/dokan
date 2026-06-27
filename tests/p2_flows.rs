@@ -65,7 +65,7 @@ async fn flow_dag_runs_in_order_with_deps() -> anyhow::Result<()> {
         }),
     )
     .await;
-    let flow_id = flow["flow_id"].as_i64().expect(&flow.to_string());
+    let flow_id = flow["flow_id"].as_i64().unwrap_or_else(|| panic!("{}", flow.to_string()));
 
     let fr = call(&c, "run_flow", json!({"flow_id": flow_id, "input": {"src":"x"}})).await;
     let flow_run_id = fr["flow_run_id"].as_i64().unwrap();
@@ -139,7 +139,7 @@ async fn flow_when_branch_and_skip_propagation() -> anyhow::Result<()> {
         }),
     )
     .await;
-    let flow_id = flow["flow_id"].as_i64().expect(&flow.to_string());
+    let flow_id = flow["flow_id"].as_i64().unwrap_or_else(|| panic!("{}", flow.to_string()));
     let fr = call(&c, "run_flow", json!({"flow_id": flow_id})).await;
     let last = poll_flow(&c, fr["flow_run_id"].as_i64().unwrap()).await;
     eprintln!("branch -> {last}");
@@ -188,7 +188,7 @@ async fn flow_map_fanout() -> anyhow::Result<()> {
         }),
     )
     .await;
-    let flow_id = flow["flow_id"].as_i64().expect(&flow.to_string());
+    let flow_id = flow["flow_id"].as_i64().unwrap_or_else(|| panic!("{}", flow.to_string()));
     let fr = call(&c, "run_flow", json!({"flow_id": flow_id})).await;
     let last = poll_flow(&c, fr["flow_run_id"].as_i64().unwrap()).await;
     eprintln!("fanout -> {last}");
@@ -251,7 +251,7 @@ async fn flow_saga_compensation() -> anyhow::Result<()> {
         }),
     )
     .await;
-    let flow_id = flow["flow_id"].as_i64().expect(&flow.to_string());
+    let flow_id = flow["flow_id"].as_i64().unwrap_or_else(|| panic!("{}", flow.to_string()));
     let fr = call(&c, "run_flow", json!({"flow_id": flow_id})).await;
     let last = poll_flow(&c, fr["flow_run_id"].as_i64().unwrap()).await;
     eprintln!("saga -> {last}");
@@ -291,7 +291,7 @@ async fn flow_step_cache_recall() -> anyhow::Result<()> {
         }),
     )
     .await;
-    let flow_id = flow["flow_id"].as_i64().expect(&flow.to_string());
+    let flow_id = flow["flow_id"].as_i64().unwrap_or_else(|| panic!("{}", flow.to_string()));
 
     // First run: cache miss → executes, tags the run with its cache key.
     let fr1 = call(&c, "run_flow", json!({"flow_id": flow_id})).await;
@@ -367,7 +367,7 @@ async fn flagship_demo_flow() -> anyhow::Result<()> {
             {"id":"alert","script_id": alert, "depends_on":["summarize"], "when":{"ref":"deps.summarize","op":"eq","value":"FLAGGED"}}
         ]}
     })).await;
-    let flow_id = flow["flow_id"].as_i64().expect(&flow.to_string());
+    let flow_id = flow["flow_id"].as_i64().unwrap_or_else(|| panic!("{}", flow.to_string()));
 
     let fr = call(&c, "run_flow", json!({"flow_id": flow_id, "input": {"count": 5}})).await;
     let last = poll_flow(&c, fr["flow_run_id"].as_i64().unwrap()).await;

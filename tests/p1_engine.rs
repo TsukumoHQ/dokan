@@ -563,7 +563,7 @@ async fn cron_enqueues_runs() -> anyhow::Result<()> {
         json!({"script_id": sid, "cron": "* * * * * *"}),
     )
     .await?;
-    let schedule_id = s["schedule_id"].as_i64().expect(&format!("scheduled: {s}"));
+    let schedule_id = s["schedule_id"].as_i64().unwrap_or_else(|| panic!("scheduled: {s}"));
 
     // Let it tick a few times, then confirm a run for this script materialized.
     tokio::time::sleep(std::time::Duration::from_secs(4)).await;

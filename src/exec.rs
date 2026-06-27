@@ -128,6 +128,7 @@ impl Executor {
     }
 
     /// Build the tamper-evident (HMAC) receipt for a finished run.
+    #[allow(clippy::too_many_arguments)]
     async fn build_receipt(
         &self,
         db: &Db,
@@ -312,11 +313,10 @@ impl Executor {
         // Best-effort cleanup of the per-run materialization dir (both /input and /output live
         // under ~/.dokan/runs/<id>/). The bytes live durably in the CAS `blobs` table; this is
         // just the ephemeral on-host copy. Either dir shares the same run-root parent.
-        if let Some(dir) = input_dir.as_deref().or(output_dir.as_deref()) {
-            if let Some(run_root) = std::path::Path::new(dir).parent() {
+        if let Some(dir) = input_dir.as_deref().or(output_dir.as_deref())
+            && let Some(run_root) = std::path::Path::new(dir).parent() {
                 let _ = tokio::fs::remove_dir_all(run_root).await;
             }
-        }
         result
     }
 
