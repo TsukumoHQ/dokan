@@ -63,7 +63,7 @@ async fn wedge_upload_run_read() -> anyhow::Result<()> {
         &client
             .call_tool(
                 CallToolRequestParams::new("run_script")
-                    .with_arguments(obj(json!({ "script_id": script_id, "input": {"n": 42} }))),
+                    .with_arguments(obj(json!({ "script_id": script_id, "input": {"n": 42}, "agent_id": "test" }))),
             )
             .await?,
     );

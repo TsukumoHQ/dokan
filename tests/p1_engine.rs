@@ -73,7 +73,7 @@ async fn queue_runs_many_concurrently() -> anyhow::Result<()> {
 
     let mut ids = vec![];
     for _ in 0..6 {
-        let r = call(&c, "run_script", json!({"script_id": sid})).await?;
+        let r = call(&c, "run_script", json!({"script_id": sid, "agent_id": "test"})).await?;
         ids.push(r["run_id"].as_i64().unwrap());
     }
     for id in &ids {
@@ -88,7 +88,7 @@ async fn queue_runs_many_concurrently() -> anyhow::Result<()> {
 async fn unroutable_runtime_stays_pending() -> anyhow::Result<()> {
     let c = spawn().await?;
     let sid = upload(&c, "ruby", "puts 'hi'\n").await;
-    let run = call(&c, "run_script", json!({"script_id": sid})).await?;
+    let run = call(&c, "run_script", json!({"script_id": sid, "agent_id": "test"})).await?;
     let run_id = run["run_id"].as_i64().unwrap();
     // No python/node/bash worker will touch a ruby job.
     let status = wait_status(&c, run_id, 4).await;
@@ -114,7 +114,7 @@ async fn logs_text(c: &RunningService<RoleClient, ()>, run_id: i64) -> String {
 async fn nonzero_exit_is_not_retried() -> anyhow::Result<()> {
     let c = spawn().await?;
     let sid = upload(&c, "bash", "echo VERDICT-LINE\nexit 2\n").await;
-    let run = call(&c, "run_script", json!({"script_id": sid})).await?;
+    let run = call(&c, "run_script", json!({"script_id": sid, "agent_id": "test"})).await?;
     let run_id = run["run_id"].as_i64().unwrap();
     assert_eq!(wait_status(&c, run_id, 60).await, "failed", "nonzero exit -> failed");
     // Give any (wrongly-scheduled) retry time to fire before counting the verdict.
@@ -148,7 +148,7 @@ async fn secret_injected_into_job_env() -> anyhow::Result<()> {
         "secret name listed (value never returned): {names}"
     );
     let sid = upload(&c, "bash", "echo KEY=$DOKAN_TEST_KEY\n").await;
-    let run = call(&c, "run_script", json!({"script_id": sid})).await?;
+    let run = call(&c, "run_script", json!({"script_id": sid, "agent_id": "test"})).await?;
     let run_id = run["run_id"].as_i64().unwrap();
     assert_eq!(wait_status(&c, run_id, 60).await, "succeeded", "ran");
     let text = logs_text(&c, run_id).await;
@@ -170,7 +170,7 @@ async fn stringified_object_input_is_not_double_encoded() -> anyhow::Result<()> 
     let run = call(
         &c,
         "run_script",
-        json!({"script_id": sid, "input": "{\"write\":true}"}),
+        json!({"script_id": sid, "input": "{\"write\":true}", "agent_id": "test"}),
     )
     .await?;
     let run_id = run["run_id"].as_i64().unwrap();
@@ -203,7 +203,7 @@ async fn progress_channel_sets_latest_and_is_not_logged() -> anyhow::Result<()> 
          echo '::dokan:result:: {\"done\":true}'\n",
     )
     .await;
-    let run = call(&c, "run_script", json!({"script_id": sid})).await?;
+    let run = call(&c, "run_script", json!({"script_id": sid, "agent_id": "test"})).await?;
     let run_id = run["run_id"].as_i64().unwrap();
     assert_eq!(wait_status(&c, run_id, 60).await, "succeeded", "ran");
     let r = call(&c, "read_logs", json!({"run_id": run_id, "after_cursor": 0, "limit": 500})).await?;
@@ -286,7 +286,7 @@ async fn structured_result_is_captured() -> anyhow::Result<()> {
         "echo working\necho '::dokan:result:: {\"alert\":true,\"n\":3}'\n",
     )
     .await;
-    let run = call(&c, "run_script", json!({"script_id": sid})).await?;
+    let run = call(&c, "run_script", json!({"script_id": sid, "agent_id": "test"})).await?;
     let run_id = run["run_id"].as_i64().unwrap();
     let w = call(&c, "wait_for", json!({"run_id": run_id, "timeout": 60})).await?;
     assert_eq!(w["status"], "succeeded", "ran: {w}");
@@ -306,7 +306,7 @@ async fn structured_result_is_captured() -> anyhow::Result<()> {
 async fn delete_script_cascades() -> anyhow::Result<()> {
     let c = spawn().await?;
     let sid = upload(&c, "bash", "echo bye\n").await;
-    let run = call(&c, "run_script", json!({"script_id": sid})).await?;
+    let run = call(&c, "run_script", json!({"script_id": sid, "agent_id": "test"})).await?;
     let run_id = run["run_id"].as_i64().unwrap();
     assert_eq!(wait_status(&c, run_id, 60).await, "succeeded", "ran");
     let d = call(&c, "delete_script", json!({"script_id": sid})).await?;
@@ -325,16 +325,16 @@ async fn run_or_recall_recalls_identical() -> anyhow::Result<()> {
     let c = spawn().await?;
     let sid = upload(&c, "bash", "echo '::dokan:result:: {\"v\":42}'\n").await;
     // First cached run executes.
-    let r1 = call(&c, "run_script", json!({"script_id": sid, "cache": true})).await?;
+    let r1 = call(&c, "run_script", json!({"script_id": sid, "cache": true, "agent_id": "test"})).await?;
     let run1 = r1["run_id"].as_i64().unwrap();
     assert_eq!(wait_status(&c, run1, 60).await, "succeeded", "first ran");
     // Identical cached run is recalled — same run_id, no new execution.
-    let r2 = call(&c, "run_script", json!({"script_id": sid, "cache": true})).await?;
+    let r2 = call(&c, "run_script", json!({"script_id": sid, "cache": true, "agent_id": "test"})).await?;
     assert_eq!(r2["status"], "recalled", "second recalled: {r2}");
     assert_eq!(r2["run_id"].as_i64().unwrap(), run1, "recalled the same run");
     assert_eq!(r2["result"]["v"], 42, "recalled result intact: {r2}");
     // A different input is a different key -> not recalled.
-    let r3 = call(&c, "run_script", json!({"script_id": sid, "cache": true, "input": {"x": 1}})).await?;
+    let r3 = call(&c, "run_script", json!({"script_id": sid, "cache": true, "input": {"x": 1}, "agent_id": "test"})).await?;
     assert_eq!(r3["status"], "pending", "different input executes fresh: {r3}");
     c.cancel().await?;
     Ok(())
@@ -385,7 +385,7 @@ async fn on_result_fires_target() -> anyhow::Result<()> {
     })).await?;
     assert_eq!(t["status"], "armed", "trigger armed: {t}");
 
-    let r = call(&c, "run_script", json!({"script_id": src})).await?;
+    let r = call(&c, "run_script", json!({"script_id": src, "agent_id": "test"})).await?;
     assert_eq!(wait_status(&c, r["run_id"].as_i64().unwrap(), 60).await, "succeeded", "source ran");
 
     // The trigger should enqueue a run of the target script.
@@ -419,7 +419,7 @@ async fn deterministic_network_off_receipt_and_recall() -> anyhow::Result<()> {
     let sid = call(&c, "upload_script",
         json!({"name": "det-probe", "runtime": "bash", "source": src, "network": false}))
         .await?["script_id"].as_i64().unwrap();
-    let r1 = call(&c, "run_script", json!({"script_id": sid, "cache": true})).await?;
+    let r1 = call(&c, "run_script", json!({"script_id": sid, "cache": true, "agent_id": "test"})).await?;
     let id1 = r1["run_id"].as_i64().unwrap();
     assert_eq!(wait_status(&c, id1, 60).await, "succeeded", "ran");
     // Network was disabled.
@@ -430,7 +430,7 @@ async fn deterministic_network_off_receipt_and_recall() -> anyhow::Result<()> {
     assert!(rec["sig"].as_str().map(|s| !s.is_empty()).unwrap_or(false), "signed: {rec}");
     assert!(rec["output_sha256"].as_str().is_some(), "binds output: {rec}");
     // Recall: identical inputs → recalled without re-running.
-    let r2 = call(&c, "run_script", json!({"script_id": sid, "cache": true})).await?;
+    let r2 = call(&c, "run_script", json!({"script_id": sid, "cache": true, "agent_id": "test"})).await?;
     assert_eq!(r2["status"], "recalled", "recalled: {r2}");
     assert_eq!(r2["run_id"].as_i64().unwrap(), id1, "same run recalled");
     c.cancel().await?;
@@ -442,13 +442,13 @@ async fn deterministic_network_off_receipt_and_recall() -> anyhow::Result<()> {
 async fn idempotency_key_dedups() -> anyhow::Result<()> {
     let c = spawn().await?;
     let sid = upload(&c, "bash", "echo hi\n").await;
-    let a = call(&c, "run_script", json!({"script_id": sid, "idempotency_key": "job-42"})).await?;
+    let a = call(&c, "run_script", json!({"script_id": sid, "idempotency_key": "job-42", "agent_id": "test"})).await?;
     let id = a["run_id"].as_i64().unwrap();
-    let b = call(&c, "run_script", json!({"script_id": sid, "idempotency_key": "job-42"})).await?;
+    let b = call(&c, "run_script", json!({"script_id": sid, "idempotency_key": "job-42", "agent_id": "test"})).await?;
     assert_eq!(b["idempotent"], true, "second is idempotent: {b}");
     assert_eq!(b["run_id"].as_i64().unwrap(), id, "same run returned");
     // A different key enqueues a fresh run.
-    let d = call(&c, "run_script", json!({"script_id": sid, "idempotency_key": "job-99"})).await?;
+    let d = call(&c, "run_script", json!({"script_id": sid, "idempotency_key": "job-99", "agent_id": "test"})).await?;
     assert_ne!(d["run_id"].as_i64().unwrap(), id, "different key -> new run");
     c.cancel().await?;
     Ok(())

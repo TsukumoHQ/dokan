@@ -194,9 +194,13 @@ pub struct RunArgs {
     /// (status "recalled"). Opt-in — leave false for monitors/time-sensitive jobs that must
     /// re-execute. Exploits dokan's determinism.
     pub cache: Option<bool>,
-    /// Your agent id. Tags the run for provenance, selects which scoped secrets the job
-    /// sees (global + this agent's), and counts against this agent's concurrency quota.
-    pub agent_id: Option<String>,
+    /// REQUIRED. Your agent id — provenance for the run; selects which scoped secrets the job
+    /// sees (global + this agent's) and meters this agent's concurrency + compute quota.
+    /// NOTE: this is an UNAUTHENTICATED provenance tag, NOT an isolation/auth boundary. dokan's
+    /// trust model is single-tenant (all jobs trusted), so per-agent secret scoping is
+    /// defense-in-depth, not a guarantee against a caller that passes another agent's id. True
+    /// non-spoofable isolation is the held per-agent-token upgrade (see SECURITY.md).
+    pub agent_id: String,
     /// Exactly-once key: if a run with this key already exists, return it instead of
     /// enqueuing a duplicate. Use for safe retries of the enqueue call itself.
     pub idempotency_key: Option<String>,
@@ -672,7 +676,7 @@ impl Dokan {
         }
     }
 
-    #[tool(description = "Trigger a script run. Returns run_id immediately; never blocks. Poll with read_logs or wait_for. INPUT FILES: pass files={\"<name>\": \"<handle>\"} (handles from upload_blob) to materialize each file READ-ONLY at /input/<name> in the container — the way to feed a job a real document (a PDF, dataset, .md). The blob shas enter the cache key + receipt, so the run stays deterministic. Unknown handle → loud error, no run created.")]
+    #[tool(description = "Trigger a script run. Returns run_id immediately; never blocks. Poll with read_logs or wait_for. agent_id is REQUIRED: it tags provenance, selects the job's scoped secrets (global + this agent's), and meters your concurrency/compute quota — it is unauthenticated provenance, NOT an isolation/auth boundary (see SECURITY.md). INPUT FILES: pass files={\"<name>\": \"<handle>\"} (handles from upload_blob) to materialize each file READ-ONLY at /input/<name> in the container — the way to feed a job a real document (a PDF, dataset, .md). The blob shas enter the cache key + receipt, so the run stays deterministic. Unknown handle → loud error, no run created.")]
     async fn run_script(
         &self,
         Parameters(a): Parameters<RunArgs>,
@@ -738,32 +742,40 @@ impl Dokan {
         } else {
             None
         };
+        // agent_id is REQUIRED — closes the quota-omit bypass (omitting it used to skip quota
+        // entirely). It is unauthenticated provenance, not an auth boundary (single-tenant trust
+        // model; see SECURITY.md) — a non-empty id is all we enforce here.
+        let aid = a.agent_id.trim();
+        if aid.is_empty() {
+            return ok(json!({
+                "error": "agent_id_required",
+                "hint": "pass your agent id — it tags provenance, scopes secrets, and meters quota"
+            }));
+        }
         // Per-agent backpressure: concurrency quota + rolling compute budget. A runaway
         // agent can't swamp the shared runtime or burn unbounded compute.
-        if let Some(aid) = a.agent_id.as_deref() {
-            let n = self.db.agent_running_count(aid).await.map_err(internal)?;
-            if n >= AGENT_MAX_CONCURRENT {
-                return ok(json!({
-                    "error": "quota_exceeded", "agent_id": aid,
-                    "in_flight": n, "limit": AGENT_MAX_CONCURRENT
-                }));
-            }
-            let spent = self
-                .db
-                .agent_compute_seconds(aid, AGENT_BUDGET_WINDOW_SECS)
-                .await
-                .map_err(internal)?;
-            if spent >= AGENT_COMPUTE_BUDGET_SECS {
-                return ok(json!({
-                    "error": "budget_exceeded", "agent_id": aid,
-                    "compute_seconds_24h": spent, "budget": AGENT_COMPUTE_BUDGET_SECS
-                }));
-            }
+        let n = self.db.agent_running_count(aid).await.map_err(internal)?;
+        if n >= AGENT_MAX_CONCURRENT {
+            return ok(json!({
+                "error": "quota_exceeded", "agent_id": aid,
+                "in_flight": n, "limit": AGENT_MAX_CONCURRENT
+            }));
+        }
+        let spent = self
+            .db
+            .agent_compute_seconds(aid, AGENT_BUDGET_WINDOW_SECS)
+            .await
+            .map_err(internal)?;
+        if spent >= AGENT_COMPUTE_BUDGET_SECS {
+            return ok(json!({
+                "error": "budget_exceeded", "agent_id": aid,
+                "compute_seconds_24h": spent, "budget": AGENT_COMPUTE_BUDGET_SECS
+            }));
         }
         // Enqueue only — a worker claims it from the queue (FOR UPDATE SKIP LOCKED).
         let run_id = self
             .db
-            .insert_run_with_blobs(a.script_id, &input, a.agent_id.as_deref(), input_blobs.as_ref())
+            .insert_run_with_blobs(a.script_id, &input, Some(aid), input_blobs.as_ref())
             .await
             .map_err(internal)?;
         if let Some(key) = &cache_key {
