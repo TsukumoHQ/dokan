@@ -33,9 +33,14 @@ dokan is built for a **trusted, single-tenant operator** — your own agent
 fleet on a host you control. Several deliberate design choices follow from
 that and are **not** vulnerabilities:
 
-- **Secrets are global to every job.** `set_secret` injects a value as an env
-  var into *every* job container. There is no per-script secret scoping yet.
-  Only run scripts you trust on a box that holds secrets.
+- **Secret scoping is advisory provenance, not an isolation boundary.**
+  `set_secret` injects globals into *every* job container; an optional per-agent
+  scope (`agent_secrets`) narrows extras to one `agent_id`. But `agent_id` is a
+  caller-supplied, **unauthenticated** arg on the unauthenticated control plane —
+  a caller can pass any id. So per-agent scoping is **defense-in-depth on a
+  trusted box, not a guarantee** against a malicious caller reading another
+  agent's scoped secrets. Only run scripts you trust on a box that holds secrets.
+  (True non-spoofable isolation = per-agent auth tokens, a planned upgrade.)
 - **The MCP control plane is unauthenticated** and binds to `127.0.0.1:8088`
   by default. It assumes anything that can reach it is already trusted. **Do
   not expose `:8088` to an untrusted network** — put it behind your own
