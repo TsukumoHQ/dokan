@@ -37,6 +37,8 @@ pub fn operator_router(state: AppState) -> Router {
         .route("/api/runs/{id}/logs", get(run_logs))
         .route("/api/runs/{id}/stream", get(run_stream))
         .route("/api/runs/{id}/receipt", get(run_receipt))
+        .route("/api/runs/{id}/verify", get(verify_run))
+        .route("/api/receipt/pubkey", get(receipt_pubkey))
         .route("/api/scripts", get(list_scripts))
         .route("/api/blobs", get(list_blobs))
         .route("/api/schedules", get(list_schedules))
@@ -907,7 +909,10 @@ function loadReceipt(){
     h+=rrow('input sha256', shaCell(rc.input_sha256));
     h+=rrow('output sha256', shaCell(rc.output_sha256));
     h+=rrow('secrets generation', `<span class=tnum>${rc.secrets_generation??'—'}</span>`);
+    h+=rrow('hermetic', rc.hermetic?'<span class="detbadge det">yes · network-disabled</span>':'<span class="detbadge adv">no</span>');
     h+=rrow('hmac ('+esc(rc.alg||'?')+')', shaCell(rc.sig));
+    const ed=rc.ed25519||{}; const dsig=(rc.dsse&&rc.dsse.signatures&&rc.dsse.signatures[0]&&rc.dsse.signatures[0].sig)||'';
+    if(dsig) h+=rrow('ed25519 ('+esc(ed.keyid||'?')+')', shaCell(dsig));
     const ib=rc.input_blobs; const keys=ib&&typeof ib==='object'?Object.keys(ib):[];
     if(keys.length){
       let inner=keys.map(k=>`<div style="margin:.15rem 0">${esc(k)} → <span style="color:var(--fg-dim)">${esc(trunc(ib[k],16))}</span></div>`).join('');
@@ -1166,6 +1171,47 @@ async fn run_receipt(State(s): State<AppState>, Path(id): Path<i64>) -> impl Int
             Json(json!({"error": "no receipt for this run"})),
         ),
     }
+}
+
+/// Public, key-free verification of a run's receipt — the third-party `verify` path. Checks the
+/// Ed25519/DSSE signature against the receipt's embedded public key and that the signed in-toto
+/// Statement attests this receipt's output. No re-execution (that's `reproduce`).
+async fn verify_run(State(s): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
+    match s.db.run_receipt(id).await.ok().flatten() {
+        Some(r) => {
+            let rep = crate::receipt::verify_receipt(&r);
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "run_id": id,
+                    "ok": rep.ok(),
+                    "ed25519_valid": rep.ed25519_valid,
+                    "binding_consistent": rep.binding_consistent,
+                    "hermetic": rep.hermetic,
+                    "deterministic": r.get("deterministic").and_then(|v| v.as_bool()).unwrap_or(false),
+                    "keyid": rep.keyid,
+                })),
+            )
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "no receipt for this run"})),
+        ),
+    }
+}
+
+/// The daemon's Ed25519 PUBLIC verifying key — anyone can fetch it to verify receipts offline.
+async fn receipt_pubkey(State(_s): State<AppState>) -> impl IntoResponse {
+    let signer = crate::receipt::Signer::from_env();
+    (
+        StatusCode::OK,
+        Json(json!({
+            "alg": "ed25519",
+            "keyid": signer.ed_keyid(),
+            "public_key": signer.ed_public_b64(),
+            "encoding": "base64",
+        })),
+    )
 }
 
 #[derive(Deserialize)]

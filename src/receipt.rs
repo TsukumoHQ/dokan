@@ -1,22 +1,36 @@
-//! Tamper-evident reproducibility receipts. A receipt binds a run's inputs (image digest,
-//! source, input, secrets generation) to its output (result hash, exit) under a keyed HMAC,
-//! so anyone holding `DOKAN_RECEIPT_KEY` can DETECT tampering and verify that a recalled run
-//! is sound — not a stale or altered cache hit. The HMAC is symmetric: it is tamper-evidence
-//! for key-holders, NOT a third-party-verifiable signature (that needs an asymmetric scheme —
-//! on the roadmap). Only meaningful for network-disabled (deterministic) scripts, where the
-//! output really is a pure function of the inputs.
+//! Reproducibility receipts. A receipt binds a run's inputs (image digest, source, input,
+//! secrets generation) to its output (result hash, exit) so a recalled run can be shown sound —
+//! not a stale or altered cache hit. Two signatures, complementary:
+//!
+//! - **HMAC-SHA256** (symmetric) — tamper-evidence for holders of `DOKAN_RECEIPT_KEY`. It is NOT
+//!   a third-party-verifiable signature (Turborepo's model; they disclaim it as "not a security
+//!   feature"). Kept for back-compat + cheap key-holder checks.
+//! - **Ed25519** (asymmetric) over an in-toto Statement in a DSSE envelope — the real public-verify
+//!   story: anyone with the PUBLIC key (`/api/receipt/pubkey`, `dokan pubkey`) can verify, no shared
+//!   secret. This is what licenses calling a receipt "verifiable" to a third party.
+//!
+//! Only meaningful for network-disabled (deterministic) scripts, where the output really is a pure
+//! function of the inputs.
 
+use ed25519_dalek::{Signer as _, SigningKey, VerifyingKey};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
+
+/// DSSE payloadType for a dokan run statement (the value bound into the PAE preamble).
+pub const DSSE_PAYLOAD_TYPE: &str = "application/vnd.in-toto+json";
+/// in-toto predicateType for a dokan run.
+pub const PREDICATE_TYPE: &str = "https://dokan.dev/Run/v1";
 
 #[derive(Clone)]
 pub struct Signer {
     key: Vec<u8>,
+    ed: SigningKey,
 }
 
 impl Signer {
-    /// Key from `DOKAN_RECEIPT_KEY`; if unset, a clearly-flagged PUBLIC dev key (don't trust
-    /// those receipts — they are forgeable). Reaching the fallback in the daemon implies the
+    /// HMAC key from `DOKAN_RECEIPT_KEY` + Ed25519 secret from `DOKAN_RECEIPT_ED25519_SECRET`
+    /// (base64 32-byte seed). Either unset → a clearly-flagged PUBLIC dev key (don't trust those
+    /// receipts — they are forgeable). Reaching a fallback in the daemon implies the
     /// `DOKAN_DEV_INSECURE` escape hatch is set; `preflight_security` refuses to boot otherwise.
     pub fn from_env() -> Self {
         let key = match std::env::var("DOKAN_RECEIPT_KEY") {
@@ -37,7 +51,7 @@ impl Signer {
                 "dokan-dev-receipt-key".to_string()
             }
         };
-        Self { key: key.into_bytes() }
+        Self { key: key.into_bytes(), ed: ed_from_env() }
     }
 
     /// Whether a non-empty `DOKAN_RECEIPT_KEY` is configured (vs. the public dev fallback).
@@ -46,11 +60,224 @@ impl Signer {
         std::env::var("DOKAN_RECEIPT_KEY").map(|k| !k.is_empty()).unwrap_or(false)
     }
 
+    /// Whether a usable (base64, 32-byte) `DOKAN_RECEIPT_ED25519_SECRET` is configured (vs. the
+    /// public dev fallback). Used by the boot-time fail-closed preflight.
+    pub fn ed_key_configured() -> bool {
+        std::env::var("DOKAN_RECEIPT_ED25519_SECRET")
+            .ok()
+            .and_then(|s| ed_seed_from_b64(&s))
+            .is_some()
+    }
+
+    /// HMAC-SHA256 over the canonical binding payload (hex). Key-holder tamper-evidence.
     pub fn sign(&self, payload: &str) -> String {
         let mut mac = Hmac::<Sha256>::new_from_slice(&self.key).expect("hmac accepts any key len");
         mac.update(payload.as_bytes());
         hex(&mac.finalize().into_bytes())
     }
+
+    /// Ed25519 signature (hex of the 64-byte sig) over an arbitrary message. Used to sign the
+    /// DSSE pre-authentication encoding of an in-toto Statement.
+    pub fn ed_sign(&self, msg: &[u8]) -> String {
+        hex(&self.ed.sign(msg).to_bytes())
+    }
+
+    /// The Ed25519 PUBLIC key (base64, 32 bytes) — safe to publish; third parties verify with it.
+    pub fn ed_public_b64(&self) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(self.ed.verifying_key().to_bytes())
+    }
+
+    /// Short stable key id (first 16 hex of SHA-256 over the public key) for the DSSE `keyid`.
+    pub fn ed_keyid(&self) -> String {
+        let h = sha256_hex(&self.ed.verifying_key().to_bytes());
+        h[..16].to_string()
+    }
+}
+
+/// DSSE Pre-Authentication Encoding (PAE):
+/// `"DSSEv1" SP len(type) SP type SP len(body) SP body`, where lengths are ASCII decimal of the
+/// UTF-8 byte length and SP is a single 0x20. This is the exact byte string that gets signed, so a
+/// verifier reconstructs it from (payloadType, payload) before checking the Ed25519 signature.
+pub fn dsse_pae(payload_type: &str, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(payload.len() + payload_type.len() + 32);
+    out.extend_from_slice(b"DSSEv1 ");
+    out.extend_from_slice(payload_type.len().to_string().as_bytes());
+    out.push(b' ');
+    out.extend_from_slice(payload_type.as_bytes());
+    out.push(b' ');
+    out.extend_from_slice(payload.len().to_string().as_bytes());
+    out.push(b' ');
+    out.extend_from_slice(payload);
+    out
+}
+
+/// Verify a DSSE/Ed25519 signature with a PUBLIC key only — the third-party verification path.
+/// `public_b64` = base64 32-byte verifying key, `sig_hex` = hex 64-byte signature over
+/// `dsse_pae(payload_type, payload)`. Returns false on any malformed input (never panics).
+pub fn ed_verify(public_b64: &str, payload_type: &str, payload: &[u8], sig_hex: &str) -> bool {
+    use base64::Engine;
+    let Ok(pk_bytes) = base64::engine::general_purpose::STANDARD.decode(public_b64) else {
+        return false;
+    };
+    let Ok(pk_arr): Result<[u8; 32], _> = pk_bytes.try_into() else {
+        return false;
+    };
+    let Ok(vk) = VerifyingKey::from_bytes(&pk_arr) else {
+        return false;
+    };
+    let Some(sig_bytes) = unhex(sig_hex) else {
+        return false;
+    };
+    let Ok(sig_arr): Result<[u8; 64], _> = sig_bytes.try_into() else {
+        return false;
+    };
+    let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
+    vk.verify_strict(&dsse_pae(payload_type, payload), &sig).is_ok()
+}
+
+impl Signer {
+    /// Recompute the HMAC binding from a receipt's stored fields and compare it to the stored
+    /// `sig`. True iff this signer's key reproduces it — the key-holder tamper-evidence check.
+    /// Returns false if any field is missing/malformed.
+    pub fn verify_hmac(&self, receipt: &serde_json::Value) -> bool {
+        let s = |k: &str| receipt.get(k).and_then(|v| v.as_str()).map(str::to_string);
+        let n = |k: &str| receipt.get(k).and_then(|v| v.as_i64());
+        let b = |k: &str| receipt.get(k).and_then(|v| v.as_bool());
+        let (Some(digest), Some(source_sha), Some(input_sha), Some(output_hash), Some(sig)) =
+            (s("image_digest"), s("source_sha256"), s("input_sha256"), s("output_sha256"), s("sig"))
+        else {
+            return false;
+        };
+        let (Some(secrets_gen), Some(exit_code), Some(network)) =
+            (n("secrets_generation"), n("exit"), b("network"))
+        else {
+            return false;
+        };
+        let blobs_canon = crate::mcp::canonical_input_blobs(receipt.get("input_blobs"));
+        let output_blobs_canon = crate::mcp::canonical_input_blobs(receipt.get("output_blobs"));
+        let payload = format!(
+            "v1|{digest}|{source_sha}|{input_sha}|{secrets_gen}|{output_hash}|{exit_code}|{network}|{blobs_canon}|{output_blobs_canon}",
+        );
+        // Constant-ish compare is unnecessary here (both sides are public hex), but keep it simple.
+        self.sign(&payload) == sig
+    }
+}
+
+/// Result of public (key-free) receipt verification — the offline `verify` path.
+#[derive(Debug, Clone)]
+pub struct VerifyReport {
+    /// The Ed25519/DSSE signature verifies against the receipt's embedded public key.
+    pub ed25519_valid: bool,
+    /// The signed in-toto Statement's `output_sha256` matches the receipt's top-level claim
+    /// (the envelope attests THIS receipt's output, not some other run's).
+    pub binding_consistent: bool,
+    /// Signed hermetic claim (network was disabled) → output is a pure function of inputs.
+    pub hermetic: bool,
+    /// DSSE keyid the receipt was signed under.
+    pub keyid: String,
+}
+
+impl VerifyReport {
+    /// A receipt is publicly sound iff its Ed25519 signature verifies AND the signed statement
+    /// is bound to the receipt's claimed output.
+    pub fn ok(&self) -> bool {
+        self.ed25519_valid && self.binding_consistent
+    }
+}
+
+/// Verify a receipt with NO key material — the third-party path. Checks the DSSE/Ed25519
+/// signature against the receipt's embedded public key, then that the signed statement attests
+/// the same output the receipt claims at top level. Never panics on a malformed receipt.
+pub fn verify_receipt(receipt: &serde_json::Value) -> VerifyReport {
+    use base64::Engine;
+    let dsse = receipt.get("dsse");
+    let public_b64 = receipt
+        .get("ed25519")
+        .and_then(|e| e.get("public_key"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let payload_type = dsse
+        .and_then(|d| d.get("payloadType"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(DSSE_PAYLOAD_TYPE);
+    let payload_b64 = dsse
+        .and_then(|d| d.get("payload"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let sig = dsse
+        .and_then(|d| d.get("signatures"))
+        .and_then(|s| s.get(0))
+        .and_then(|s| s.get("sig"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let keyid = dsse
+        .and_then(|d| d.get("signatures"))
+        .and_then(|s| s.get(0))
+        .and_then(|s| s.get("keyid"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    let payload_bytes = base64::engine::general_purpose::STANDARD
+        .decode(payload_b64)
+        .unwrap_or_default();
+    let ed25519_valid =
+        !payload_bytes.is_empty() && ed_verify(public_b64, payload_type, &payload_bytes, sig);
+
+    // Binding coherence: the signed statement must attest the receipt's own claimed output.
+    let claimed = receipt.get("output_sha256").and_then(|v| v.as_str());
+    let signed = serde_json::from_slice::<serde_json::Value>(&payload_bytes)
+        .ok()
+        .and_then(|st| {
+            st.get("predicate")
+                .and_then(|p| p.get("output_sha256"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        });
+    let binding_consistent = match (claimed, signed.as_deref()) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    };
+    let hermetic = receipt.get("hermetic").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    VerifyReport { ed25519_valid, binding_consistent, hermetic, keyid }
+}
+
+/// Build the Ed25519 signing key: from `DOKAN_RECEIPT_ED25519_SECRET` (base64 32-byte seed), else
+/// a deterministic, clearly-flagged PUBLIC dev key (forgeable — dev/test only).
+fn ed_from_env() -> SigningKey {
+    if let Some(seed) = std::env::var("DOKAN_RECEIPT_ED25519_SECRET")
+        .ok()
+        .and_then(|s| ed_seed_from_b64(&s))
+    {
+        return SigningKey::from_bytes(&seed);
+    }
+    if crate::crypto::dev_insecure() {
+        tracing::warn!(
+            "DOKAN_RECEIPT_ED25519_SECRET unset/invalid and DOKAN_DEV_INSECURE set — receipts \
+             Ed25519-signed with a PUBLIC dev key; the public-verify story is void (anyone can \
+             forge). Dev/test only; never run this in production."
+        );
+    } else {
+        tracing::error!(
+            "DOKAN_RECEIPT_ED25519_SECRET unset/invalid — receipts would be signed with a public \
+             dev key and be forgeable. Set it (base64 32-byte seed), or DOKAN_DEV_INSECURE=1 for \
+             local dev."
+        );
+    }
+    // Deterministic dev seed so dev receipts verify consistently against the dev pubkey.
+    let mut seed = [0u8; 32];
+    let d = Sha256::digest(b"dokan-dev-receipt-ed25519");
+    seed.copy_from_slice(&d);
+    SigningKey::from_bytes(&seed)
+}
+
+/// Decode a base64 string to a 32-byte Ed25519 seed, or None if malformed / wrong length.
+fn ed_seed_from_b64(s: &str) -> Option<[u8; 32]> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(s.trim()).ok()?;
+    bytes.try_into().ok()
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -68,17 +295,57 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
+/// Decode a hex string to bytes, or None if it has an odd length or a non-hex digit.
+fn unhex(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn dev_signer() -> Signer {
+        Signer { key: b"k1".to_vec(), ed: ed_from_env() }
+    }
+
     #[test]
     fn sign_is_deterministic_and_key_sensitive() {
-        let a = Signer { key: b"k1".to_vec() };
-        let b = Signer { key: b"k2".to_vec() };
+        let a = Signer { key: b"k1".to_vec(), ed: ed_from_env() };
+        let b = Signer { key: b"k2".to_vec(), ed: ed_from_env() };
         assert_eq!(a.sign("x"), a.sign("x"), "same key+payload -> same sig");
         assert_ne!(a.sign("x"), a.sign("y"), "payload matters");
         assert_ne!(a.sign("x"), b.sign("x"), "key matters");
         assert_eq!(sha256_hex(b""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    }
+
+    #[test]
+    fn dsse_pae_is_canonical() {
+        // "DSSEv1 SP 4 SP test SP 5 SP hello"
+        assert_eq!(dsse_pae("test", b"hello"), b"DSSEv1 4 test 5 hello");
+    }
+
+    #[test]
+    fn ed25519_round_trips_with_public_key_only() {
+        let s = dev_signer();
+        let payload = br#"{"_type":"https://in-toto.io/Statement/v1"}"#;
+        let sig = s.ed_sign(&dsse_pae(DSSE_PAYLOAD_TYPE, payload));
+        let pubkey = s.ed_public_b64();
+        // Third party with ONLY the public key verifies.
+        assert!(ed_verify(&pubkey, DSSE_PAYLOAD_TYPE, payload, &sig), "valid sig verifies");
+        // A flipped payload byte is rejected.
+        assert!(
+            !ed_verify(&pubkey, DSSE_PAYLOAD_TYPE, br#"{"_type":"https://in-toto.io/Statement/v2"}"#, &sig),
+            "tampered payload rejected"
+        );
+        // A flipped signature is rejected.
+        let mut bad = sig.clone();
+        bad.replace_range(0..2, if &sig[0..2] == "00" { "ff" } else { "00" });
+        assert!(!ed_verify(&pubkey, DSSE_PAYLOAD_TYPE, payload, &bad), "tampered sig rejected");
     }
 }

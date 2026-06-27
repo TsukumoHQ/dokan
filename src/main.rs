@@ -104,6 +104,15 @@ enum Commands {
         #[arg(long)]
         check: bool,
     },
+    /// Print this daemon's Ed25519 PUBLIC verifying key — share it so third parties can verify
+    /// receipts offline. Reads the key from DOKAN_RECEIPT_ED25519_SECRET (or the dev key).
+    Pubkey,
+    /// Verify a receipt JSON with its embedded public key — no daemon, no shared secret, no
+    /// re-execution. Exit 0 = verified (Ed25519 sig valid + bound to its output), 1 = failed.
+    Verify {
+        /// Path to a receipt JSON file, or '-' to read from stdin.
+        receipt: String,
+    },
 }
 
 #[tokio::main]
@@ -119,9 +128,49 @@ async fn main() -> Result<()> {
     // Subcommand routing. `update` runs the self-updater and EXITS before any daemon work or the
     // security preflight — it must work on a binary that isn't configured to serve. With no
     // subcommand we fall through to the daemon path, byte-for-byte unchanged.
-    if let Some(Commands::Update { force, check }) = cli.command {
-        let code = dokan::update::run(force, check).await;
-        std::process::exit(code);
+    match cli.command {
+        Some(Commands::Update { force, check }) => {
+            let code = dokan::update::run(force, check).await;
+            std::process::exit(code);
+        }
+        Some(Commands::Pubkey) => {
+            let s = receipt::Signer::from_env();
+            println!(
+                "{}",
+                serde_json::json!({
+                    "alg": "ed25519",
+                    "keyid": s.ed_keyid(),
+                    "public_key": s.ed_public_b64(),
+                    "encoding": "base64",
+                })
+            );
+            std::process::exit(0);
+        }
+        Some(Commands::Verify { receipt: path }) => {
+            let raw = if path == "-" {
+                use std::io::Read;
+                let mut buf = String::new();
+                std::io::stdin().read_to_string(&mut buf)?;
+                buf
+            } else {
+                std::fs::read_to_string(&path)?
+            };
+            let r: serde_json::Value = serde_json::from_str(&raw)
+                .map_err(|e| anyhow::anyhow!("receipt is not valid JSON: {e}"))?;
+            let rep = receipt::verify_receipt(&r);
+            println!(
+                "{}",
+                serde_json::json!({
+                    "ok": rep.ok(),
+                    "ed25519_valid": rep.ed25519_valid,
+                    "binding_consistent": rep.binding_consistent,
+                    "hermetic": rep.hermetic,
+                    "keyid": rep.keyid,
+                })
+            );
+            std::process::exit(if rep.ok() { 0 } else { 1 });
+        }
+        None => {}
     }
 
     // Fail closed on missing crypto keys (GAP-4). Refuse to boot insecurely unless the
@@ -421,6 +470,13 @@ fn preflight_security() -> Result<()> {
         missing.push(
             "DOKAN_RECEIPT_KEY — without it, receipts are HMAC'd with a PUBLIC dev key, so they \
              are forgeable and NOT tamper-evident.",
+        );
+    }
+    if !receipt::Signer::ed_key_configured() {
+        missing.push(
+            "DOKAN_RECEIPT_ED25519_SECRET — without it, receipts are Ed25519-signed with a PUBLIC \
+             dev key, so the third-party public-verify story is void (anyone can forge). Set it to \
+             a base64 32-byte seed.",
         );
     }
 
