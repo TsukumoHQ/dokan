@@ -505,6 +505,46 @@ impl Db {
         Ok(version)
     }
 
+    /// Update a script's metadata + resource limits in place WITHOUT touching the source or
+    /// bumping the version. Used by upsert when the source is unchanged but the limits/flags
+    /// differ (e.g. setting a mem cap), so a cap-only re-provision is no longer a silent no-op.
+    /// The IS DISTINCT FROM guard only writes when something actually changed (keeps the common
+    /// "respawned agent re-uploads the identical script" path cheap) and returns whether it did.
+    /// Does NOT refresh the search embedding (that tracks name+description and updates on a
+    /// source change); a description-only tweak here won't re-embed until the next source change.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_script_meta(
+        &self,
+        id: i64,
+        runtime: &str,
+        description: Option<&str>,
+        created_by: Option<&str>,
+        network: bool,
+        mem_limit_mb: Option<i64>,
+        cpu_limit: Option<f64>,
+        feed_prev_result: bool,
+    ) -> Result<bool> {
+        let n = sqlx::query(
+            "UPDATE scripts SET runtime = $2, description = $3, created_by = $4, network = $5, \
+                 mem_limit_mb = $6, cpu_limit = $7, feed_prev_result = $8 \
+             WHERE id = $1 AND (runtime IS DISTINCT FROM $2 OR description IS DISTINCT FROM $3 \
+                 OR created_by IS DISTINCT FROM $4 OR network IS DISTINCT FROM $5 \
+                 OR mem_limit_mb IS DISTINCT FROM $6 OR cpu_limit IS DISTINCT FROM $7 \
+                 OR feed_prev_result IS DISTINCT FROM $8)",
+        )
+        .bind(id)
+        .bind(runtime)
+        .bind(description)
+        .bind(created_by)
+        .bind(network)
+        .bind(mem_limit_mb)
+        .bind(cpu_limit)
+        .bind(feed_prev_result)
+        .execute(&self.pool)
+        .await?;
+        Ok(n.rows_affected() > 0)
+    }
+
     /// Store a run's tamper-evident reproducibility receipt.
     pub async fn set_run_receipt(&self, id: i64, receipt: &serde_json::Value) -> Result<()> {
         sqlx::query("UPDATE runs SET receipt = $2 WHERE id = $1")
