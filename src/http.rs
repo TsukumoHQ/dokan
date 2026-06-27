@@ -38,6 +38,7 @@ pub fn operator_router(state: AppState) -> Router {
         .route("/api/runs/{id}/stream", get(run_stream))
         .route("/api/runs/{id}/receipt", get(run_receipt))
         .route("/api/runs/{id}/verify", get(verify_run))
+        .route("/api/runs/{id}/reproduce", post(reproduce_run_ep))
         .route("/api/receipt/pubkey", get(receipt_pubkey))
         .route("/api/scripts", get(list_scripts))
         .route("/api/blobs", get(list_blobs))
@@ -1196,6 +1197,19 @@ async fn verify_run(State(s): State<AppState>, Path(id): Path<i64>) -> impl Into
         None => (
             StatusCode::NOT_FOUND,
             Json(json!({"error": "no receipt for this run"})),
+        ),
+    }
+}
+
+/// Reproduce a run by RE-EXECUTION: re-run the recorded invocation and byte-compare its output to
+/// the receipt → REPRODUCED / DIVERGED / TAMPERED / INCONCLUSIVE. Blocks up to ~120s for the
+/// re-run (the cockpit "reproduce" action); the MCP `reproduce` tool exposes a tunable timeout.
+async fn reproduce_run_ep(State(s): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
+    match crate::mcp::reproduce_run(&s.db, &s.exec, id, 120, None).await {
+        Ok(v) => (StatusCode::OK, Json(v)),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
         ),
     }
 }

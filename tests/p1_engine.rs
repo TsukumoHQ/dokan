@@ -159,6 +159,62 @@ async fn list_runs_separates_verdict_from_error() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// reproduce (TSU-46 PR-B) — the wedge: verify by RE-EXECUTION. A deterministic, network-off run
+/// re-runs byte-identical → REPRODUCED(0).
+#[tokio::test]
+async fn reproduce_deterministic_run_is_reproduced() -> anyhow::Result<()> {
+    let c = spawn().await?;
+    let sid = call(&c, "upload_script",
+        json!({"name": "repro-det", "runtime": "bash", "source": "echo '::dokan:result:: {\"x\":1}'\n", "network": false}))
+        .await?["script_id"].as_i64().unwrap();
+    let id = call(&c, "run_script", json!({"script_id": sid, "agent_id": "test"})).await?["run_id"].as_i64().unwrap();
+    assert_eq!(wait_status(&c, id, 60).await, "succeeded", "original ran");
+    let v = call(&c, "reproduce", json!({"run_id": id, "timeout": 60})).await?;
+    assert_eq!(v["verdict"], "REPRODUCED", "deterministic run reproduces: {v}");
+    assert_eq!(v["code"], 0, "exit code 0: {v}");
+    assert!(v["repro_run_id"].as_i64().is_some(), "carries the re-run id: {v}");
+    c.cancel().await?;
+    Ok(())
+}
+
+/// reproduce — a NON-deterministic workload (unseeded $RANDOM), even with the network off, yields
+/// a different output on re-run → DIVERGED(6). Proves "the runtime is deterministic; your output
+/// is reproducible iff your code is" — and which.
+#[tokio::test]
+async fn reproduce_nondeterministic_run_diverges() -> anyhow::Result<()> {
+    let c = spawn().await?;
+    let sid = call(&c, "upload_script",
+        json!({"name": "repro-rand", "runtime": "bash", "source": "echo \"::dokan:result:: {\\\"r\\\":$RANDOM}\"\n", "network": false}))
+        .await?["script_id"].as_i64().unwrap();
+    let id = call(&c, "run_script", json!({"script_id": sid, "agent_id": "test"})).await?["run_id"].as_i64().unwrap();
+    assert_eq!(wait_status(&c, id, 60).await, "succeeded", "original ran");
+    let v = call(&c, "reproduce", json!({"run_id": id, "timeout": 60})).await?;
+    assert_eq!(v["verdict"], "DIVERGED", "nondeterministic output diverges: {v}");
+    assert_eq!(v["code"], 6, "exit code 6: {v}");
+    assert_ne!(v["expected_output_sha256"], v["actual_output_sha256"], "outputs differ: {v}");
+    c.cancel().await?;
+    Ok(())
+}
+
+/// reproduce — a run that had the NETWORK enabled isn't soundly reproducible (output isn't a pure
+/// function of its inputs) → INCONCLUSIVE(7), and dokan refuses to even re-run it.
+#[tokio::test]
+async fn reproduce_networked_run_is_inconclusive() -> anyhow::Result<()> {
+    let c = spawn().await?;
+    let sid = call(&c, "upload_script",
+        json!({"name": "repro-net", "runtime": "bash", "source": "echo '::dokan:result:: {\"x\":1}'\n", "network": true}))
+        .await?["script_id"].as_i64().unwrap();
+    let id = call(&c, "run_script", json!({"script_id": sid, "agent_id": "test"})).await?["run_id"].as_i64().unwrap();
+    assert_eq!(wait_status(&c, id, 60).await, "succeeded", "original ran");
+    let v = call(&c, "reproduce", json!({"run_id": id, "timeout": 60})).await?;
+    assert_eq!(v["verdict"], "INCONCLUSIVE", "networked run not soundly reproducible: {v}");
+    assert_eq!(v["code"], 7, "exit code 7: {v}");
+    assert_eq!(v["reason"], "non_deterministic", "reason is the network: {v}");
+    assert!(v["repro_run_id"].is_null(), "no re-run was created: {v}");
+    c.cancel().await?;
+    Ok(())
+}
+
 /// Secrets set over MCP are injected as env vars into the job container. (Terrain P0:
 /// leads had no way to provision API keys for monitors.)
 #[tokio::test]
