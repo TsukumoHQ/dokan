@@ -165,9 +165,13 @@ pub struct UploadArgs {
     pub description: Option<String>,
     /// Free-text creator/owner tag (e.g. agent name or human). Shown in the operator UI.
     pub created_by: Option<String>,
-    /// Idempotent re-provision: if a script of this name exists, update it (version bump,
-    /// or no-op when the source is identical) and return its id instead of creating a
-    /// duplicate. Default false. Use it so a respawned agent can safely re-upload.
+    /// Idempotent re-provision: if a script of this name exists, update it in place and return
+    /// its id instead of creating a duplicate. A changed source bumps the version
+    /// (status "updated"); an identical source with changed limits/flags (mem_limit_mb, cpu_limit,
+    /// network, feed_prev_result, description) applies them WITHOUT a version bump
+    /// (status "metadata_updated") — so a cap-only re-provision actually takes; a fully identical
+    /// re-upload is a cheap no-op (status "unchanged"). Default false. Use it so a respawned agent
+    /// can safely re-upload and so you can tune a script's caps without perturbing its source.
     pub upsert: Option<bool>,
     /// Network access for the job. Default true (monitors that hit APIs need it). Set FALSE
     /// for a pure-compute script: it runs network-disabled, making its output a deterministic
@@ -475,7 +479,27 @@ impl Dokan {
                 self.db.find_script_by_name(&a.name).await.map_err(internal)?
             {
                 if source == a.source {
-                    return ok(json!({"script_id": id, "version": version, "status": "unchanged"}));
+                    // Source unchanged: still apply a metadata-only update (limits/flags/desc)
+                    // WITHOUT a version bump — so a cap-only re-provision (e.g. setting
+                    // mem_limit_mb) actually takes, instead of being a silent no-op. Re-asserts
+                    // the passed definition; the IS DISTINCT FROM guard keeps an identical
+                    // re-upload a cheap no-op.
+                    let changed = self
+                        .db
+                        .update_script_meta(
+                            id,
+                            &a.runtime,
+                            a.description.as_deref(),
+                            a.created_by.as_deref(),
+                            a.network.unwrap_or(true),
+                            a.mem_limit_mb,
+                            a.cpu_limit,
+                            a.feed_prev_result.unwrap_or(false),
+                        )
+                        .await
+                        .map_err(internal)?;
+                    let status = if changed { "metadata_updated" } else { "unchanged" };
+                    return ok(json!({"script_id": id, "version": version, "status": status}));
                 }
                 let embedding = self.embed_script(&a.name, &a.description).await;
                 let version = self

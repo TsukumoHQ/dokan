@@ -221,8 +221,9 @@ async fn progress_channel_sets_latest_and_is_not_logged() -> anyhow::Result<()> 
     Ok(())
 }
 
-/// upsert=true re-provisions a script by name: same id back, no duplicate rows, no-op
-/// when the source is unchanged, version bump when it changes. (Terrain P2.)
+/// upsert=true re-provisions a script by name: same id back, no duplicate rows, no-op when
+/// source + metadata are unchanged, version bump when the source changes, and a metadata-only
+/// update (e.g. a new mem cap on identical source) applies WITHOUT a version bump. (Terrain P2.)
 #[tokio::test]
 async fn upsert_dedups_by_name() -> anyhow::Result<()> {
     let c = spawn().await?;
@@ -248,6 +249,28 @@ async fn upsert_dedups_by_name() -> anyhow::Result<()> {
         d["version"].as_i64().unwrap() > a["version"].as_i64().unwrap(),
         "version bumped: {d}"
     );
+    // Same source but a NEW mem cap -> metadata_updated, same id, NO version bump (the cap-only
+    // re-provision that used to be a silent no-op).
+    let v_after_d = d["version"].as_i64().unwrap();
+    let e = call(
+        &c,
+        "upload_script",
+        json!({"name": name, "runtime": "bash", "source": "echo v2\n", "upsert": true, "mem_limit_mb": 256}),
+    )
+    .await?;
+    assert_eq!(e["script_id"].as_i64().unwrap(), id, "same id on metadata update");
+    assert_eq!(e["status"], "metadata_updated", "metadata applied on identical source: {e}");
+    assert_eq!(e["version"].as_i64().unwrap(), v_after_d, "version NOT bumped on metadata-only: {e}");
+    let g = call(&c, "get_script", json!({"id": id})).await?;
+    assert_eq!(g["mem_limit_mb"].as_i64(), Some(256), "mem cap took: {g}");
+    // Re-applying the identical source + metadata -> unchanged (IS DISTINCT FROM guard).
+    let h = call(
+        &c,
+        "upload_script",
+        json!({"name": name, "runtime": "bash", "source": "echo v2\n", "upsert": true, "mem_limit_mb": 256}),
+    )
+    .await?;
+    assert_eq!(h["status"], "unchanged", "no-op when source + metadata identical: {h}");
     c.cancel().await?;
     Ok(())
 }
