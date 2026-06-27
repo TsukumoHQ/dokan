@@ -265,6 +265,11 @@ pub struct CancelArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct VerifyArgs {
+    pub run_id: i64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ComposeFlowArgs {
     /// Flow name.
     pub name: String,
@@ -1296,6 +1301,25 @@ impl Dokan {
             .await
             .map_err(internal)?;
         ok(json!({"run_id": a.run_id, "status": "canceled"}))
+    }
+
+    #[tool(description = "Verify a run's receipt WITHOUT re-executing — offline, instant. Checks the Ed25519/DSSE signature against the receipt's embedded public key (third-party-verifiable, NO shared secret needed), the HMAC binding with the daemon key (key-holder check), and that the signed in-toto Statement attests THIS run's output. Returns {ok, ed25519_valid, hmac_valid, binding_consistent, hermetic, deterministic, keyid}. hermetic=true means the run was network-disabled (its output is a pure function of inputs). For verify-by-RE-EXECUTION (re-run + byte-compare), use the reproduce primitive.")]
+    async fn verify(&self, Parameters(a): Parameters<VerifyArgs>) -> Result<CallToolResult, McpError> {
+        let Some(receipt) = self.db.run_receipt(a.run_id).await.map_err(internal)? else {
+            return ok(json!({"error": "no_receipt", "run_id": a.run_id}));
+        };
+        let rep = crate::receipt::verify_receipt(&receipt);
+        let hmac_valid = self.exec.verify_receipt_hmac(&receipt);
+        ok(json!({
+            "run_id": a.run_id,
+            "ok": rep.ok() && hmac_valid,
+            "ed25519_valid": rep.ed25519_valid,
+            "hmac_valid": hmac_valid,
+            "binding_consistent": rep.binding_consistent,
+            "hermetic": rep.hermetic,
+            "deterministic": receipt.get("deterministic").and_then(|v| v.as_bool()).unwrap_or(false),
+            "keyid": rep.keyid,
+        }))
     }
 }
 

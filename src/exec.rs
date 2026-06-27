@@ -132,6 +132,7 @@ impl Executor {
     async fn build_receipt(
         &self,
         db: &Db,
+        run_id: i64,
         image: &str,
         source: &str,
         input: &serde_json::Value,
@@ -141,9 +142,11 @@ impl Executor {
         input_blobs: Option<&serde_json::Value>,
         output_blobs: Option<&serde_json::Value>,
     ) -> serde_json::Value {
-        use crate::receipt::sha256_hex;
+        use crate::receipt::{dsse_pae, sha256_hex, DSSE_PAYLOAD_TYPE, PREDICATE_TYPE};
         let digest = self.pool.digest(image).unwrap_or_else(|| image.to_string());
         let secrets_gen = db.secrets_generation().await.unwrap_or(0);
+        let source_sha = sha256_hex(source.as_bytes());
+        let input_sha = sha256_hex(input.to_string().as_bytes());
         let output_hash = sha256_hex(
             result
                 .as_ref()
@@ -160,28 +163,82 @@ impl Executor {
         // files the job wrote to /output, folded into the binding so the captured output set is
         // tamper-evident too (symmetric with input blobs). None/empty → "".
         let output_blobs_canon = canonical_input_blobs(output_blobs);
-        // The HMAC'd payload is a canonical, order-stable string of the binding.
+        // The HMAC'd payload is a canonical, order-stable string of the binding (key-holder
+        // tamper-evidence — back-compat).
         let payload = format!(
-            "v1|{digest}|{}|{}|{secrets_gen}|{output_hash}|{exit_code}|{network}|{blobs_canon}|{output_blobs_canon}",
-            sha256_hex(source.as_bytes()),
-            sha256_hex(input.to_string().as_bytes()),
+            "v1|{digest}|{source_sha}|{input_sha}|{secrets_gen}|{output_hash}|{exit_code}|{network}|{blobs_canon}|{output_blobs_canon}",
         );
         let sig = self.signer.sign(&payload);
+
+        // in-toto Statement (v1): the SAME binding, expressed as a portable attestation whose
+        // subject is the run's output. hermetic = !network is the signed SLSA-L4-style claim.
+        // Subjects: the result hash plus every captured /output blob (content-addressed).
+        let mut subject = vec![serde_json::json!({
+            "name": "result", "digest": { "sha256": output_hash }
+        })];
+        if let Some(serde_json::Value::Object(ob)) = output_blobs {
+            for (name, sha) in ob {
+                if let Some(s) = sha.as_str() {
+                    subject.push(serde_json::json!({ "name": name, "digest": { "sha256": s } }));
+                }
+            }
+        }
+        let statement = serde_json::json!({
+            "_type": "https://in-toto.io/Statement/v1",
+            "subject": subject,
+            "predicateType": PREDICATE_TYPE,
+            "predicate": {
+                "builder": { "id": "dokan", "version": env!("CARGO_PKG_VERSION") },
+                "invocation": { "invocationId": run_id.to_string(), "image": image },
+                "image_digest": digest,
+                "source_sha256": source_sha,
+                "input_sha256": input_sha,
+                "secrets_generation": secrets_gen,
+                "output_sha256": output_hash,
+                "exit": exit_code,
+                "network": network,
+                "hermetic": !network,
+                "input_blobs": input_blobs.cloned().unwrap_or(serde_json::Value::Null),
+                "output_blobs": output_blobs.cloned().unwrap_or(serde_json::Value::Null),
+            }
+        });
+        // DSSE-wrap the statement and Ed25519-sign its pre-authentication encoding. A third
+        // party verifies with the PUBLIC key alone (no shared secret) — the real public-verify.
+        let payload_bytes = serde_json::to_vec(&statement).unwrap_or_default();
+        let payload_b64 = base64::engine::general_purpose::STANDARD.encode(&payload_bytes);
+        let ed_sig = self.signer.ed_sign(&dsse_pae(DSSE_PAYLOAD_TYPE, &payload_bytes));
+        let keyid = self.signer.ed_keyid();
+        let dsse = serde_json::json!({
+            "payloadType": DSSE_PAYLOAD_TYPE,
+            "payload": payload_b64,
+            "signatures": [ { "keyid": keyid, "sig": ed_sig } ],
+        });
+
         serde_json::json!({
             "v": 1,
             "image_digest": digest,
-            "source_sha256": sha256_hex(source.as_bytes()),
-            "input_sha256": sha256_hex(input.to_string().as_bytes()),
+            "source_sha256": source_sha,
+            "input_sha256": input_sha,
             "secrets_generation": secrets_gen,
             "output_sha256": output_hash,
             "exit": exit_code,
             "network": network,
             "deterministic": !network,
+            "hermetic": !network,
             "input_blobs": input_blobs.cloned().unwrap_or(serde_json::Value::Null),
             "output_blobs": output_blobs.cloned().unwrap_or(serde_json::Value::Null),
             "alg": "hmac-sha256",
             "sig": sig,
+            "statement": statement,
+            "dsse": dsse,
+            "ed25519": { "keyid": keyid, "public_key": self.signer.ed_public_b64() },
         })
+    }
+
+    /// Recompute + check a receipt's HMAC binding with the daemon's key (the key-holder
+    /// tamper-evidence check). Complements the key-free Ed25519/DSSE verification.
+    pub fn verify_receipt_hmac(&self, receipt: &serde_json::Value) -> bool {
+        self.signer.verify_hmac(receipt)
     }
 
     /// Kill a running job's container (best-effort).
@@ -447,7 +504,7 @@ impl Executor {
         // input/output blobs) to (output, exit) under a keyed HMAC. Sound check for network=false
         // runs; advisory for networked ones.
         let receipt = self
-            .build_receipt(db, image, source, input, &result, exit_code, network, input_blobs, output_blobs.as_ref())
+            .build_receipt(db, run_id, image, source, input, &result, exit_code, network, input_blobs, output_blobs.as_ref())
             .await;
         let _ = db.set_run_receipt(run_id, &receipt).await;
         if let Some(r) = &result {

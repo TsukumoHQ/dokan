@@ -460,6 +460,38 @@ async fn deterministic_network_off_receipt_and_recall() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Receipt hardening (TSU-46 PR-A): a deterministic run's receipt carries an in-toto Statement
+/// + DSSE/Ed25519 envelope and verifies OFFLINE (no re-execution) under both the public-key
+/// (Ed25519) and key-holder (HMAC) paths, marked hermetic because the network was disabled.
+#[tokio::test]
+async fn deterministic_receipt_verifies_ed25519_and_hmac() -> anyhow::Result<()> {
+    let c = spawn().await?;
+    let src = "echo '::dokan:result:: {\"x\":2}'\n";
+    let sid = call(&c, "upload_script",
+        json!({"name": "verify-probe", "runtime": "bash", "source": src, "network": false}))
+        .await?["script_id"].as_i64().unwrap();
+    let r = call(&c, "run_script", json!({"script_id": sid, "agent_id": "test"})).await?;
+    let id = r["run_id"].as_i64().unwrap();
+    assert_eq!(wait_status(&c, id, 60).await, "succeeded", "ran");
+    // Receipt now carries the in-toto Statement + DSSE envelope alongside the legacy HMAC.
+    let rec = call(&c, "get_receipt", json!({"run_id": id})).await?;
+    assert!(
+        rec["dsse"]["signatures"][0]["sig"].as_str().map(|s| !s.is_empty()).unwrap_or(false),
+        "ed25519/dsse sig present: {rec}"
+    );
+    assert_eq!(rec["hermetic"], true, "network-off → hermetic: {rec}");
+    assert_eq!(rec["statement"]["predicateType"], "https://dokan.dev/Run/v1", "in-toto predicate: {rec}");
+    // verify (offline, no re-exec): both signature paths valid + statement bound to this output.
+    let v = call(&c, "verify", json!({"run_id": id})).await?;
+    assert_eq!(v["ok"], true, "verify ok: {v}");
+    assert_eq!(v["ed25519_valid"], true, "ed25519 valid: {v}");
+    assert_eq!(v["hmac_valid"], true, "hmac valid: {v}");
+    assert_eq!(v["binding_consistent"], true, "binding consistent: {v}");
+    assert_eq!(v["hermetic"], true, "hermetic: {v}");
+    c.cancel().await?;
+    Ok(())
+}
+
 /// Run artifacts (output): capture_output mounts a writable /output; a job that writes a file
 /// there has it captured as a content-addressed blob, surfaced as output_blobs={name: sha} on
 /// wait_for, folded into the receipt, and downloadable via download_blob. (TSU-56.)
