@@ -166,13 +166,28 @@ ALTER TABLE scripts ADD COLUMN IF NOT EXISTS feed_prev_result BOOLEAN NOT NULL D
 -- Signed reproducibility receipt: proof of what produced a run's output.
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS receipt JSONB;
 
--- Idempotency: an explicit agent-supplied key. A run_script carrying a key that already
--- exists returns the existing run instead of enqueuing a duplicate (exactly-once intent).
+-- Idempotency: an explicit agent-supplied (or webhook-derived) key. A run carrying a key that
+-- already exists collapses to the existing run instead of enqueuing a duplicate. TRUE
+-- exactly-once is enforced by a PARTIAL UNIQUE index + an atomic insert-or-return
+-- (INSERT ... ON CONFLICT DO NOTHING RETURNING) in code — NOT best-effort check-then-insert: two
+-- near-simultaneous identical requests now collapse to one run instead of racing to two.
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS idempotency_key TEXT;
-CREATE INDEX IF NOT EXISTS idx_runs_idempotency ON runs (idempotency_key) WHERE idempotency_key IS NOT NULL;
+-- DEPLOY NOTE: the unique index cannot build while duplicate keys exist, so first NULL out any
+-- EXISTING duplicates (keep the earliest row per key). This UPDATE touches LIVE prod data the
+-- first time an executor carrying this migration boots — sequence the rollout accordingly.
+-- Idempotent + dup-safe: a second run is a no-op once the duplicates are already cleared.
+UPDATE runs r SET idempotency_key = NULL
+ WHERE idempotency_key IS NOT NULL
+   AND id <> (SELECT MIN(id) FROM runs r2 WHERE r2.idempotency_key = r.idempotency_key);
+DROP INDEX IF EXISTS idx_runs_idempotency;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_runs_idempotency ON runs (idempotency_key) WHERE idempotency_key IS NOT NULL;
 -- Same idempotency key on flow_runs, so a webhook→flow redelivery dedups too (TSU follow-up to #18).
 ALTER TABLE flow_runs ADD COLUMN IF NOT EXISTS idempotency_key TEXT;
-CREATE INDEX IF NOT EXISTS idx_flow_runs_idempotency ON flow_runs (idempotency_key) WHERE idempotency_key IS NOT NULL;
+UPDATE flow_runs r SET idempotency_key = NULL
+ WHERE idempotency_key IS NOT NULL
+   AND id <> (SELECT MIN(id) FROM flow_runs r2 WHERE r2.idempotency_key = r.idempotency_key);
+DROP INDEX IF EXISTS idx_flow_runs_idempotency;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_flow_runs_idempotency ON flow_runs (idempotency_key) WHERE idempotency_key IS NOT NULL;
 
 -- Run-or-recall: content-addressed cache. cache_key = hash(runtime+source+input+secrets
 -- generation). A cache:true run recalls a prior succeeded run with the same key instead of

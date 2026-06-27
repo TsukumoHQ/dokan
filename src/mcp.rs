@@ -716,14 +716,6 @@ impl Dokan {
         let Some(script) = script else {
             return ok(json!({"error": "script_not_found", "id": a.script_id}));
         };
-        // Idempotency: a repeated enqueue with the same key returns the existing run.
-        if let Some(key) = a.idempotency_key.as_deref() {
-            if let Some((run_id, status)) =
-                self.db.find_run_by_idempotency(key).await.map_err(internal)?
-            {
-                return ok(json!({"run_id": run_id, "status": status, "idempotent": true}));
-            }
-        }
         let input = destringify(a.input.unwrap_or(json!({})));
         // Run artifacts: validate every file handle exists BEFORE a run is created (unknown
         // handle → loud error, no run). Build the content-addressed input_blobs map
@@ -803,17 +795,35 @@ impl Dokan {
                 "compute_seconds_24h": spent, "budget": AGENT_COMPUTE_BUDGET_SECS
             }));
         }
-        // Enqueue only — a worker claims it from the queue (FOR UPDATE SKIP LOCKED).
-        let run_id = self
-            .db
-            .insert_run_with_blobs(a.script_id, &input, Some(aid), input_blobs.as_ref(), a.capture_output.unwrap_or(false))
-            .await
-            .map_err(internal)?;
+        // Enqueue only — a worker claims it from the queue (FOR UPDATE SKIP LOCKED). When an
+        // idempotency_key is supplied, insert-or-return atomically: two racing identical
+        // enqueues collapse to ONE run via the partial UNIQUE index (exactly-once). created=false
+        // recalls the existing run and returns the `idempotent: true` shape.
+        let run_id = if let Some(key) = a.idempotency_key.as_deref() {
+            let (id, created) = self
+                .db
+                .insert_run_idempotent(a.script_id, &input, Some(aid), input_blobs.as_ref(), a.capture_output.unwrap_or(false), key)
+                .await
+                .map_err(internal)?;
+            if !created {
+                let status = self
+                    .db
+                    .find_run_by_idempotency(key)
+                    .await
+                    .map_err(internal)?
+                    .map(|(_, st)| st)
+                    .unwrap_or_else(|| "pending".to_string());
+                return ok(json!({"run_id": id, "status": status, "idempotent": true}));
+            }
+            id
+        } else {
+            self.db
+                .insert_run_with_blobs(a.script_id, &input, Some(aid), input_blobs.as_ref(), a.capture_output.unwrap_or(false))
+                .await
+                .map_err(internal)?
+        };
         if let Some(key) = &cache_key {
             let _ = self.db.set_run_cache_key(run_id, key).await;
-        }
-        if let Some(key) = a.idempotency_key.as_deref() {
-            let _ = self.db.set_run_idempotency(run_id, key).await;
         }
         let mut out = json!({"run_id": run_id, "status": "pending"});
         if let Some(key) = cache_key {
