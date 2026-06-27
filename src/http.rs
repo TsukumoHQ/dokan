@@ -75,42 +75,51 @@ async fn webhook_fire(
     // enqueue (provider delivery-id header, else hash of token+body).
     let idem = webhook_idempotency_key(&token, &headers, &body);
     if kind == "flow" {
-        if let Ok(Some((existing, status))) = s.db.find_flow_run_by_idempotency(&idem).await {
-            metrics::counter!("dokan_webhook_dedup_total").increment(1);
-            return (
-                StatusCode::OK,
-                Json(json!({"flow_run_id": existing, "status": status, "idempotent": true})),
-            )
-                .into_response();
-        }
         let Some(spec) = s.db.get_flow_spec(target_id).await.ok().flatten() else {
             return (StatusCode::NOT_FOUND, "flow gone").into_response();
         };
-        match s.db.insert_flow_run(target_id, &spec, &input).await {
-            Ok(id) => {
-                let _ = s.db.set_flow_run_idempotency(id, &idem).await;
+        // Atomic insert-or-return: an at-least-once redelivery (or a true near-simultaneous
+        // race) collapses to the first flow_run via the partial UNIQUE index — exactly-once,
+        // not best-effort check-then-insert.
+        match s.db.insert_flow_run_idempotent(target_id, &spec, &input, &idem).await {
+            Ok((id, true)) => {
                 metrics::counter!("dokan_webhook_fires_total", "target" => "flow").increment(1);
                 (StatusCode::ACCEPTED, Json(json!({"flow_run_id": id, "status": "pending"}))).into_response()
+            }
+            Ok((id, false)) => {
+                metrics::counter!("dokan_webhook_dedup_total").increment(1);
+                let status = s
+                    .db
+                    .find_flow_run_by_idempotency(&idem)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|(_, st)| st)
+                    .unwrap_or_else(|| "pending".to_string());
+                (StatusCode::OK, Json(json!({"flow_run_id": id, "status": status, "idempotent": true}))).into_response()
             }
             Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "enqueue failed").into_response(),
         }
     } else {
         // Script target: webhook providers (Stripe/Calendly/GitHub) deliver at-least-once and
-        // RETRY on a slow/non-2xx response; the shared `idem` (computed above) collapses an
-        // identical redelivery to the first run instead of spawning a duplicate.
-        if let Ok(Some((existing, status))) = s.db.find_run_by_idempotency(&idem).await {
-            metrics::counter!("dokan_webhook_dedup_total").increment(1);
-            return (
-                StatusCode::OK,
-                Json(json!({"run_id": existing, "status": status, "idempotent": true})),
-            )
-                .into_response();
-        }
-        match s.db.insert_run(target_id, &input, agent_id.as_deref()).await {
-            Ok(id) => {
-                let _ = s.db.set_run_idempotency(id, &idem).await;
+        // RETRY on a slow/non-2xx response; the atomic insert-or-return collapses an identical
+        // redelivery (or a concurrent race) to the first run instead of spawning a duplicate.
+        match s.db.insert_run_idempotent(target_id, &input, agent_id.as_deref(), None, false, &idem).await {
+            Ok((id, true)) => {
                 metrics::counter!("dokan_webhook_fires_total", "target" => "script").increment(1);
                 (StatusCode::ACCEPTED, Json(json!({"run_id": id, "status": "pending"}))).into_response()
+            }
+            Ok((id, false)) => {
+                metrics::counter!("dokan_webhook_dedup_total").increment(1);
+                let status = s
+                    .db
+                    .find_run_by_idempotency(&idem)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|(_, st)| st)
+                    .unwrap_or_else(|| "pending".to_string());
+                (StatusCode::OK, Json(json!({"run_id": id, "status": status, "idempotent": true}))).into_response()
             }
             Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "enqueue failed").into_response(),
         }
@@ -121,8 +130,8 @@ async fn webhook_fire(
 /// (Stripe/GitHub/generic) so legitimate distinct events with identical bodies aren't
 /// collapsed; falls back to a hash of (token + raw body) so a verbatim retry of a provider
 /// that sends no delivery id still dedups. Namespaced by token so two webhooks never collide.
-/// Best-effort (check-then-insert, mirroring the MCP run path): near-simultaneous retries can
-/// still race to two runs, but real provider retries are seconds apart.
+/// Enforced exactly-once: the key feeds an atomic insert-or-return against a partial UNIQUE
+/// index, so even near-simultaneous retries collapse to a single run.
 fn webhook_idempotency_key(token: &str, headers: &HeaderMap, body: &[u8]) -> String {
     const DELIVERY_HEADERS: [&str; 4] =
         ["idempotency-key", "x-idempotency-key", "x-github-delivery", "x-request-id"];

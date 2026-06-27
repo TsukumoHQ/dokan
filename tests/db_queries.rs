@@ -202,3 +202,74 @@ async fn run_with_input_file_validates_and_persists_blobs() -> anyhow::Result<()
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn insert_run_idempotent_collapses_to_one_run() -> anyhow::Result<()> {
+    // The atomic insert-or-return contract: the first call creates (created=true); a second
+    // call with the SAME key recalls the first run (created=false) — exactly-once, no duplicate
+    // row. This is the unit-level proof behind the webhook/run dedup wire tests.
+    let db = Db::connect(&db_url()).await?;
+    db.migrate().await?;
+
+    let (sid, _) = db
+        .insert_script("idem-run", "bash", "echo hi", None, None, true, None, None, false, None)
+        .await?;
+    let key = format!("idem-test-{}", dokan::crypto::random_token());
+
+    let (first_id, created1) = db
+        .insert_run_idempotent(sid, &serde_json::json!({"n": 1}), Some("agent-x"), None, false, &key)
+        .await?;
+    assert!(created1, "first call creates the run");
+
+    let (second_id, created2) = db
+        .insert_run_idempotent(sid, &serde_json::json!({"n": 1}), Some("agent-x"), None, false, &key)
+        .await?;
+    assert!(!created2, "second call with the same key recalls, does not create");
+    assert_eq!(first_id, second_id, "same run_id returned on the recall");
+
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM runs WHERE idempotency_key = $1")
+        .bind(&key)
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(n, 1, "exactly one row despite two identical idempotent inserts");
+    Ok(())
+}
+
+#[tokio::test]
+async fn insert_flow_run_idempotent_collapses_and_builds_steps_once() -> anyhow::Result<()> {
+    // Same exactly-once contract for flow_runs, plus: the flow_steps ledger is built ONLY for
+    // the freshly inserted flow_run, never duplicated on the recall.
+    let db = Db::connect(&db_url()).await?;
+    db.migrate().await?;
+
+    let spec = serde_json::json!({"steps": [{"id": "a", "script_id": 0, "input": {}}]});
+    let flow_id: i64 = sqlx::query_scalar("INSERT INTO flows (name, spec) VALUES ($1, $2) RETURNING id")
+        .bind(format!("idem-flow-{}", dokan::crypto::random_token()))
+        .bind(&spec)
+        .fetch_one(&db.pool)
+        .await?;
+    let key = format!("idem-flow-key-{}", dokan::crypto::random_token());
+
+    let (first_id, created1) = db
+        .insert_flow_run_idempotent(flow_id, &spec, &serde_json::json!({}), &key)
+        .await?;
+    assert!(created1, "first call creates the flow_run");
+
+    let (second_id, created2) = db
+        .insert_flow_run_idempotent(flow_id, &spec, &serde_json::json!({}), &key)
+        .await?;
+    assert!(!created2, "second call with the same key recalls, does not create");
+    assert_eq!(first_id, second_id, "same flow_run_id on the recall");
+
+    let runs: i64 = sqlx::query_scalar("SELECT count(*) FROM flow_runs WHERE idempotency_key = $1")
+        .bind(&key)
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(runs, 1, "exactly one flow_run despite two identical inserts");
+    let steps: i64 = sqlx::query_scalar("SELECT count(*) FROM flow_steps WHERE flow_run_id = $1")
+        .bind(first_id)
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(steps, 1, "steps built exactly once (only on the fresh insert)");
+    Ok(())
+}

@@ -632,6 +632,50 @@ impl Db {
         Ok(id)
     }
 
+    /// Atomic insert-or-return for the idempotent run paths (webhook script target + MCP
+    /// run_script carrying an `idempotency_key`). ONE race-safe statement: insert the run, but if
+    /// the partial UNIQUE index `uq_runs_idempotency` already holds this key, DO NOTHING and
+    /// recall the existing row's id. Two near-simultaneous identical requests therefore collapse
+    /// to a SINGLE run — true exactly-once, replacing the old best-effort check-then-insert (which
+    /// could race to two runs). Returns `(run_id, created)`; `created == false` means an existing
+    /// run was recalled (the caller answers `idempotent: true`). Mirrors the column set of
+    /// `insert_run_with_blobs`.
+    pub async fn insert_run_idempotent(
+        &self,
+        script_id: i64,
+        input: &serde_json::Value,
+        agent_id: Option<&str>,
+        input_blobs: Option<&serde_json::Value>,
+        capture_output: bool,
+        idem_key: &str,
+    ) -> Result<(i64, bool)> {
+        // The ON CONFLICT target must repeat the index's partial predicate to infer it.
+        let inserted: Option<i64> = sqlx::query_scalar(
+            "INSERT INTO runs (script_id, input, status, agent_id, input_blobs, capture_output, idempotency_key) \
+             VALUES ($1, $2, 'pending', $3, $4, $5, $6) \
+             ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING \
+             RETURNING id",
+        )
+        .bind(script_id)
+        .bind(input)
+        .bind(agent_id)
+        .bind(input_blobs)
+        .bind(capture_output)
+        .bind(idem_key)
+        .fetch_optional(&self.pool)
+        .await?;
+        if let Some(id) = inserted {
+            self.notify_runs().await;
+            return Ok((id, true));
+        }
+        // Conflict (redelivery or lost race): the key already exists — recall the first run.
+        let id: i64 = sqlx::query_scalar("SELECT id FROM runs WHERE idempotency_key = $1")
+            .bind(idem_key)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok((id, false))
+    }
+
     // ---- blobs (run artifacts, v0.2.2): content-addressed input store ----
 
     /// Store bytes content-addressed by their sha256 hex. Re-storing identical bytes is a
@@ -810,8 +854,9 @@ impl Db {
         Ok(v)
     }
 
-    /// Find a prior run by idempotency key: (run_id, status). Exactly-once intent — a
-    /// repeated run_script with the same key returns this instead of a duplicate.
+    /// Recall the existing run for an idempotency key: (run_id, status). Used on the recall
+    /// branch of the atomic `insert_run_idempotent` to report the live status in the
+    /// `idempotent: true` response.
     pub async fn find_run_by_idempotency(&self, key: &str) -> Result<Option<(i64, String)>> {
         let row = sqlx::query(
             "SELECT id, status FROM runs WHERE idempotency_key = $1 ORDER BY id DESC LIMIT 1",
@@ -822,17 +867,8 @@ impl Db {
         Ok(row.map(|r| (r.get("id"), r.get("status"))))
     }
 
-    pub async fn set_run_idempotency(&self, id: i64, key: &str) -> Result<()> {
-        sqlx::query("UPDATE runs SET idempotency_key = $2 WHERE id = $1")
-            .bind(id)
-            .bind(key)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
-    /// Flow-run equivalents of the above — a webhook firing a FLOW dedups the same way a webhook
-    /// firing a script does, so an at-least-once provider retry collapses to the first flow run.
+    /// Flow-run equivalent — recalls the existing flow_run's (id, status) for the
+    /// `idempotent: true` response on the flow-target webhook recall branch.
     pub async fn find_flow_run_by_idempotency(&self, key: &str) -> Result<Option<(i64, String)>> {
         let row = sqlx::query(
             "SELECT id, status FROM flow_runs WHERE idempotency_key = $1 ORDER BY id DESC LIMIT 1",
@@ -841,15 +877,6 @@ impl Db {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(|r| (r.get("id"), r.get("status"))))
-    }
-
-    pub async fn set_flow_run_idempotency(&self, id: i64, key: &str) -> Result<()> {
-        sqlx::query("UPDATE flow_runs SET idempotency_key = $2 WHERE id = $1")
-            .bind(id)
-            .bind(key)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
     }
 
     /// Retention GC: delete logs + terminal runs older than `days`. Keeps recent history and
@@ -1479,6 +1506,78 @@ impl Db {
         }
         tx.commit().await?;
         Ok(flow_run_id)
+    }
+
+    /// Atomic insert-or-return for the idempotent flow-run path (webhook flow target). Same
+    /// exactly-once contract as `insert_run_idempotent`: a redelivery or a racing duplicate
+    /// collapses to the FIRST flow_run via the partial UNIQUE index `uq_flow_runs_idempotency`.
+    /// The flow_steps ledger (mirrored from `insert_flow_run`) is built ONLY for a freshly
+    /// inserted flow_run — a recalled one already has its steps. Returns `(flow_run_id, created)`.
+    pub async fn insert_flow_run_idempotent(
+        &self,
+        flow_id: i64,
+        spec: &serde_json::Value,
+        input: &serde_json::Value,
+        idem_key: &str,
+    ) -> Result<(i64, bool)> {
+        let mut tx = self.pool.begin().await?;
+        // ON CONFLICT target repeats the partial predicate to infer the index.
+        let inserted: Option<i64> = sqlx::query_scalar(
+            "INSERT INTO flow_runs (flow_id, input, idempotency_key) VALUES ($1, $2, $3) \
+             ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING \
+             RETURNING id",
+        )
+        .bind(flow_id)
+        .bind(input)
+        .bind(idem_key)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(flow_run_id) = inserted else {
+            // Conflict: recall the existing flow_run; create no steps.
+            tx.rollback().await?;
+            let id: i64 = sqlx::query_scalar("SELECT id FROM flow_runs WHERE idempotency_key = $1")
+                .bind(idem_key)
+                .fetch_one(&self.pool)
+                .await?;
+            return Ok((id, false));
+        };
+
+        // Freshly inserted — build the durability ledger (identical to insert_flow_run).
+        let steps = spec.get("steps").and_then(|s| s.as_array()).cloned().unwrap_or_default();
+        for st in steps {
+            let step_id = st.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+            let script_id = st.get("script_id").and_then(|v| v.as_i64()).unwrap_or(0);
+            let step_input = st.get("input").cloned().unwrap_or(serde_json::json!({}));
+            let deps: Vec<String> = st
+                .get("depends_on")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|d| d.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            let when_cond = st.get("when").cloned();
+            let map_ref = st.get("map").and_then(|v| v.as_str()).map(String::from);
+            let compensate = st.get("compensate").and_then(|v| v.as_i64());
+            let retries = st.get("retries").and_then(|v| v.as_i64());
+            let cache = st.get("cache").and_then(|v| v.as_bool()).unwrap_or(false);
+            sqlx::query(
+                "INSERT INTO flow_steps \
+                 (flow_run_id, step_id, script_id, input, depends_on, when_cond, map_ref, compensate, retries, cache) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+            )
+            .bind(flow_run_id)
+            .bind(step_id)
+            .bind(script_id)
+            .bind(step_input)
+            .bind(&deps)
+            .bind(when_cond)
+            .bind(map_ref)
+            .bind(compensate)
+            .bind(retries)
+            .bind(cache)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok((flow_run_id, true))
     }
 
     /// Claim a pending flow_run for driving (SKIP LOCKED, multi-engine safe).
