@@ -831,6 +831,27 @@ impl Db {
         Ok(())
     }
 
+    /// Flow-run equivalents of the above — a webhook firing a FLOW dedups the same way a webhook
+    /// firing a script does, so an at-least-once provider retry collapses to the first flow run.
+    pub async fn find_flow_run_by_idempotency(&self, key: &str) -> Result<Option<(i64, String)>> {
+        let row = sqlx::query(
+            "SELECT id, status FROM flow_runs WHERE idempotency_key = $1 ORDER BY id DESC LIMIT 1",
+        )
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| (r.get("id"), r.get("status"))))
+    }
+
+    pub async fn set_flow_run_idempotency(&self, id: i64, key: &str) -> Result<()> {
+        sqlx::query("UPDATE flow_runs SET idempotency_key = $2 WHERE id = $1")
+            .bind(id)
+            .bind(key)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Retention GC: delete logs + terminal runs older than `days`. Keeps recent history and
     /// all non-terminal runs. Returns (runs deleted, logs deleted). (T3 — Postgres bounded.)
     pub async fn gc_old(&self, days: f64) -> Result<(u64, u64)> {

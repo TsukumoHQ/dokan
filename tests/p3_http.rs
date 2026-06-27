@@ -350,3 +350,74 @@ async fn webhook_fires_without_bearer() -> anyhow::Result<()> {
     let _ = child.kill().await;
     Ok(())
 }
+
+/// A webhook pointing at a FLOW dedups an at-least-once redelivery the same way the script
+/// path does: the second identical POST returns the first flow_run (200 + idempotent), not a
+/// fresh enqueue. (TSU follow-up to #18 — the flow-target branch had no idempotency.)
+#[tokio::test]
+async fn webhook_flow_target_dedups() -> anyhow::Result<()> {
+    let port = free_port();
+    let base = format!("http://127.0.0.1:{port}");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dokan"))
+        .args(["--transport", "http", "--addr", &format!("127.0.0.1:{port}")])
+        .env("DOKAN_DEV_INSECURE", "1")
+        .kill_on_drop(true)
+        .spawn()?;
+
+    let cli = reqwest::Client::new();
+    let mut up = false;
+    for _ in 0..50 {
+        if let Ok(r) = cli.get(format!("{base}/metrics")).send().await {
+            if r.status().is_success() { up = true; break; }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(up, "dokan http did not come up");
+
+    // Seed a minimal flow (empty steps — we only exercise webhook enqueue dedup, not execution)
+    // and a webhook pointing at it.
+    let pool = sqlx::postgres::PgPool::connect(&db_url()).await?;
+    let flow_id: i64 = sqlx::query("INSERT INTO flows (name, spec) VALUES ($1, $2) RETURNING id")
+        .bind(format!("wh-flow-{port}"))
+        .bind(json!({"steps": []}))
+        .fetch_one(&pool)
+        .await?
+        .get("id");
+    let hook_token = format!("whflow-{port}");
+    sqlx::query("INSERT INTO webhooks (token, target_kind, target_id) VALUES ($1, 'flow', $2)")
+        .bind(&hook_token)
+        .bind(flow_id)
+        .execute(&pool)
+        .await?;
+
+    // First delivery -> 202 + a flow_run_id.
+    let first = cli
+        .post(format!("{base}/hook/{hook_token}"))
+        .json(&json!({"event": "ping"}))
+        .send()
+        .await?;
+    assert_eq!(first.status(), 202, "first flow webhook accepted");
+    let first_body: serde_json::Value = first.json().await?;
+    let flow_run_id = first_body["flow_run_id"].as_i64().expect(&first_body.to_string());
+
+    // Identical redelivery -> 200 + idempotent + the SAME flow_run_id, no second flow_run.
+    let again = cli
+        .post(format!("{base}/hook/{hook_token}"))
+        .json(&json!({"event": "ping"}))
+        .send()
+        .await?;
+    assert_eq!(again.status(), 200, "identical redelivery dedups (200, not a fresh 202)");
+    let again_body: serde_json::Value = again.json().await?;
+    assert_eq!(again_body["idempotent"], json!(true), "marked idempotent: {again_body}");
+    assert_eq!(again_body["flow_run_id"].as_i64(), Some(flow_run_id), "same flow_run_id");
+    let n: i64 = sqlx::query("SELECT count(*) AS n FROM flow_runs WHERE flow_id = $1")
+        .bind(flow_id)
+        .fetch_one(&pool)
+        .await?
+        .get("n");
+    assert_eq!(n, 1, "exactly one flow_run despite two identical deliveries");
+
+    let _ = child.kill().await;
+    Ok(())
+}

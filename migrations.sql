@@ -170,6 +170,9 @@ ALTER TABLE runs ADD COLUMN IF NOT EXISTS receipt JSONB;
 -- exists returns the existing run instead of enqueuing a duplicate (exactly-once intent).
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS idempotency_key TEXT;
 CREATE INDEX IF NOT EXISTS idx_runs_idempotency ON runs (idempotency_key) WHERE idempotency_key IS NOT NULL;
+-- Same idempotency key on flow_runs, so a webhook→flow redelivery dedups too (TSU follow-up to #18).
+ALTER TABLE flow_runs ADD COLUMN IF NOT EXISTS idempotency_key TEXT;
+CREATE INDEX IF NOT EXISTS idx_flow_runs_idempotency ON flow_runs (idempotency_key) WHERE idempotency_key IS NOT NULL;
 
 -- Run-or-recall: content-addressed cache. cache_key = hash(runtime+source+input+secrets
 -- generation). A cache:true run recalls a prior succeeded run with the same key instead of
