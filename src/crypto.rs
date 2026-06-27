@@ -20,6 +20,22 @@ pub fn random_token() -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+/// The single, explicit escape hatch (`DOKAN_DEV_INSECURE=1` / `true`) that permits booting
+/// without `DOKAN_SECRET_KEY` / `DOKAN_RECEIPT_KEY`. Without it the daemon refuses to start
+/// insecurely (see `preflight_security` in `main.rs`). Shared by the crypto + receipt sites so
+/// there is exactly one knob. For local dev + CI only — never set it in production.
+pub fn dev_insecure() -> bool {
+    std::env::var("DOKAN_DEV_INSECURE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Whether a non-empty `DOKAN_SECRET_KEY` is configured (i.e. secrets will be sealed at rest
+/// rather than stored plaintext). Used by the boot-time fail-closed preflight.
+pub fn secret_key_configured() -> bool {
+    std::env::var("DOKAN_SECRET_KEY").map(|k| !k.is_empty()).unwrap_or(false)
+}
+
 #[derive(Clone)]
 pub struct SecretCrypto {
     cipher: Option<ChaCha20Poly1305>,
@@ -34,7 +50,19 @@ impl SecretCrypto {
                 Self { cipher: Some(ChaCha20Poly1305::new(&digest)) }
             }
             _ => {
-                tracing::warn!("DOKAN_SECRET_KEY unset — secrets stored in plaintext at rest");
+                // Reaching here in the daemon implies the escape hatch is set —
+                // `preflight_security` refuses to boot otherwise. Warn LOUDLY either way.
+                if dev_insecure() {
+                    tracing::warn!(
+                        "DOKAN_SECRET_KEY unset and DOKAN_DEV_INSECURE set — secrets are stored \
+                         UNENCRYPTED (plaintext) at rest. Dev/test only; never run this in production."
+                    );
+                } else {
+                    tracing::error!(
+                        "DOKAN_SECRET_KEY unset — secrets would be stored in plaintext. Set \
+                         DOKAN_SECRET_KEY, or DOKAN_DEV_INSECURE=1 for local dev."
+                    );
+                }
                 Self { cipher: None }
             }
         }

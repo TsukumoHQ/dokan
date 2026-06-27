@@ -26,7 +26,8 @@ async fn spawn() -> anyhow::Result<RunningService<RoleClient, ()>> {
     Ok(()
         .serve(TokioChildProcess::new(
             Command::new(env!("CARGO_BIN_EXE_dokan")).configure(|cmd| {
-                cmd.arg("--transport").arg("stdio");
+                // GAP-4: the daemon fails closed without crypto keys; opt into dev defaults.
+                cmd.arg("--transport").arg("stdio").env("DOKAN_DEV_INSECURE", "1");
             }),
         )?)
         .await?)

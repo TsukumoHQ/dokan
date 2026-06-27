@@ -34,7 +34,8 @@ async fn semantic_ranks_without_lexical_overlap() -> anyhow::Result<()> {
     let c = ()
         .serve(TokioChildProcess::new(
             Command::new(env!("CARGO_BIN_EXE_dokan")).configure(|cmd| {
-                cmd.arg("--transport").arg("stdio").arg("--embed");
+                // GAP-4: the daemon fails closed without crypto keys; opt into dev defaults.
+                cmd.arg("--transport").arg("stdio").arg("--embed").env("DOKAN_DEV_INSECURE", "1");
             }),
         )?)
         .await?;

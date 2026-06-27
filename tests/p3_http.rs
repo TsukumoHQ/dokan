@@ -56,6 +56,8 @@ async fn operator_surface_and_relay() -> anyhow::Result<()> {
             "--token", token,
             "--relay-url", &format!("http://127.0.0.1:{relay_port}/"),
         ])
+        // GAP-4: the daemon fails closed without crypto keys; opt into dev defaults.
+        .env("DOKAN_DEV_INSECURE", "1")
         .kill_on_drop(true)
         .spawn()?;
 
@@ -191,6 +193,8 @@ async fn per_script_mem_override() -> anyhow::Result<()> {
             "--addr", &format!("127.0.0.1:{port}"),
             "--token", token,
         ])
+        // GAP-4: the daemon fails closed without crypto keys; opt into dev defaults.
+        .env("DOKAN_DEV_INSECURE", "1")
         .kill_on_drop(true)
         .spawn()?;
 
@@ -266,6 +270,8 @@ async fn webhook_fires_without_bearer() -> anyhow::Result<()> {
             "--addr", &format!("127.0.0.1:{port}"),
             "--token", token,
         ])
+        // GAP-4: the daemon fails closed without crypto keys; opt into dev defaults.
+        .env("DOKAN_DEV_INSECURE", "1")
         .kill_on_drop(true)
         .spawn()?;
 

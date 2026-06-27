@@ -13,7 +13,7 @@ use dokan::db::Db;
 use dokan::exec::Executor;
 use dokan::mcp::Dokan;
 use dokan::worker::Worker;
-use dokan::{embed, exec, flow, http, scale};
+use dokan::{crypto, embed, exec, flow, http, receipt, scale};
 
 #[derive(Parser, Debug)]
 #[command(name = "dokan", version, about = "Agent-operated script runtime (MCP-first)")]
@@ -97,6 +97,11 @@ async fn main() -> Result<()> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "dokan=info".into()))
         .with_writer(std::io::stderr)
         .init();
+
+    // Fail closed on missing crypto keys (GAP-4). Refuse to boot insecurely unless the
+    // operator explicitly opts in with DOKAN_DEV_INSECURE=1. Runs before any DB/Docker work
+    // so an insecure misconfiguration is caught at the door, loudly and actionably.
+    preflight_security()?;
 
     let db = Db::connect(&cli.database_url).await?;
     db.migrate().await?;
@@ -360,6 +365,48 @@ async fn serve_http(
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("dokan listening: MCP http://{addr}/mcp · UI http://{addr}/");
     axum::serve(listener, app).await?;
+    Ok(())
+}
+
+/// Boot-time security gate (GAP-4): both crypto keys are validated together, before the
+/// daemon does anything. Missing keys are insecure defaults — plaintext secrets at rest and
+/// forgeable receipts — so we FAIL CLOSED by default. `DOKAN_DEV_INSECURE=1` is the single,
+/// explicit escape hatch for local dev + CI; with it set, the per-key `from_env()` paths warn
+/// loudly and proceed with the insecure behavior. The dev/plaintext code paths are retained,
+/// now gated behind this flag rather than reachable by accident.
+fn preflight_security() -> Result<()> {
+    if crypto::dev_insecure() {
+        tracing::warn!(
+            "DOKAN_DEV_INSECURE set — booting in INSECURE dev mode. Any unset crypto key falls \
+             back to an insecure default (plaintext secrets / public receipt key). Never set this \
+             in production."
+        );
+        return Ok(());
+    }
+
+    let mut missing = Vec::new();
+    if !crypto::secret_key_configured() {
+        missing.push(
+            "DOKAN_SECRET_KEY — without it, secrets are stored in PLAINTEXT at rest (a DB dump \
+             leaks every API key).",
+        );
+    }
+    if !receipt::Signer::key_configured() {
+        missing.push(
+            "DOKAN_RECEIPT_KEY — without it, receipts are HMAC'd with a PUBLIC dev key, so they \
+             are forgeable and NOT tamper-evident.",
+        );
+    }
+
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "refusing to start insecurely (GAP-4 fail-closed) — required crypto key(s) missing:\n  \
+             - {}\n\nFix: set the key(s) above to strong secret values. For local dev or CI where \
+             this is acceptable, set DOKAN_DEV_INSECURE=1 to explicitly opt into the insecure \
+             defaults.",
+            missing.join("\n  - ")
+        );
+    }
     Ok(())
 }
 
