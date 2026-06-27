@@ -522,6 +522,13 @@ async fn prepare_output_dir(run_id: i64) -> Result<String> {
     let home = std::env::var("HOME").map_err(|_| anyhow!("HOME unset; cannot prepare /output"))?;
     let dir = format!("{home}/.dokan/runs/{run_id}/output");
     tokio::fs::create_dir_all(&dir).await?;
+    // The job writes here as the container's own uid (often root, or a userns-remapped uid),
+    // while this host dir is owned by the dokan user. A Linux bind mount keeps host perms, so a
+    // default 0755 dir blocks the container from creating files ("Permission denied"). Make it
+    // world-writable so any uid can write; the files the job creates land 0644 by default, so
+    // dokan reads them back fine. (macOS Docker Desktop is permissive, hence Linux-only bite.)
+    use std::os::unix::fs::PermissionsExt;
+    tokio::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).await?;
     Ok(dir)
 }
 
