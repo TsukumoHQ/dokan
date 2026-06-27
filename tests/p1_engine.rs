@@ -129,6 +129,36 @@ async fn nonzero_exit_is_not_retried() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// list_runs (TSU-78) classifies a monitor's intentional non-zero exit as a VERDICT, not an
+/// ERROR — so a wall of `failed` runs no longer reads as a wall of bugs. The script_id filter
+/// scopes to one script, outcome=error surfaces only genuine failures (excludes verdicts), and
+/// `all_green` answers "is everything passing?" over the window.
+#[tokio::test]
+async fn list_runs_separates_verdict_from_error() -> anyhow::Result<()> {
+    let c = spawn().await?;
+    // A monitor that runs to completion and exits 1 = a deterministic verdict.
+    let sid = upload(&c, "bash", "echo finding\nexit 1\n").await;
+    let run = call(&c, "run_script", json!({"script_id": sid, "agent_id": "test"})).await?;
+    let id = run["run_id"].as_i64().unwrap();
+    assert_eq!(wait_status(&c, id, 60).await, "failed", "raw status still failed (back-compat)");
+    // Scoped to this script, the run classifies as a verdict — not an error — and the window is
+    // not all-green (a verdict is an unresolved finding).
+    let listed = call(&c, "list_runs", json!({"script_id": sid, "limit": 50})).await?;
+    let mine = listed["recent"].as_array().unwrap().iter()
+        .find(|r| r["run_id"].as_i64() == Some(id)).expect("run listed");
+    assert_eq!(mine["outcome"], "verdict", "exit-1 monitor = verdict: {listed}");
+    assert_eq!(listed["all_green"], false, "a verdict means not all-green: {listed}");
+    assert_eq!(listed["outcomes"]["verdict"], 1, "tallied as a verdict: {listed}");
+    // outcome=error filter excludes the verdict — the way to find REAL failures only.
+    let errs = call(&c, "list_runs", json!({"script_id": sid, "outcome": "error", "limit": 50})).await?;
+    assert!(
+        errs["recent"].as_array().unwrap().iter().all(|r| r["run_id"].as_i64() != Some(id)),
+        "verdict excluded from outcome=error: {errs}"
+    );
+    c.cancel().await?;
+    Ok(())
+}
+
 /// Secrets set over MCP are injected as env vars into the job container. (Terrain P0:
 /// leads had no way to provision API keys for monitors.)
 #[tokio::test]

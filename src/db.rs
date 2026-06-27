@@ -73,6 +73,41 @@ pub struct Run {
     pub input_blobs: Option<serde_json::Value>,
 }
 
+impl Run {
+    /// Coarse outcome class that separates a deterministic VERDICT (a monitor/gate that ran to
+    /// completion and chose a non-zero exit) from a real execution ERROR. See [`classify_outcome`].
+    pub fn outcome(&self) -> &'static str {
+        classify_outcome(&self.status, self.exit_code)
+    }
+}
+
+/// Classify a run's terminal state for operators (TSU-78). The pain: `status = 'failed'` lumps a
+/// monitor that intentionally `exit 1`s as a finding together with a genuine infra failure, so a
+/// wall of "failed" runs reads as a wall of bugs (211 of them, once) when most are healthy verdicts.
+///
+/// The discriminator is the same one the retry logic already uses (`run_outcome`): a run that ran
+/// to completion records an `exit_code`; one that couldn't execute (timeout, container vanished,
+/// setup error) records NULL.
+/// - `ok` — succeeded (exit 0).
+/// - `verdict` — ran to completion, exit 1..=127: a deterministic finding, NOT a failure.
+/// - `error` — a real execution failure: NULL exit (timeout/vanished/setup) or a signal-kill
+///   (exit ≥ 128, e.g. 137 OOM / 139 SIGSEGV — not a value a script chooses).
+/// - `canceled` / `running` / `pending` — passed through.
+pub fn classify_outcome(status: &str, exit_code: Option<i32>) -> &'static str {
+    match status {
+        "succeeded" => "ok",
+        "failed" => match exit_code {
+            Some(0) => "ok",
+            Some(n) if (1..=127).contains(&n) => "verdict",
+            _ => "error", // exit ≥ 128 (signal-killed) or NULL (couldn't execute)
+        },
+        "canceled" => "canceled",
+        "running" => "running",
+        // pending or any unknown/future status → treat as not-yet-terminal.
+        _ => "pending",
+    }
+}
+
 /// Catalog row with runtime-policy flags — for the operator UI's Scripts panel and the
 /// list_scripts surface that needs more than name+desc. Still bodiless (no source).
 #[derive(Debug, Clone)]
@@ -979,34 +1014,30 @@ impl Db {
         Ok(row.map(|r| (r.get("status"), r.get("exit_code"))))
     }
 
-    /// Recent runs, newest first, optionally filtered by status.
-    pub async fn list_runs(&self, status: Option<&str>, limit: i64) -> Result<Vec<Run>> {
-        let rows = if let Some(st) = status {
-            sqlx::query(
-                "SELECT r.id, r.script_id, r.status, r.exit_code, r.error, r.created_at, r.progress, \
-                     r.input_blobs, \
-                     s.name AS script_name, s.description AS script_description, \
-                     s.created_by AS script_created_by \
-                 FROM runs r JOIN scripts s ON s.id = r.script_id \
-                 WHERE r.status = $1 ORDER BY r.id DESC LIMIT $2",
-            )
-            .bind(st)
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await?
-        } else {
-            sqlx::query(
-                "SELECT r.id, r.script_id, r.status, r.exit_code, r.error, r.created_at, r.progress, \
-                     r.input_blobs, \
-                     s.name AS script_name, s.description AS script_description, \
-                     s.created_by AS script_created_by \
-                 FROM runs r JOIN scripts s ON s.id = r.script_id \
-                 ORDER BY r.id DESC LIMIT $1",
-            )
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await?
-        };
+    /// Recent runs, newest first, optionally filtered by status and/or script. Both filters are
+    /// optional and composable: a typed-NULL bind means "no filter on this column", so one query
+    /// serves all four combinations (script_id added for TSU-78 — scope a noisy monitor's runs).
+    pub async fn list_runs(
+        &self,
+        status: Option<&str>,
+        script_id: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<Run>> {
+        let rows = sqlx::query(
+            "SELECT r.id, r.script_id, r.status, r.exit_code, r.error, r.created_at, r.progress, \
+                 r.input_blobs, \
+                 s.name AS script_name, s.description AS script_description, \
+                 s.created_by AS script_created_by \
+             FROM runs r JOIN scripts s ON s.id = r.script_id \
+             WHERE ($1::text IS NULL OR r.status = $1) \
+               AND ($2::bigint IS NULL OR r.script_id = $2) \
+             ORDER BY r.id DESC LIMIT $3",
+        )
+        .bind(status)
+        .bind(script_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
         Ok(rows
             .into_iter()
             .map(|r| Run {
@@ -1923,5 +1954,29 @@ impl Db {
                 .fetch_one(&self.pool)
                 .await?;
         Ok(v.unwrap_or(0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::classify_outcome;
+
+    #[test]
+    fn verdict_vs_error_classification() {
+        // Clean success.
+        assert_eq!(classify_outcome("succeeded", Some(0)), "ok");
+        // A monitor that ran and chose a non-zero exit = a deterministic VERDICT, not a failure.
+        assert_eq!(classify_outcome("failed", Some(1)), "verdict");
+        assert_eq!(classify_outcome("failed", Some(2)), "verdict");
+        assert_eq!(classify_outcome("failed", Some(127)), "verdict");
+        // Couldn't execute (timeout / vanished / setup) records NULL exit = a real ERROR.
+        assert_eq!(classify_outcome("failed", None), "error");
+        // Signal-kills (≥128: 137 OOM, 139 SIGSEGV) are crashes, not chosen verdicts = ERROR.
+        assert_eq!(classify_outcome("failed", Some(137)), "error");
+        assert_eq!(classify_outcome("failed", Some(139)), "error");
+        // Non-terminal / canceled pass through.
+        assert_eq!(classify_outcome("canceled", None), "canceled");
+        assert_eq!(classify_outcome("running", None), "running");
+        assert_eq!(classify_outcome("pending", None), "pending");
     }
 }

@@ -253,10 +253,16 @@ pub struct WaitForArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListRunsArgs {
-    /// Filter by status: pending|running|succeeded|failed|canceled. Optional.
+    /// Filter by raw status: pending|running|succeeded|failed|canceled. Optional.
     pub status: Option<String>,
     /// Max rows (default 20).
     pub limit: Option<i64>,
+    /// Filter to a single script's runs (e.g. scope one noisy monitor). Optional.
+    pub script_id: Option<i64>,
+    /// Filter by classified OUTCOME: ok | verdict | error | canceled | running | pending.
+    /// `error` = real execution failures only (skips intentional monitor verdicts — the way to
+    /// find actual bugs); `verdict` = deterministic findings (a monitor that ran and exit≠0).
+    pub outcome: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -926,7 +932,7 @@ impl Dokan {
         ok(out)
     }
 
-    #[tool(description = "List recent runs with server-side status counts. Optional status filter. Cursor-light summary, not every row.")]
+    #[tool(description = "List recent runs with server-side status counts. Filters: status, script_id, and outcome. Each run carries an OUTCOME that separates a deterministic VERDICT (a monitor/gate that ran and chose exit≠0 — a finding, NOT a failure) from a real ERROR (timeout/vanished/setup/OOM). Use outcome=error to surface ONLY genuine failures (don't chase monitor verdicts as bugs); outcome=verdict for findings. The response carries `outcomes` (counts by class) and `all_green` (true iff zero errors AND zero verdicts in the window) — the quick 'is everything passing?' check. Cursor-light summary, not every row.")]
     async fn list_runs(
         &self,
         Parameters(a): Parameters<ListRunsArgs>,
@@ -939,25 +945,39 @@ impl Dokan {
             .collect();
         let rows = self
             .db
-            .list_runs(a.status.as_deref(), limit)
+            .list_runs(a.status.as_deref(), a.script_id, limit)
             .await
             .map_err(internal)?;
-        let items: Vec<_> = rows
-            .iter()
-            .map(|r| {
-                // error only when present, to stay token-frugal on the happy path.
-                let mut o = json!({"run_id": r.id, "script_id": r.script_id, "script": r.script_name, "status": r.status, "exit": r.exit_code, "at": r.created_at.to_rfc3339()});
-                if let Some(e) = &r.error {
-                    o["error"] = json!(e);
-                }
-                // Latest progress line — the cheap "what is this long run doing now" signal.
-                if let Some(p) = &r.progress {
-                    o["progress"] = json!(p);
-                }
-                o
-            })
-            .collect();
-        ok(json!({"counts": counts_obj, "recent": items}))
+        // Classify every row, optionally keep only one outcome class, and tally a per-class
+        // summary so an operator sees verdict-vs-error at a glance instead of a wall of "failed".
+        let want = a.outcome.as_deref();
+        let mut outcomes: std::collections::BTreeMap<&'static str, i64> = std::collections::BTreeMap::new();
+        let mut items: Vec<serde_json::Value> = Vec::new();
+        for r in &rows {
+            // Tally over the FULL window so `outcomes` + `all_green` reflect reality regardless
+            // of the display filter; emit only rows matching the requested outcome.
+            let outcome = r.outcome();
+            *outcomes.entry(outcome).or_insert(0) += 1;
+            if want.is_some_and(|w| w != outcome) {
+                continue;
+            }
+            // error only when present, to stay token-frugal on the happy path.
+            let mut o = json!({"run_id": r.id, "script_id": r.script_id, "script": r.script_name, "status": r.status, "outcome": outcome, "exit": r.exit_code, "at": r.created_at.to_rfc3339()});
+            if let Some(e) = &r.error {
+                o["error"] = json!(e);
+            }
+            // Latest progress line — the cheap "what is this long run doing now" signal.
+            if let Some(p) = &r.progress {
+                o["progress"] = json!(p);
+            }
+            items.push(o);
+        }
+        let outcomes_obj: serde_json::Map<String, serde_json::Value> =
+            outcomes.iter().map(|(k, v)| (k.to_string(), json!(v))).collect();
+        // all_green = nothing in the window is an error OR an unresolved verdict: every check passed.
+        let all_green = outcomes.get("error").copied().unwrap_or(0) == 0
+            && outcomes.get("verdict").copied().unwrap_or(0) == 0;
+        ok(json!({"counts": counts_obj, "outcomes": outcomes_obj, "all_green": all_green, "recent": items}))
     }
 
     #[tool(description = "Compose a flow: a declarative DAG of steps wired over MCP. Validates acyclicity. Returns flow_id. \

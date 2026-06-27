@@ -1002,11 +1002,11 @@ async fn list_runs(State(s): State<AppState>, Query(q): Query<ListQ>) -> impl In
     let counts = s.db.run_status_counts().await.unwrap_or_default();
     let counts_obj: serde_json::Map<String, serde_json::Value> =
         counts.into_iter().map(|(k, v)| (k, json!(v))).collect();
-    let rows = s.db.list_runs(None, limit).await.unwrap_or_default();
+    let rows = s.db.list_runs(None, None, limit).await.unwrap_or_default();
     let recent: Vec<_> = rows
         .iter()
         .map(|r| json!({
-            "run_id": r.id, "script_id": r.script_id, "status": r.status,
+            "run_id": r.id, "script_id": r.script_id, "status": r.status, "outcome": r.outcome(),
             "exit": r.exit_code, "error": r.error, "created_at": r.created_at.to_rfc3339(),
             "script_name": r.script_name, "script_desc": r.script_description,
             "created_by": r.script_created_by, "progress": r.progress,
