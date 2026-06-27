@@ -371,6 +371,11 @@ pub struct GetReceiptArgs {
 pub struct ReproduceArgs {
     /// The prior run to reproduce. Its receipt is the binding the new run is diffed against.
     pub run_id: i64,
+    /// Max seconds to wait for the re-run to finish (default 120, max 300). On timeout the
+    /// verdict is INCONCLUSIVE and `repro_run_id` is still running.
+    pub timeout: Option<u64>,
+    /// Provenance/quota id for the re-run (defaults to the original run's agent, else "reproduce").
+    pub agent_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1175,79 +1180,15 @@ impl Dokan {
         }
     }
 
-    #[tool(description = "Reproduce a prior run: re-run its EXACT script source + input with caching DISABLED (forces a real container, never a recall), so the new run's receipt can be diffed against the original to verify determinism. Non-blocking: returns new_run_id immediately — poll it, then get_receipt on both and compare source_sha256/input_sha256/output_sha256. Refuses with source_drift (no run created) if the script's source changed since the original — those exact bytes are gone. Still runs but warns if the original used the network or the secrets generation has moved.")]
+    #[tool(description = "Reproduce a prior run by RE-EXECUTION: re-run its EXACT recorded invocation (cache DISABLED → a real container, never a recall) and byte-compare the new output against the receipt — verify by re-execution, not by trust. The differentiator no provenance-signing tool offers, because they don't own execution. Blocks up to `timeout`s for the re-run, then returns {verdict, code, repro_run_id, ...}: REPRODUCED(0) byte-identical; DIVERGED(6) authentic receipt but a different output (the workload isn't deterministic — unseeded RNG / wall-clock / map order); TAMPERED(5) the original receipt fails verification; INCONCLUSIVE(7) can't soundly reproduce (no receipt, network was on, source drifted, or the re-run didn't finish in time). Sound only for network-disabled runs: the runtime is deterministic, your output is reproducible iff your code is — this proves which.")]
     async fn reproduce(
         &self,
         Parameters(a): Parameters<ReproduceArgs>,
     ) -> Result<CallToolResult, McpError> {
-        // The original receipt is the binding we reproduce + diff against. No receipt → nothing
-        // to verify against.
-        let Some(receipt) = self.db.run_receipt(a.run_id).await.map_err(internal)? else {
-            return ok(json!({"error": "no_receipt", "run_id": a.run_id}));
-        };
-        // Recover the snapshotted input + input-blobs + script id from the original run row.
-        let Some((script_id, input, input_blobs, agent_id, capture_output)) =
-            self.db.run_reproduce_inputs(a.run_id).await.map_err(internal)?
-        else {
-            return ok(json!({"error": "run_not_found", "run_id": a.run_id}));
-        };
-        // Source is NOT snapshotted per-run — claim_run reads it live from `scripts`, so a
-        // re-enqueue would run whatever the source is NOW. Recompute the current source hash and
-        // refuse if it drifted from the receipt: the original bytes can't be reproduced.
-        let Some(script) = self.db.get_script(script_id).await.map_err(internal)? else {
-            return ok(json!({"error": "script_not_found", "id": script_id}));
-        };
-        let current_source_sha = crate::receipt::sha256_hex(script.source.as_bytes());
-        let original_source_sha = receipt
-            .get("source_sha256")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-        if current_source_sha != original_source_sha {
-            return ok(json!({
-                "error": "source_drift",
-                "original_run_id": a.run_id,
-                "script_id": script_id,
-                "original_source_sha256": original_source_sha,
-                "current_source_sha256": current_source_sha,
-                "note": "script source changed since the original run; exact bytes can't be reproduced — no run created",
-            }));
-        }
-        // Determinism guards — still reproduce, but warn: these can make the receipts differ
-        // for reasons unrelated to the source.
-        let mut warnings: Vec<String> = Vec::new();
-        if receipt.get("network").and_then(|v| v.as_bool()).unwrap_or(false) {
-            warnings.push(
-                "original run had network enabled — output is not guaranteed deterministic".into(),
-            );
-        }
-        let current_secrets_gen = self.db.secrets_generation().await.map_err(internal)?;
-        let original_secrets_gen = receipt
-            .get("secrets_generation")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(-1);
-        if current_secrets_gen != original_secrets_gen {
-            warnings.push(format!(
-                "secrets generation moved ({original_secrets_gen} → {current_secrets_gen}) — a secret-dependent run may differ"
-            ));
-        }
-        // Re-enqueue a fresh run with caching DISABLED (no cache_key set) → the worker always
-        // spawns a real container, never a recall. Reuses the standard enqueue path; no exec
-        // logic is duplicated.
-        let new_run_id = self
-            .db
-            .insert_run_with_blobs(script_id, &input, agent_id.as_deref(), input_blobs.as_ref(), capture_output)
+        let v = reproduce_run(&self.db, &self.exec, a.run_id, a.timeout.unwrap_or(120).min(300), a.agent_id)
             .await
             .map_err(internal)?;
-        let mut out = json!({
-            "original_run_id": a.run_id,
-            "new_run_id": new_run_id,
-            "status": "running",
-            "note": "poll new_run_id, then get_receipt on both and diff source_sha256/input_sha256/output_sha256",
-        });
-        if !warnings.is_empty() {
-            out["warning"] = json!(warnings);
-        }
-        ok(out)
+        ok(v)
     }
 
     #[tool(description = "List secret names (values are write-only and never returned). Use to check which keys a job will see in its env.")]
@@ -1340,6 +1281,102 @@ impl Dokan {
             "deterministic": receipt.get("deterministic").and_then(|v| v.as_bool()).unwrap_or(false),
             "keyid": rep.keyid,
         }))
+    }
+}
+
+/// Reproduce a recorded run: re-execute the exact recorded invocation and byte-compare the new
+/// output against the original receipt. Shared by the MCP `reproduce` tool and the HTTP endpoint.
+/// Returns a verdict object — REPRODUCED(0) / DIVERGED(6) / TAMPERED(5) / INCONCLUSIVE(7) — rather
+/// than throwing, so every terminal state is a structured answer the operator can act on.
+pub(crate) async fn reproduce_run(
+    db: &crate::db::Db,
+    exec: &crate::exec::Executor,
+    run_id: i64,
+    timeout_secs: u64,
+    agent_id: Option<String>,
+) -> anyhow::Result<serde_json::Value> {
+    let verdict = |name: &str, code: i64, mut extra: serde_json::Value| {
+        extra["verdict"] = json!(name);
+        extra["code"] = json!(code);
+        extra["run_id"] = json!(run_id);
+        extra
+    };
+    // 1. The original receipt is the thing we reproduce against.
+    let Some(orig) = db.run_receipt(run_id).await? else {
+        return Ok(verdict("INCONCLUSIVE", 7, json!({"reason": "no_receipt", "detail": "original run has no receipt to compare against"})));
+    };
+    let orig_output = orig.get("output_sha256").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let orig_source = orig.get("source_sha256").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let orig_out_blobs = canonical_input_blobs(orig.get("output_blobs"));
+    let network = orig.get("network").and_then(|v| v.as_bool()).unwrap_or(true);
+
+    // 2. A networked run's output isn't a pure function of its inputs — not soundly reproducible.
+    if network {
+        return Ok(verdict("INCONCLUSIVE", 7, json!({"reason": "non_deterministic", "detail": "original run had network enabled; output is not a pure function of inputs"})));
+    }
+    // 3. If the recorded receipt itself doesn't verify, the record was altered — re-running is moot.
+    let rep = crate::receipt::verify_receipt(&orig);
+    let hmac_ok = exec.verify_receipt_hmac(&orig);
+    if !(rep.ok() && hmac_ok) {
+        return Ok(verdict("TAMPERED", 5, json!({"reason": "receipt_failed_verification", "ed25519_valid": rep.ed25519_valid, "hmac_valid": hmac_ok, "binding_consistent": rep.binding_consistent})));
+    }
+    // 4. Re-execute the recorded invocation (same script, input, input-blobs, capture flag).
+    let Some((script_id, input, input_blobs, orig_aid, capture_output)) =
+        db.run_reproduce_inputs(run_id).await?
+    else {
+        return Ok(verdict("INCONCLUSIVE", 7, json!({"reason": "run_not_found"})));
+    };
+    // Source is read live from `scripts` at claim time, not snapshotted per run — so if the
+    // script changed since the original, a re-run would execute DIFFERENT bytes. Catch that
+    // upfront (no wasted container): the exact code is gone, so the result is INCONCLUSIVE.
+    let Some(script) = db.get_script(script_id).await? else {
+        return Ok(verdict("INCONCLUSIVE", 7, json!({"reason": "script_not_found", "script_id": script_id})));
+    };
+    let current_source = crate::receipt::sha256_hex(script.source.as_bytes());
+    if current_source != orig_source {
+        return Ok(verdict("INCONCLUSIVE", 7, json!({
+            "reason": "source_changed", "script_id": script_id,
+            "original_source_sha256": orig_source, "current_source_sha256": current_source,
+            "detail": "script source changed since the original run; the exact bytes can't be reproduced — no run created"
+        })));
+    }
+    let aid = agent_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or(orig_aid)
+        .unwrap_or_else(|| "reproduce".to_string());
+    let repro_id = db
+        .insert_run_with_blobs(script_id, &input, Some(&aid), input_blobs.as_ref(), capture_output)
+        .await?;
+    // 5. Long-poll the re-run to terminal (a worker claims it from the queue).
+    let mut status = String::from("pending");
+    for _ in 0..(timeout_secs * 2) {
+        status = db.run_status(repro_id).await?.unwrap_or_else(|| "unknown".into());
+        if matches!(status.as_str(), "succeeded" | "failed" | "canceled") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    if !matches!(status.as_str(), "succeeded" | "failed") {
+        return Ok(verdict("INCONCLUSIVE", 7, json!({"repro_run_id": repro_id, "reason": "timeout_or_unrunnable", "status": status})));
+    }
+    // 6. Compare the re-run's receipt to the original.
+    let Some(repro) = db.run_receipt(repro_id).await? else {
+        return Ok(verdict("INCONCLUSIVE", 7, json!({"repro_run_id": repro_id, "reason": "no_repro_receipt"})));
+    };
+    let repro_output = repro.get("output_sha256").and_then(|v| v.as_str()).unwrap_or_default();
+    let repro_out_blobs = canonical_input_blobs(repro.get("output_blobs"));
+    if repro_output == orig_output && repro_out_blobs == orig_out_blobs {
+        Ok(verdict("REPRODUCED", 0, json!({"repro_run_id": repro_id, "output_sha256": orig_output})))
+    } else {
+        Ok(verdict("DIVERGED", 6, json!({
+            "repro_run_id": repro_id,
+            "expected_output_sha256": orig_output,
+            "actual_output_sha256": repro_output,
+            "detail": "re-execution produced a different output; the workload is not byte-reproducible (unseeded RNG / wall-clock / map iteration order)"
+        })))
     }
 }
 
