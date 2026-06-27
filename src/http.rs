@@ -71,23 +71,33 @@ async fn webhook_fire(
     let input = serde_json::from_slice::<serde_json::Value>(&body)
         .unwrap_or_else(|_| json!({ "raw": String::from_utf8_lossy(&body) }));
 
+    // Same at-least-once dedup as the script path below: collapse a redelivery to the first
+    // enqueue (provider delivery-id header, else hash of token+body).
+    let idem = webhook_idempotency_key(&token, &headers, &body);
     if kind == "flow" {
+        if let Ok(Some((existing, status))) = s.db.find_flow_run_by_idempotency(&idem).await {
+            metrics::counter!("dokan_webhook_dedup_total").increment(1);
+            return (
+                StatusCode::OK,
+                Json(json!({"flow_run_id": existing, "status": status, "idempotent": true})),
+            )
+                .into_response();
+        }
         let Some(spec) = s.db.get_flow_spec(target_id).await.ok().flatten() else {
             return (StatusCode::NOT_FOUND, "flow gone").into_response();
         };
         match s.db.insert_flow_run(target_id, &spec, &input).await {
             Ok(id) => {
+                let _ = s.db.set_flow_run_idempotency(id, &idem).await;
                 metrics::counter!("dokan_webhook_fires_total", "target" => "flow").increment(1);
                 (StatusCode::ACCEPTED, Json(json!({"flow_run_id": id, "status": "pending"}))).into_response()
             }
             Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "enqueue failed").into_response(),
         }
     } else {
-        // Idempotency: webhook providers (Stripe/Calendly/GitHub) deliver at-least-once and
-        // RETRY on a slow/non-2xx response — without this, each retry spawns a duplicate run.
-        // Collapse an identical redelivery to the first run: dedup on a provider delivery-id
-        // header if present, else on a hash of (token + body) so a verbatim replay matches.
-        let idem = webhook_idempotency_key(&token, &headers, &body);
+        // Script target: webhook providers (Stripe/Calendly/GitHub) deliver at-least-once and
+        // RETRY on a slow/non-2xx response; the shared `idem` (computed above) collapses an
+        // identical redelivery to the first run instead of spawning a duplicate.
         if let Ok(Some((existing, status))) = s.db.find_run_by_idempotency(&idem).await {
             metrics::counter!("dokan_webhook_dedup_total").increment(1);
             return (
