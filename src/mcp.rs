@@ -543,7 +543,7 @@ impl Dokan {
         ok(v)
     }
 
-    #[tool(description = "Upload a script. Returns script_id + version. Runtime: python|node|bash. INPUT CONTRACT: the script reads its input from the DOKAN_INPUT env var (a JSON string) — NOT stdin or argv. Secrets set via set_secret arrive as their own env vars (e.g. $OPENAI_API_KEY). A nonzero exit is treated as the script's own deterministic verdict (e.g. a monitor finding) and is NOT retried; only a container/infra failure retries. Pass upsert=true to re-provision by name idempotently (no duplicate rows on respawn). STRUCTURED RESULT: print a line `::dokan:result:: {json}` on stdout to attach a structured result to the run — it is captured (not logged), returned by wait_for/read_logs, and POSTed to the relay, so a monitor's finding reaches the agent event-driven. PROGRESS: print `::dokan:progress:: <text>` to set the run's live status line (latest wins, overwritten each emit) — surfaced by list_runs/read_logs/wait_for and the UI, NOT logged. Use it in a long loop (e.g. `meeting 3/6`) so the operator sees current state without paging logs; flush stdout (Python: print(..., flush=True)) so it lands live.")]
+    #[tool(description = "Upload a script. Returns script_id + version. Runtime: python|node|bash. INPUT CONTRACT: the script reads its input from the DOKAN_INPUT env var (a JSON string) — NOT stdin or argv. Secrets set via set_secret arrive as their own env vars (e.g. $OPENAI_API_KEY). A nonzero exit is treated as the script's own deterministic verdict (e.g. a monitor finding) and is NOT retried; only a container/infra failure retries. Pass upsert=true to re-provision by name idempotently (no duplicate rows on respawn). STRUCTURED RESULT: print a line `::dokan:result:: {json}` on stdout to attach a structured result to the run — it is captured (not logged), returned by wait_for/read_logs, and POSTed to the relay, so a monitor's finding reaches the agent event-driven. PROGRESS: print `::dokan:progress:: <text>` to set the run's live status line (latest wins, overwritten each emit) — surfaced by list_runs/read_logs/wait_for and the UI, NOT logged. Use it in a long loop (e.g. `meeting 3/6`) so the operator sees current state without paging logs; flush stdout (Python: print(..., flush=True)) so it lands live. STATEFUL MONITORS: set feed_prev_result=true and this script's previous structured result is injected as DOKAN_INPUT.prev_result on the next run (null on the first) — for week-over-week diffs without external state. Per-job caps: mem_limit_mb / cpu_limit / network (see args).")]
     async fn upload_script(
         &self,
         Parameters(a): Parameters<UploadArgs>,
@@ -767,7 +767,7 @@ impl Dokan {
         }
     }
 
-    #[tool(description = "Trigger a script run. Returns run_id immediately; never blocks. Poll with read_logs or wait_for. agent_id is REQUIRED: it tags provenance, selects the job's scoped secrets (global + this agent's), and meters your concurrency/compute quota — it is unauthenticated provenance, NOT an isolation/auth boundary (see SECURITY.md). INPUT FILES: pass files={\"<name>\": \"<handle>\"} (handles from upload_blob) to materialize each file READ-ONLY at /input/<name> in the container — the way to feed a job a real document (a PDF, dataset, .md). The blob shas enter the cache key + receipt, so the run stays deterministic. Unknown handle → loud error, no run created. OUTPUT FILES: set capture_output=true to mount a writable /output — dokan captures every file the job writes there as a content-addressed blob and returns output_blobs={\"<name>\": \"<sha>\"} (on wait_for/read_logs, downloadable via download_blob, folded into the receipt). Opt-in (default off keeps the fast warm path).")]
+    #[tool(description = "Trigger a script run. Returns run_id immediately; never blocks. Poll with read_logs or wait_for. agent_id is REQUIRED: it tags provenance, selects the job's scoped secrets (global + this agent's), and meters your concurrency/compute quota — it is unauthenticated provenance, NOT an isolation/auth boundary (see SECURITY.md). INPUT FILES: pass files={\"<name>\": \"<handle>\"} (handles from upload_blob) to materialize each file READ-ONLY at /input/<name> in the container — the way to feed a job a real document (a PDF, dataset, .md). The blob shas enter the cache key + receipt, so the run stays deterministic. Unknown handle → loud error, no run created. OUTPUT FILES: set capture_output=true to mount a writable /output — dokan captures every file the job writes there as a content-addressed blob and returns output_blobs={\"<name>\": \"<sha>\"} (on wait_for/read_logs, downloadable via download_blob, folded into the receipt). Opt-in (default off keeps the fast warm path). CACHE: set cache=true for run-or-recall — an identical prior run (same source+input+secrets-gen) returns its result with status \"recalled\", no container spawned (deterministic jobs only; leave false for monitors/time-sensitive runs).")]
     async fn run_script(
         &self,
         Parameters(a): Parameters<RunArgs>,
@@ -1242,7 +1242,7 @@ impl Dokan {
         ok(json!({"name": a.name, "scope": scope, "status": "set"}))
     }
 
-    #[tool(description = "Fetch a run's tamper-evident reproducibility receipt: the image digest, source/input/output hashes, secrets generation, exit, and a keyed HMAC tag (alg+sig). The HMAC lets a DOKAN_RECEIPT_KEY holder detect tampering — it is NOT a third-party-verifiable signature. For a network=false (deterministic) run it attests a recall is sound.")]
+    #[tool(description = "Fetch a run's tamper-evident reproducibility receipt: the image digest, source/input/output hashes, secrets generation, exit, a keyed HMAC tag (alg+sig), AND an Ed25519/in-toto DSSE envelope (public-key, third-party-verifiable). The HMAC is the DOKAN_RECEIPT_KEY-holder tamper check; for a key-free third-party check use `verify` (offline) or `reproduce` (re-execution). For a network=false (deterministic) run it attests a recall is sound.")]
     async fn get_receipt(
         &self,
         Parameters(a): Parameters<GetReceiptArgs>,
@@ -1478,7 +1478,16 @@ impl ServerHandler for Dokan {
              explicitly). No LLM runs inside dokan — intelligence is yours, applied at the edge. \
              Flows: compose_flow wires a DAG; steps support when (branch), map (fan-out), \
              compensate (saga rollback), retries. Poll get_flow_run — map children are collapsed \
-             into a {n,ok,failed} count, not listed individually."
+             into a {n,ok,failed} count (+ failed_children indices on partial failure), and \
+             top-level steps paginate (limit/after -> next_cursor). \
+             Provenance: every run gets a tamper-evident receipt (get_receipt); verify checks it \
+             OFFLINE (Ed25519/DSSE, no shared secret); reproduce re-executes + byte-compares \
+             (REPRODUCED/DIVERGED/TAMPERED/INCONCLUSIVE) — sound for network=false runs. \
+             Recurring: schedule (6-field cron) / create_webhook (inbound POST /hook/<token>). \
+             Secrets: set_secret (write-only, env-injected); list_secrets = names only. \
+             Errors are a uniform {error: code, message, hint?} envelope. \
+             Discover the rest with whoami (caps, your secrets, quota) and list_runs (outcome= \
+             error|verdict, all_green)."
                 .into(),
         );
         info
