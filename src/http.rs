@@ -7,7 +7,7 @@ use std::convert::Infallible;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, Path, Query, State};
@@ -90,8 +90,11 @@ async fn webhook_fire(
 ) -> impl IntoResponse {
     let now = now_secs();
     // Per-source-IP guard FIRST — the cheapest, broadest cap, so a hammering/enumerating client
-    // is shed before any token parse or DB work.
-    if !WEBHOOK_IP_LIMITER.check_at(&peer.ip().to_string(), now) {
+    // is shed before any token parse or DB work. The IP is the real client (X-Forwarded-For only
+    // when the direct peer is a trusted proxy — else the spoofable peer), so behind a tunnel the
+    // limit keys on the actual client, not the shared proxy IP.
+    let ip = client_ip(&headers, peer.ip(), &TRUSTED_PROXIES);
+    if !WEBHOOK_IP_LIMITER.check_at(&ip, now) {
         metrics::counter!("dokan_webhook_rate_limited_total").increment(1);
         return (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response();
     }
@@ -273,6 +276,31 @@ static WEBHOOK_LIMITER: LazyLock<FixedWindowLimiter> = LazyLock::new(|| FixedWin
 /// retrying provider) so a single hammering client can't overload the endpoint or probe tokens
 /// fast. Keyed by the ConnectInfo peer IP; complements the per-token limiter.
 static WEBHOOK_IP_LIMITER: LazyLock<FixedWindowLimiter> = LazyLock::new(|| FixedWindowLimiter::new(10, 100));
+
+/// Trusted reverse-proxy / tunnel IPs (TSU-189), from `DOKAN_TRUSTED_PROXIES` (comma-separated).
+/// Empty by default → X-Forwarded-For is NEVER trusted (the safe default: a spoofed XFF must not
+/// let an attacker forge their source IP and dodge the per-IP rate limit). Set this ONLY to the
+/// IP(s) of the proxy/tunnel actually in front of dokan.
+static TRUSTED_PROXIES: LazyLock<std::collections::HashSet<IpAddr>> = LazyLock::new(|| {
+    std::env::var("DOKAN_TRUSTED_PROXIES")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|s| s.trim().parse::<IpAddr>().ok())
+        .collect()
+});
+
+/// Resolve the real client IP for rate-limiting. If the direct peer is a TRUSTED proxy, take the
+/// left-most X-Forwarded-For entry (the original client it forwarded for); otherwise use the peer
+/// directly. A spoofed XFF from an UNTRUSTED peer is ignored — so it can't forge the rate-limit key.
+fn client_ip(headers: &HeaderMap, peer: IpAddr, trusted: &std::collections::HashSet<IpAddr>) -> String {
+    if trusted.contains(&peer)
+        && let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok())
+        && let Some(first) = xff.split(',').map(|s| s.trim()).find(|s| !s.is_empty())
+    {
+        return first.to_string();
+    }
+    peer.to_string()
+}
 
 fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
@@ -1368,6 +1396,35 @@ async fn set_secret(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ipset(ips: &[&str]) -> std::collections::HashSet<IpAddr> {
+        ips.iter().map(|s| s.parse().unwrap()).collect()
+    }
+    fn xff(v: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", v.parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn client_ip_ignores_xff_from_untrusted_peer() {
+        let peer: IpAddr = "203.0.113.9".parse().unwrap();
+        // Peer is NOT a trusted proxy → a spoofed XFF must be ignored (use the real peer).
+        assert_eq!(client_ip(&xff("1.2.3.4"), peer, &ipset(&["10.0.0.1"])), "203.0.113.9");
+        // Empty trusted set → never trust XFF.
+        assert_eq!(client_ip(&xff("1.2.3.4"), peer, &ipset(&[])), "203.0.113.9");
+    }
+
+    #[test]
+    fn client_ip_uses_xff_client_from_trusted_proxy() {
+        let proxy: IpAddr = "10.0.0.1".parse().unwrap();
+        let trusted = ipset(&["10.0.0.1"]);
+        // Trusted proxy → take the left-most XFF entry (the original client).
+        assert_eq!(client_ip(&xff("1.2.3.4, 10.0.0.1"), proxy, &trusted), "1.2.3.4");
+        assert_eq!(client_ip(&xff("  9.9.9.9 "), proxy, &trusted), "9.9.9.9");
+        // Trusted proxy but no XFF header → fall back to the peer.
+        assert_eq!(client_ip(&HeaderMap::new(), proxy, &trusted), "10.0.0.1");
+    }
 
     #[test]
     fn ct_eq_matches_only_identical_equal_length() {
