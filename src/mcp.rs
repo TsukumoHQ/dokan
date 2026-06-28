@@ -171,9 +171,11 @@ pub struct UploadArgs {
     /// re-upload is a cheap no-op (status "unchanged"). Default false. Use it so a respawned agent
     /// can safely re-upload and so you can tune a script's caps without perturbing its source.
     pub upsert: Option<bool>,
-    /// Network access for the job. Default true (monitors that hit APIs need it). Set FALSE
-    /// for a pure-compute script: it runs network-disabled, making its output a deterministic
-    /// function of its inputs — soundly cacheable (cache:true) and provable via its receipt.
+    /// Network access for the job. **Default FALSE (hermetic-by-default, v0.4.0).** A job runs
+    /// network-disabled unless you opt in with `network:true` — making its output a deterministic
+    /// function of its inputs by default: soundly cacheable (cache:true) and provable via its
+    /// receipt/reproduce. Set TRUE for a script that must reach the network (e.g. a monitor that
+    /// hits an API). Pre-0.4.0 the default was true; existing scripts keep their stored value.
     pub network: Option<bool>,
     /// Optional per-job memory cap in MiB; null = the executor's global default. Raise it for a
     /// heavier job that OOMs (exit 137) under the default cap. A script with any override runs
@@ -512,7 +514,7 @@ impl Dokan {
                             &a.runtime,
                             a.description.as_deref(),
                             a.created_by.as_deref(),
-                            a.network.unwrap_or(true),
+                            a.network.unwrap_or(false),
                             a.mem_limit_mb,
                             a.cpu_limit,
                             a.feed_prev_result.unwrap_or(false),
@@ -531,7 +533,7 @@ impl Dokan {
                         &a.source,
                         a.description.as_deref(),
                         a.created_by.as_deref(),
-                        a.network.unwrap_or(true),
+                        a.network.unwrap_or(false),
                         a.mem_limit_mb,
                         a.cpu_limit,
                         a.feed_prev_result.unwrap_or(false),
@@ -552,7 +554,7 @@ impl Dokan {
                 &a.source,
                 a.description.as_deref(),
                 a.created_by.as_deref(),
-                a.network.unwrap_or(true),
+                a.network.unwrap_or(false),
                 a.mem_limit_mb,
                 a.cpu_limit,
                 a.feed_prev_result.unwrap_or(false),
