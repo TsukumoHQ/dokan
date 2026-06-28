@@ -18,6 +18,17 @@ const IDLE_POLL: Duration = Duration::from_millis(400);
 /// step is never mistaken for a dead engine. 2× the job timeout gives comfortable margin.
 const FLOW_LEASE_SECS: f64 = (crate::exec::DEFAULT_TIMEOUT_SECS * 2) as f64;
 
+/// Hard cap on a single `map` fan-out's child count. Container execution is already throttled
+/// to the worker concurrency cap (each child holds a `slots` permit), but a pathological array
+/// would still create that many run rows + tokio tasks up front — bound it. A map over a larger
+/// array fails fast with a clear verdict rather than degrading the whole runtime.
+const MAX_MAP_FANOUT: usize = 1000;
+
+/// Whether a map fan-out of `n` children is within the cap. Pure — unit-tested.
+fn fanout_within_cap(n: usize) -> bool {
+    n <= MAX_MAP_FANOUT
+}
+
 #[derive(Clone)]
 pub struct FlowEngine {
     db: Db,
@@ -241,6 +252,17 @@ impl FlowEngine {
                 .await
                 .ok();
             metrics::counter!("dokan_flow_steps_finished_total", "status" => "succeeded").increment(1);
+            return;
+        }
+        // Backpressure guard: refuse a fan-out wider than the cap rather than create thousands
+        // of run rows + tokio tasks at once. Fail the parent with a clear, terminal verdict.
+        if !fanout_within_cap(items.len()) {
+            self.db
+                .finish_step(flow_run_id, &step.step_id, "failed", Some("map_fanout_too_large"))
+                .await
+                .ok();
+            metrics::counter!("dokan_flow_steps_finished_total", "status" => "failed").increment(1);
+            tracing::warn!(flow_run_id, step = %step.step_id, count = items.len(), cap = MAX_MAP_FANOUT, "map fan-out exceeds cap");
             return;
         }
         let children: Vec<_> = items
@@ -891,5 +913,12 @@ mod tests {
     #[test]
     fn validate_rejects_empty_steps() {
         assert!(validate_spec(&spec(json!([]))).unwrap_err().contains("empty"));
+    }
+
+    #[test]
+    fn map_fanout_cap_bounds_child_count() {
+        assert!(fanout_within_cap(1));
+        assert!(fanout_within_cap(MAX_MAP_FANOUT));
+        assert!(!fanout_within_cap(MAX_MAP_FANOUT + 1), "one over the cap is refused");
     }
 }

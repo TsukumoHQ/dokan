@@ -1058,26 +1058,53 @@ impl Dokan {
         // Token-frugal: a map fan-out can have thousands of `<id>#<i>` children. Collapse
         // them into a per-parent {n, ok, failed} count instead of listing every child (and
         // drop the parent's aggregated array `out`, which would re-inline all child outputs).
-        let mut child: std::collections::HashMap<String, (u32, u32, u32)> =
-            std::collections::HashMap::new();
+        // On partial failure also surface WHICH child indices failed (capped) so the operator
+        // can see what broke without paging every child.
+        #[derive(Default)]
+        struct MapAgg {
+            n: u32,
+            ok: u32,
+            failed: u32,
+            failed_idx: Vec<i64>,
+        }
+        let mut child: std::collections::HashMap<String, MapAgg> = std::collections::HashMap::new();
         for s in &steps {
             if let Some(i) = s.step_id.find('#') {
                 let e = child.entry(s.step_id[..i].to_string()).or_default();
-                e.0 += 1;
+                e.n += 1;
                 match s.status.as_str() {
-                    "succeeded" => e.1 += 1,
-                    "failed" => e.2 += 1,
+                    "succeeded" => e.ok += 1,
+                    "failed" => {
+                        e.failed += 1;
+                        if let Ok(idx) = s.step_id[i + 1..].parse::<i64>() {
+                            e.failed_idx.push(idx);
+                        }
+                    }
                     _ => {}
                 }
             }
         }
+        // Cap the surfaced failed-index list so a huge fan-out stays token-frugal.
+        const FAILED_IDX_CAP: usize = 20;
         let items: Vec<_> = steps
             .iter()
             .filter(|s| !s.step_id.contains('#'))
             .map(|s| {
                 let mut o = json!({"id": s.step_id, "status": s.status});
                 match child.get(&s.step_id) {
-                    Some((n, ok, failed)) => o["map"] = json!({"n": n, "ok": ok, "failed": failed}),
+                    Some(a) => {
+                        let mut m = json!({"n": a.n, "ok": a.ok, "failed": a.failed});
+                        if a.failed > 0 {
+                            let mut idx = a.failed_idx.clone();
+                            idx.sort_unstable();
+                            m["failed_children"] =
+                                json!(idx.iter().take(FAILED_IDX_CAP).collect::<Vec<_>>());
+                            if idx.len() > FAILED_IDX_CAP {
+                                m["failed_children_truncated"] = json!(idx.len() - FAILED_IDX_CAP);
+                            }
+                        }
+                        o["map"] = m;
+                    }
                     None => o["out"] = json!(s.output),
                 }
                 if s.compensated {

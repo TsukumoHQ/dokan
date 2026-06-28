@@ -336,6 +336,12 @@ async fn flow_map_partial_failure_compensates_upstream() -> anyhow::Result<()> {
         proc["map"]["failed"].as_i64().unwrap_or(0) >= 1,
         "at least the BOOM child failed: {last}"
     );
+    // Partial-failure ergonomics: get_flow_run surfaces WHICH child index failed (BOOM = idx 1).
+    let failed_children = proc["map"]["failed_children"].as_array().expect("failed_children listed");
+    assert!(
+        failed_children.iter().any(|v| v.as_i64() == Some(1)),
+        "the BOOM child (index 1) is named in failed_children: {last}"
+    );
     // The upstream succeeded step is rolled back by the saga.
     assert_eq!(step(steps, "s0")["comp"], json!(true), "s0 compensated on map failure: {last}");
 
