@@ -474,6 +474,7 @@ impl FlowEngine {
 }
 
 /// Result of aggregating a map step's children.
+#[derive(Debug)]
 enum Agg {
     Succeeded(String),
     Failed,
@@ -680,4 +681,215 @@ fn has_cycle(edges: &HashMap<String, Vec<String>>) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::FlowStep;
+    use serde_json::json;
+
+    fn child(step_id: &str, status: &str, output: Option<&str>) -> FlowStep {
+        FlowStep {
+            step_id: step_id.to_string(),
+            script_id: 1,
+            input: json!({}),
+            depends_on: vec![],
+            status: status.to_string(),
+            output: output.map(String::from),
+            when_cond: None,
+            map_ref: None,
+            compensate: None,
+            compensated: false,
+            retries: None,
+            finished_at: None,
+            cache: false,
+        }
+    }
+
+    // ---- aggregate_children: map fan-out completion + partial-failure (saga trigger) ----
+
+    #[test]
+    fn aggregate_none_while_a_child_is_pending() {
+        let steps = vec![child("p#0", "succeeded", Some("a")), child("p#1", "running", None)];
+        assert!(aggregate_children(&steps, "p").is_none(), "not terminal while a child runs");
+    }
+
+    #[test]
+    fn aggregate_none_when_no_children() {
+        let steps = vec![child("other#0", "succeeded", Some("x"))];
+        assert!(aggregate_children(&steps, "p").is_none(), "no children for this parent");
+    }
+
+    #[test]
+    fn aggregate_failed_if_any_child_failed() {
+        // Partial failure: one of three children failed → the whole map parent fails,
+        // which is what triggers saga compensation of upstream steps.
+        let steps = vec![
+            child("p#0", "succeeded", Some("a")),
+            child("p#1", "failed", None),
+            child("p#2", "succeeded", Some("c")),
+        ];
+        assert!(matches!(aggregate_children(&steps, "p"), Some(Agg::Failed)), "any child failed → Failed");
+    }
+
+    #[test]
+    fn aggregate_succeeded_orders_outputs_by_index() {
+        // Children deliberately out of insertion order; aggregation must sort by the #index.
+        let steps = vec![
+            child("p#2", "succeeded", Some("c")),
+            child("p#0", "succeeded", Some("a")),
+            child("p#1", "succeeded", Some("b")),
+        ];
+        match aggregate_children(&steps, "p") {
+            Some(Agg::Succeeded(arr)) => assert_eq!(arr, json!(["a", "b", "c"]).to_string()),
+            other => panic!("expected ordered Succeeded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn aggregate_skipped_child_is_null_slot() {
+        let steps = vec![
+            child("p#0", "succeeded", Some("a")),
+            child("p#1", "skipped", None),
+        ];
+        match aggregate_children(&steps, "p") {
+            Some(Agg::Succeeded(arr)) => assert_eq!(arr, json!(["a", null]).to_string()),
+            other => panic!("expected Succeeded with null slot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn aggregate_does_not_confuse_a_prefixed_sibling_parent() {
+        // "p" children must not match " p10"-style other parents: prefix is "p#".
+        let steps = vec![child("p#0", "succeeded", Some("a")), child("p2#0", "failed", None)];
+        match aggregate_children(&steps, "p") {
+            Some(Agg::Succeeded(arr)) => assert_eq!(arr, json!(["a"]).to_string()),
+            other => panic!("sibling parent leaked into aggregation: {other:?}"),
+        }
+    }
+
+    // ---- eval_when: branch gate + skip decision ----
+
+    fn deps(pairs: &[(&str, &str)]) -> serde_json::Value {
+        let mut m = serde_json::Map::new();
+        for (k, v) in pairs {
+            m.insert((*k).to_string(), json!(v));
+        }
+        serde_json::Value::Object(m)
+    }
+
+    #[test]
+    fn when_eq_and_ne() {
+        let d = deps(&[("a", "ok")]);
+        assert!(eval_when(&json!({"ref":"deps.a","op":"eq","value":"ok"}), &json!({}), &d));
+        assert!(!eval_when(&json!({"ref":"deps.a","op":"eq","value":"nope"}), &json!({}), &d));
+        assert!(eval_when(&json!({"ref":"deps.a","op":"ne","value":"nope"}), &json!({}), &d));
+    }
+
+    #[test]
+    fn when_contains_truthy_falsy() {
+        let d = deps(&[("a", "flagged: spam")]);
+        assert!(eval_when(&json!({"ref":"deps.a","op":"contains","value":"spam"}), &json!({}), &d));
+        assert!(eval_when(&json!({"ref":"deps.a","op":"truthy"}), &json!({}), &d));
+        assert!(!eval_when(&json!({"ref":"deps.missing","op":"truthy"}), &json!({}), &d));
+        assert!(eval_when(&json!({"ref":"deps.missing","op":"falsy"}), &json!({}), &d));
+    }
+
+    #[test]
+    fn when_unknown_op_defaults_to_truthy() {
+        let d = deps(&[("a", "x")]);
+        assert!(eval_when(&json!({"ref":"deps.a","op":"bogus"}), &json!({}), &d));
+    }
+
+    #[test]
+    fn when_reads_flow_input_root() {
+        assert!(eval_when(
+            &json!({"ref":"flow_input.mode","op":"eq","value":"live"}),
+            &json!({"mode":"live"}),
+            &json!({})
+        ));
+    }
+
+    // ---- resolve_ref: dep hop + JSON-string decode ----
+
+    #[test]
+    fn resolve_decodes_json_string_array_for_map() {
+        // A step prints a JSON array as a string; map:"deps.emit" must see the array.
+        let d = deps(&[("emit", "[1,2,3]")]);
+        assert_eq!(resolve_ref("deps.emit", &json!({}), &d), Some(json!([1, 2, 3])));
+    }
+
+    #[test]
+    fn resolve_nested_and_bad_root() {
+        let d = json!({"obj": "{\"k\":\"v\"}"});
+        assert_eq!(resolve_ref("deps.obj.k", &json!({}), &d), Some(json!("v")));
+        assert_eq!(resolve_ref("nope.x", &json!({}), &d), None);
+    }
+
+    // ---- is_truthy edges ----
+
+    #[test]
+    fn is_truthy_edges() {
+        assert!(!is_truthy(&json!(null)));
+        assert!(!is_truthy(&json!(false)));
+        assert!(!is_truthy(&json!(0)));
+        assert!(!is_truthy(&json!("")));
+        assert!(!is_truthy(&json!("false")));
+        assert!(!is_truthy(&json!("0")));
+        assert!(!is_truthy(&json!([])));
+        assert!(is_truthy(&json!("ok")));
+        assert!(is_truthy(&json!(1)));
+        assert!(is_truthy(&json!(["x"])));
+    }
+
+    // ---- validate_spec: saga/DAG spec gate ----
+
+    fn spec(steps: serde_json::Value) -> serde_json::Value {
+        json!({ "steps": steps })
+    }
+
+    #[test]
+    fn validate_accepts_a_well_formed_saga() {
+        let s = spec(json!([
+            {"id":"a","script_id":1,"compensate":9},
+            {"id":"b","script_id":2,"depends_on":["a"],"when":{"ref":"deps.a","op":"eq","value":"ok"}},
+            {"id":"c","script_id":3,"depends_on":["a"],"map":"deps.a","retries":2,"cache":true},
+        ]));
+        assert!(validate_spec(&s).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_cycle() {
+        let s = spec(json!([
+            {"id":"a","script_id":1,"depends_on":["b"]},
+            {"id":"b","script_id":2,"depends_on":["a"]},
+        ]));
+        assert_eq!(validate_spec(&s), Err("flow spec has a cycle".into()));
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_id_and_hash_id() {
+        let dup = spec(json!([{"id":"a","script_id":1},{"id":"a","script_id":2}]));
+        assert!(validate_spec(&dup).unwrap_err().contains("duplicate"));
+        let hash = spec(json!([{"id":"a#0","script_id":1}]));
+        assert!(validate_spec(&hash).unwrap_err().contains("'#'"));
+    }
+
+    #[test]
+    fn validate_rejects_unknown_dep_and_bad_field_types() {
+        let dep = spec(json!([{"id":"a","script_id":1,"depends_on":["ghost"]}]));
+        assert!(validate_spec(&dep).unwrap_err().contains("unknown step ghost"));
+        let comp = spec(json!([{"id":"a","script_id":1,"compensate":"not-int"}]));
+        assert!(validate_spec(&comp).unwrap_err().contains("compensate"));
+        let map = spec(json!([{"id":"a","script_id":1,"map":123}]));
+        assert!(validate_spec(&map).unwrap_err().contains("map must be a string"));
+        let op = spec(json!([{"id":"a","script_id":1,"when":{"ref":"deps.x","op":"gt","value":1}}]));
+        assert!(validate_spec(&op).unwrap_err().contains("when.op invalid"));
+    }
+
+    #[test]
+    fn validate_rejects_empty_steps() {
+        assert!(validate_spec(&spec(json!([]))).unwrap_err().contains("empty"));
+    }
 }
