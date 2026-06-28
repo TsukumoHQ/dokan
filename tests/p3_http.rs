@@ -80,6 +80,14 @@ async fn operator_surface_and_relay() -> anyhow::Result<()> {
     let r = cli.get(format!("{base}/api/runs")).send().await?;
     assert_eq!(r.status(), 401, "unauthenticated rejected");
 
+    // 3b. /health sits OUTSIDE the bearer gate: reachable with NO token, 200 + version + db up.
+    let r = cli.get(format!("{base}/health")).send().await?;
+    assert_eq!(r.status(), 200, "health is unauthenticated + ok");
+    let h: serde_json::Value = r.json().await?;
+    assert_eq!(h["status"], "ok", "health status ok: {h}");
+    assert_eq!(h["db"], "up", "health reports db up: {h}");
+    assert!(h["version"].as_str().is_some_and(|v| !v.is_empty()), "health reports version: {h}");
+
     // 4. Seed a script directly, then trigger it via the HTTP API.
     let pool = sqlx::postgres::PgPool::connect(&db_url()).await?;
     let script_id: i64 = sqlx::query(

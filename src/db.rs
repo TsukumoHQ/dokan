@@ -800,6 +800,14 @@ impl Db {
         .await?)
     }
 
+    /// Cheap liveness probe — `SELECT 1`. True iff Postgres answers. Powers `/health`.
+    pub async fn ping(&self) -> bool {
+        sqlx::query_scalar::<_, i32>("SELECT 1")
+            .fetch_one(&self.pool)
+            .await
+            .is_ok()
+    }
+
     /// Count an agent's in-flight runs (pending or running) — the quota enforcement input.
     pub async fn agent_running_count(&self, agent_id: &str) -> Result<i64> {
         Ok(sqlx::query_scalar(
