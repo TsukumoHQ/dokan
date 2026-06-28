@@ -431,10 +431,11 @@ async fn serve_http(
         .nest_service("/mcp", service)
         .merge(http::operator_router(state.clone()))
         .layer(axum::middleware::from_fn_with_state(token, http::auth));
-    // Inbound webhooks sit OUTSIDE the bearer gate (the URL token is their auth), so an
-    // external service can reach /hook/<token> without DOKAN_TOKEN.
+    // Inbound webhooks + the /health probe sit OUTSIDE the bearer gate (the URL token is the
+    // webhook's auth; health is meant for unauthenticated monitors/load-balancers).
     let app = axum::Router::new()
-        .merge(http::webhook_router(state))
+        .merge(http::webhook_router(state.clone()))
+        .merge(http::health_router(state))
         .merge(protected);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;

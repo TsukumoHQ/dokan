@@ -56,6 +56,26 @@ pub fn webhook_router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// Liveness/readiness probe. Mounted OUTSIDE the bearer gate so a monitor, load-balancer, or
+/// the auto-merge-on-green flow's health step can curl it with no token. 200 when Postgres
+/// answers, 503 when it doesn't; always reports the running binary's version.
+pub fn health_router(state: AppState) -> Router {
+    Router::new().route("/health", get(health)).with_state(state)
+}
+
+async fn health(State(s): State<AppState>) -> impl IntoResponse {
+    let db_up = s.db.ping().await;
+    let code = if db_up { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+    (
+        code,
+        Json(json!({
+            "status": if db_up { "ok" } else { "degraded" },
+            "version": env!("CARGO_PKG_VERSION"),
+            "db": if db_up { "up" } else { "down" },
+        })),
+    )
+}
+
 /// Fire an inbound webhook: resolve the token → enqueue the target script/flow with the
 /// POST body as input. Non-blocking (202 + id); the worker/flow engine runs it.
 async fn webhook_fire(
