@@ -164,13 +164,17 @@ impl WarmPool {
             // scripts hitting APIs; none need caps. Relax per-deployment if ever needed.
             cap_drop: Some(vec!["ALL".to_string()]),
             security_opt: Some(vec!["no-new-privileges".to_string()]),
-            // Read-only root filesystem: untrusted code cannot mutate the image. The only
-            // writable surfaces are the /tmp tmpfs (where the bootstrap drops the script) and
-            // the per-run /output bind (opt-in). /tmp is a tmpfs (mode 1777) so the non-root
-            // job uid can write it; its size counts against the container's memory cgroup, so
-            // the existing mem cap already bounds it.
+            // Read-only root filesystem (TSU-118): untrusted code cannot mutate the image. Only
+            // writable surfaces are two tmpfs + the opt-in /output bind:
+            //   - /tmp (mode 1777): the bootstrap drops the script; the non-root job uid writes here.
+            //   - /run/secrets (mode 0700, noexec, GAP-2): per-container in-memory secret files,
+            //     writable under the RO rootfs, never persisted in the warm image layer.
+            // tmpfs size counts against the container mem cgroup, so the mem cap already bounds it.
             readonly_rootfs: Some(true),
-            tmpfs: Some(HashMap::from([("/tmp".to_string(), "rw,nosuid,nodev".to_string())])),
+            tmpfs: Some(HashMap::from([
+                ("/tmp".to_string(), "rw,nosuid,nodev".to_string()),
+                ("/run/secrets".to_string(), "rw,nosuid,nodev,noexec,mode=0700".to_string()),
+            ])),
             // network=false → fully network-disabled (deterministic). Else default networking.
             network_mode: if isolated { Some("none".to_string()) } else { None },
             mounts,

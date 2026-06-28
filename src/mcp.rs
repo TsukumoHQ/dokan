@@ -236,6 +236,10 @@ pub struct UploadArgs {
     pub cpu_limit: Option<f64>,
     /// Opt-in: feed the previous run's structured result into the next run as DOKAN_INPUT.prev_result (for stateful monitors).
     pub feed_prev_result: Option<bool>,
+    /// Optional secret ALLOWLIST: the subset of secret names this script's jobs may see (least
+    /// privilege). null/omitted = back-compat (all of your + global secrets). When set, only these
+    /// names are injected — as env vars AND files under tmpfs /run/secrets/<name>.
+    pub secrets: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -577,6 +581,9 @@ impl Dokan {
                         )
                         .await
                         .map_err(internal)?;
+                    if let Some(ref names) = a.secrets {
+                        self.db.set_script_secrets(id, Some(names)).await.map_err(internal)?;
+                    }
                     let status = if changed { "metadata_updated" } else { "unchanged" };
                     return ok(json!({"script_id": id, "version": version, "status": status}));
                 }
@@ -597,6 +604,9 @@ impl Dokan {
                     )
                     .await
                     .map_err(internal)?;
+                if let Some(ref names) = a.secrets {
+                    self.db.set_script_secrets(id, Some(names)).await.map_err(internal)?;
+                }
                 return ok(json!({"script_id": id, "version": version, "status": "updated"}));
             }
         // Captured before insert so the duplicate-name warning can compare against it.
@@ -618,6 +628,9 @@ impl Dokan {
             )
             .await
             .map_err(internal)?;
+        if let Some(ref names) = a.secrets {
+            self.db.set_script_secrets(id, Some(names)).await.map_err(internal)?;
+        }
         let mut out = json!({"script_id": id, "version": version, "status": "uploaded"});
         // Footgun guard: a plain upload of a name that already exists silently spawns a
         // duplicate script_id (orphan accumulation). `prior` was captured before insert.
