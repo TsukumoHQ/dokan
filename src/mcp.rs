@@ -766,6 +766,8 @@ impl Dokan {
             if let Some((run_id, exit, result)) =
                 self.db.find_cached_run(&key).await.map_err(internal)?
             {
+                // Cache hit-rate observability: a recall served without spawning a container.
+                metrics::counter!("dokan_run_cache_total", "result" => "hit").increment(1);
                 let mut hit = json!({
                     "run_id": run_id, "status": "recalled", "exit": exit, "cache_key": key,
                 });
@@ -774,6 +776,7 @@ impl Dokan {
                 }
                 return ok(hit);
             }
+            metrics::counter!("dokan_run_cache_total", "result" => "miss").increment(1);
             Some(key)
         } else {
             None
