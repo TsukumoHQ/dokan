@@ -108,9 +108,12 @@ impl FlowEngine {
             let steps = self.db.flow_steps(flow_run_id).await?;
 
             if steps.iter().any(|s| s.status == "failed") {
-                self.compensate(flow_run_id, &input, &steps).await;
-                self.db.finish_flow_run(flow_run_id, "failed").await?;
-                metrics::counter!("dokan_flow_runs_finished_total", "status" => "failed").increment(1);
+                let comp_failed = self.compensate(flow_run_id, &input, &steps).await;
+                // If a rollback step itself failed, the saga didn't fully unwind — surface it as
+                // a distinct terminal status (needs-attention) rather than a plain "failed". (TSU-190)
+                let status = if comp_failed > 0 { "compensation_failed" } else { "failed" };
+                self.db.finish_flow_run(flow_run_id, status).await?;
+                metrics::counter!("dokan_flow_runs_finished_total", "status" => status).increment(1);
                 return Ok(());
             }
             // Terminal when no step is still pending/running/expanded. Succeeded if we got
@@ -289,13 +292,15 @@ impl FlowEngine {
     /// Saga rollback: for each succeeded step with a `compensate` script, in reverse
     /// completion order, run that script with the step's input/output. Best-effort — a
     /// compensation whose own script fails is logged + counted but does not stop the rest,
-    /// so a partial flow is unwound as far as possible.
+    /// so a partial flow is unwound as far as possible. Returns the number of compensations
+    /// whose own script FAILED (so the caller can flag the saga as needs-attention). (TSU-190)
     async fn compensate(
         &self,
         flow_run_id: i64,
         flow_input: &serde_json::Value,
         steps: &[crate::db::FlowStep],
-    ) {
+    ) -> usize {
+        let mut comp_failed = 0usize;
         // Reverse *completion* order (latest finished first), not declaration order — correct
         // for DAGs with parallel branches. Steps without finished_at sort last.
         let mut to_comp: Vec<&crate::db::FlowStep> = steps
@@ -355,9 +360,11 @@ impl FlowEngine {
             if ok {
                 tracing::info!(flow_run_id, step = %step.step_id, "compensated");
             } else {
+                comp_failed += 1;
                 tracing::warn!(flow_run_id, step = %step.step_id, run_id, "compensation script FAILED");
             }
         }
+        comp_failed
     }
 
     /// Execute a single step as a container run, with per-step retry. Records the

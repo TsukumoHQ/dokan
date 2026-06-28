@@ -102,7 +102,7 @@ async fn poll_flow(c: &RunningService<RoleClient, ()>, flow_run_id: i64) -> Valu
     for _ in 0..80 {
         last = call(c, "get_flow_run", json!({"flow_run_id": flow_run_id})).await;
         match last["status"].as_str().unwrap_or("") {
-            "succeeded" | "failed" => break,
+            "succeeded" | "failed" | "compensation_failed" => break,
             _ => tokio::time::sleep(std::time::Duration::from_millis(500)).await,
         }
     }
@@ -519,6 +519,57 @@ async fn flagship_demo_flow() -> anyhow::Result<()> {
     assert_eq!(step(steps, "score")["map"], json!({"n": 5, "ok": 5, "failed": 0}), "map fans out 5: {last}");
     assert_eq!(step(steps, "summarize")["out"], "FLAGGED", "batch flags (NG order scores 81): {last}");
     assert_eq!(step(steps, "alert")["status"], "succeeded", "when-branch alert runs on FLAGGED: {last}");
+
+    c.cancel().await?;
+    Ok(())
+}
+
+/// When a compensation (rollback) step's OWN script fails, the saga didn't fully unwind — the
+/// flow surfaces a distinct `compensation_failed` terminal status, not a plain `failed`. (TSU-190)
+#[tokio::test]
+async fn flow_compensation_failure_is_surfaced() -> anyhow::Result<()> {
+    let c = spawn().await?;
+    let good = call(
+        &c,
+        "upload_script",
+        json!({"name":"good","runtime":"bash","source":"echo ok\n","description":"succeeds"}),
+    )
+    .await["script_id"].as_i64().unwrap();
+    // The compensation script itself FAILS (exit 1).
+    let badcomp = call(
+        &c,
+        "upload_script",
+        json!({"name":"badcomp","runtime":"bash","source":"exit 1\n","description":"rollback that fails"}),
+    )
+    .await["script_id"].as_i64().unwrap();
+    let bad = call(
+        &c,
+        "upload_script",
+        json!({"name":"bad","runtime":"bash","source":"exit 1\n","description":"fails"}),
+    )
+    .await["script_id"].as_i64().unwrap();
+
+    let flow = call(
+        &c,
+        "compose_flow",
+        json!({
+            "name": "saga-comp-fail",
+            "spec": { "steps": [
+                {"id":"s0","script_id": good, "compensate": badcomp},
+                {"id":"s1","script_id": bad, "depends_on":["s0"], "retries": 0}
+            ]}
+        }),
+    )
+    .await;
+    let flow_id = flow["flow_id"].as_i64().unwrap_or_else(|| panic!("{}", flow.to_string()));
+    let fr = call(&c, "run_flow", json!({"flow_id": flow_id})).await;
+    let last = poll_flow(&c, fr["flow_run_id"].as_i64().unwrap()).await;
+    eprintln!("saga-comp-fail -> {last}");
+
+    // s1 failed → saga rolls back s0, but s0's compensate (badcomp) ITSELF fails → needs-attention.
+    assert_eq!(last["status"], "compensation_failed", "failed rollback surfaced distinctly: {last}");
+    let steps = last["steps"].as_array().unwrap();
+    assert_eq!(step(steps, "s0")["comp"], json!(true), "s0 compensation was attempted: {last}");
 
     c.cancel().await?;
     Ok(())

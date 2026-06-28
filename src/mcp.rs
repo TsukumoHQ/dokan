@@ -1330,11 +1330,9 @@ impl Dokan {
         Parameters(a): Parameters<CancelArgs>,
     ) -> Result<CallToolResult, McpError> {
         self.exec.cancel(a.run_id).await;
-        self.db
-            .finish_run(a.run_id, "canceled", None, Some("canceled by operator"))
-            .await
-            .map_err(internal)?;
-        ok(json!({"run_id": a.run_id, "status": "canceled"}))
+        // Authoritative cancel write — wins over the killed container's racing failed-finish.
+        let canceled = self.db.cancel_run(a.run_id, "canceled by operator").await.map_err(internal)?;
+        ok(json!({"run_id": a.run_id, "status": if canceled { "canceled" } else { "already_succeeded" }}))
     }
 
     #[tool(description = "Verify a run's receipt WITHOUT re-executing — offline, instant. Checks the Ed25519/DSSE signature against the receipt's embedded public key (third-party-verifiable, NO shared secret needed), the HMAC binding with the daemon key (key-holder check), and that the signed in-toto Statement attests THIS run's output. Returns {ok, ed25519_valid, hmac_valid, binding_consistent, hermetic, deterministic, keyid}. hermetic=true means the run was network-disabled (its output is a pure function of inputs). For verify-by-RE-EXECUTION (re-run + byte-compare), use the reproduce primitive.")]
