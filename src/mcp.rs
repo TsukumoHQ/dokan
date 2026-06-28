@@ -89,6 +89,24 @@ pub(crate) fn canonical_input_blobs(input_blobs: Option<&serde_json::Value>) -> 
     pairs.join(",")
 }
 
+/// Max bytes for a single uploaded blob (32 MiB, spec §5) — reject oversize at ingest rather
+/// than bloat the Postgres bytea store.
+pub(crate) const MAX_BLOB_BYTES: usize = 32 * 1024 * 1024;
+
+/// Ingest validation for an uploaded blob's decoded byte length: reject empty (garbage) and
+/// oversize uploads before they touch the store. Pure — unit-tested.
+pub(crate) fn validate_blob_bytes(len: usize) -> Result<(), String> {
+    if len == 0 {
+        return Err("blob is empty (0 bytes)".to_string());
+    }
+    if len > MAX_BLOB_BYTES {
+        return Err(format!(
+            "blob too large: {len} bytes (cap {MAX_BLOB_BYTES} bytes / 32 MiB)"
+        ));
+    }
+    Ok(())
+}
+
 /// Content-address a run: hash(runtime + source + canonical(input) + secrets generation +
 /// input blobs). Same inputs ⇒ same key ⇒ recallable (dokan jobs are deterministic). A
 /// changed input file (different sha) shifts the key, so the cache stays correct.
@@ -669,18 +687,9 @@ impl Dokan {
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(a.data.as_bytes())
             .map_err(|e| McpError::invalid_params(format!("data is not valid base64: {e}"), None))?;
-        // Cap per-blob at 32 MiB (spec §5) — reject loudly rather than bloat Postgres bytea.
-        const MAX_BLOB_BYTES: usize = 32 * 1024 * 1024;
-        if bytes.len() > MAX_BLOB_BYTES {
-            return Err(McpError::invalid_params(
-                format!(
-                    "blob too large: {} bytes (cap {} bytes / 32 MiB)",
-                    bytes.len(),
-                    MAX_BLOB_BYTES
-                ),
-                None,
-            ));
-        }
+        // Ingest limits: reject an empty (garbage) or oversize upload loudly, before it bloats
+        // the Postgres bytea store.
+        validate_blob_bytes(bytes.len()).map_err(|e| McpError::invalid_params(e, None))?;
         let (sha, size) = self.db.put_blob(&bytes).await.map_err(internal)?;
         let _ = &a.filename; // advisory only; the content address is the bytes' sha
         ok(json!({ "handle": sha, "sha": sha, "size": size }))
@@ -1493,5 +1502,16 @@ mod tests {
         assert!(validate_cron("*/5 * * * *").is_err(), "5-field rejected");
         assert!(validate_cron("0 0 0 0 0 0 0").is_err(), "7-field rejected");
         assert!(validate_cron("  0   0 * * * *  ").is_ok(), "extra whitespace tolerated");
+    }
+
+    #[test]
+    fn blob_ingest_rejects_empty_and_oversize() {
+        assert!(super::validate_blob_bytes(0).is_err(), "empty blob rejected as garbage");
+        assert!(super::validate_blob_bytes(1).is_ok(), "1 byte ok");
+        assert!(super::validate_blob_bytes(super::MAX_BLOB_BYTES).is_ok(), "exactly the cap ok");
+        assert!(
+            super::validate_blob_bytes(super::MAX_BLOB_BYTES + 1).is_err(),
+            "one over the cap rejected"
+        );
     }
 }

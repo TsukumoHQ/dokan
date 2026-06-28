@@ -332,6 +332,16 @@ async fn main() -> Result<()> {
                         Err(e) => tracing::error!("retention GC: {e}"),
                         _ => {}
                     }
+                    // Reclaim blobs no run references past the TTL — AFTER gc_old, so a blob
+                    // orphaned by a just-deleted run becomes reclaimable this same sweep.
+                    match db.gc_blobs(days).await {
+                        Ok(b) if b > 0 => {
+                            tracing::info!(blobs = b, "blob retention GC");
+                            metrics::counter!("dokan_gc_blobs_total").increment(b);
+                        }
+                        Err(e) => tracing::error!("blob retention GC: {e}"),
+                        _ => {}
+                    }
                 }
             });
         }
@@ -545,6 +555,7 @@ fn describe_metrics() {
     metrics::describe_counter!("dokan_triggers_fired_total", Unit::Count, "on_result reactive triggers fired (a run's result matched a registered predicate)");
     metrics::describe_counter!("dokan_gc_runs_total", Unit::Count, "Old runs garbage-collected (retention sweep)");
     metrics::describe_counter!("dokan_gc_logs_total", Unit::Count, "Old log lines garbage-collected (retention sweep)");
+    metrics::describe_counter!("dokan_gc_blobs_total", Unit::Count, "Unreferenced blobs garbage-collected past the TTL (orphan reclaim)");
     metrics::describe_counter!("dokan_webhook_fires_total", Unit::Count, "Inbound webhook deliveries that enqueued a run/flow, by target");
     metrics::describe_counter!("dokan_webhook_dedup_total", Unit::Count, "Inbound webhook redeliveries collapsed to the first run (at-least-once dedup)");
     metrics::describe_counter!("dokan_webhook_rate_limited_total", Unit::Count, "Inbound webhook requests rejected by the per-token rate limit (429)");
