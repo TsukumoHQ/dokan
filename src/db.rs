@@ -1018,6 +1018,28 @@ impl Db {
         Ok(())
     }
 
+    /// Set (or clear) a script's secret allowlist (GAP-2). `Some([])`/`None` semantics: pass the
+    /// explicit names to restrict; pass None to clear (→ back-compat: all secrets visible).
+    pub async fn set_script_secrets(&self, script_id: i64, names: Option<&[String]>) -> Result<()> {
+        sqlx::query("UPDATE scripts SET secrets_allowlist = $2 WHERE id = $1")
+            .bind(script_id)
+            .bind(names)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// The secret allowlist for the script behind a run (GAP-2), or None = no restriction.
+    pub async fn run_secrets_allowlist(&self, run_id: i64) -> Result<Option<Vec<String>>> {
+        let row: Option<Option<Vec<String>>> = sqlx::query_scalar(
+            "SELECT s.secrets_allowlist FROM runs r JOIN scripts s ON r.script_id = s.id WHERE r.id = $1",
+        )
+        .bind(run_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.flatten())
+    }
+
     /// Recall a prior SUCCEEDED run with this cache key: (run_id, exit_code, result). Only
     /// succeeded runs are recallable — a transient failure must never poison the cache.
     pub async fn find_cached_run(
