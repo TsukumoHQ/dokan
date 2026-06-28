@@ -63,6 +63,12 @@ struct Cli {
     #[arg(long, default_value_t = 7.0, env = "DOKAN_RETENTION_DAYS")]
     retention_days: f64,
 
+    /// Log retention: delete logs of terminal runs older than this many days, on a tighter
+    /// cadence than the full run/blob sweep (logs are the bulk of the table). Default 2 days
+    /// (0 = fall back to retention_days). Always ≤ retention_days in effect.
+    #[arg(long, default_value_t = 2.0, env = "DOKAN_LOG_RETENTION_DAYS")]
+    log_retention_days: f64,
+
     /// Per-job memory cap (MiB). The cgroup OOM-kills a job that exceeds it (exit 137).
     #[arg(long, default_value_t = 1024, env = "DOKAN_MEM_LIMIT_MB")]
     mem_limit_mb: i64,
@@ -340,6 +346,32 @@ async fn main() -> Result<()> {
                             metrics::counter!("dokan_gc_blobs_total").increment(b);
                         }
                         Err(e) => tracing::error!("blob retention GC: {e}"),
+                        _ => {}
+                    }
+                }
+            });
+        }
+
+        // Logs-only sweep on a tighter cadence (every 15 min) — log lines dominate the table, so
+        // reclaim them faster than the hourly full sweep. Effective TTL = min(log_retention,
+        // retention) when both set; falls back to retention_days if log_retention is 0.
+        let log_days = if cli.log_retention_days > 0.0 {
+            if cli.retention_days > 0.0 { cli.log_retention_days.min(cli.retention_days) } else { cli.log_retention_days }
+        } else {
+            cli.retention_days
+        };
+        if log_days > 0.0 {
+            let db = db.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(900));
+                loop {
+                    tick.tick().await;
+                    match db.gc_logs(log_days).await {
+                        Ok(l) if l > 0 => {
+                            tracing::info!(logs = l, days = log_days, "log retention GC");
+                            metrics::counter!("dokan_gc_logs_total").increment(l);
+                        }
+                        Err(e) => tracing::error!("log retention GC: {e}"),
                         _ => {}
                     }
                 }

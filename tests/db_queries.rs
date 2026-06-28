@@ -350,3 +350,93 @@ async fn idempotency_partial_unique_indexes_enforce_dedup_at_db_level() -> anyho
     assert!(raw.is_err(), "a raw duplicate idempotency_key is rejected by the partial unique index");
     Ok(())
 }
+
+#[tokio::test]
+async fn flow_step_pagination_and_map_aggregation() -> anyhow::Result<()> {
+    // TSU-177: SQL-level pagination of top-level steps + GROUP-BY map child aggregation.
+    let db = Db::connect(&db_url()).await?;
+    db.migrate().await?;
+    let (sid, _) = db
+        .insert_script("flow-pg", "bash", "echo hi", None, None, true, None, None, false, None)
+        .await?;
+    let spec = serde_json::json!({"steps": [
+        {"id":"a","script_id": sid, "input": {}},
+        {"id":"b","script_id": sid, "input": {}},
+        {"id":"m","script_id": sid, "input": {}}
+    ]});
+    let flow_id: i64 = sqlx::query_scalar("INSERT INTO flows (name, spec) VALUES ($1, $2) RETURNING id")
+        .bind(format!("flow-pg-{}", dokan::crypto::random_token()))
+        .bind(&spec)
+        .fetch_one(&db.pool)
+        .await?;
+    let key = format!("flow-pg-{}", dokan::crypto::random_token());
+    let (frid, _) = db.insert_flow_run_idempotent(flow_id, &spec, &serde_json::json!({}), &key).await?;
+    // Raw-insert map children for parent "m": 2 ok + 2 failed (indices 1,2 fail).
+    for (i, st) in [("0", "succeeded"), ("1", "failed"), ("2", "failed"), ("3", "succeeded")] {
+        sqlx::query("INSERT INTO flow_steps (flow_run_id, step_id, script_id, status) VALUES ($1, $2, $3, $4)")
+            .bind(frid)
+            .bind(format!("m#{i}"))
+            .bind(sid)
+            .bind(st)
+            .execute(&db.pool)
+            .await?;
+    }
+    // Top-level count excludes children (a, b, m = 3).
+    assert_eq!(db.flow_top_step_count(frid).await?, 3, "3 top-level steps, children excluded");
+    // LIMIT/OFFSET windows the top-level page.
+    assert_eq!(db.flow_top_steps(frid, 2, 0).await?.len(), 2, "first page of 2");
+    assert_eq!(db.flow_top_steps(frid, 2, 2).await?.len(), 1, "second page has the remainder");
+    assert!(
+        db.flow_top_steps(frid, 10, 0).await?.iter().all(|s| !s.step_id.contains('#')),
+        "no map children leak into the top-level page"
+    );
+    // GROUP-BY map counts for parent m: n=4, ok=2, failed=2.
+    let (mut n, mut ok, mut failed) = (0i64, 0i64, 0i64);
+    for (p, st, c) in db.flow_map_counts(frid).await? {
+        if p == "m" {
+            n += c;
+            if st == "succeeded" { ok += c }
+            if st == "failed" { failed += c }
+        }
+    }
+    assert_eq!((n, ok, failed), (4, 2, 2), "map child counts via GROUP BY");
+    // Failed child indices for m (capped) = [1, 2].
+    let fi: Vec<i64> = db
+        .flow_failed_child_idx(frid, 10)
+        .await?
+        .into_iter()
+        .filter(|(p, _)| p == "m")
+        .map(|(_, i)| i)
+        .collect();
+    assert_eq!(fi, vec![1, 2], "failed child indices, ordered");
+    // Cap is honored.
+    let capped = db.flow_failed_child_idx(frid, 1).await?.into_iter().filter(|(p, _)| p == "m").count();
+    assert_eq!(capped, 1, "per-parent failed-index cap honored");
+    Ok(())
+}
+
+#[tokio::test]
+async fn gc_logs_reclaims_aged_logs_keeps_runs() -> anyhow::Result<()> {
+    // TSU-177: the logs-only sweep deletes aged logs but leaves the run rows.
+    let db = Db::connect(&db_url()).await?;
+    db.migrate().await?;
+    let (sid, _) = db
+        .insert_script("gc-logs", "bash", "echo hi", None, None, true, None, None, false, None)
+        .await?;
+    let run_id = db.insert_run(sid, &serde_json::json!({}), None).await?;
+    db.finish_run(run_id, "succeeded", Some(0), None).await?;
+    db.append_log(run_id, 1, "stdout", "hello").await?;
+    sqlx::query("UPDATE runs SET finished_at = now() - interval '10 days' WHERE id = $1")
+        .bind(run_id)
+        .execute(&db.pool)
+        .await?;
+    let deleted = db.gc_logs(1.0).await?;
+    assert!(deleted >= 1, "aged log reclaimed (got {deleted})");
+    let logs: i64 = sqlx::query_scalar("SELECT count(*) FROM logs WHERE run_id = $1")
+        .bind(run_id)
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(logs, 0, "logs gone");
+    assert_eq!(db.run_status(run_id).await?.as_deref(), Some("succeeded"), "run row kept");
+    Ok(())
+}

@@ -971,6 +971,22 @@ impl Db {
         Ok(n)
     }
 
+    /// Logs-only retention sweep (TSU-177): delete logs of terminal runs older than `days`,
+    /// keeping the run rows. Run on a tighter cadence than `gc_old` since log lines dominate
+    /// the table — this bounds log growth without waiting for the slower full run/blob sweep.
+    pub async fn gc_logs(&self, days: f64) -> Result<u64> {
+        let n = sqlx::query(
+            "DELETE FROM logs WHERE run_id IN ( \
+                 SELECT id FROM runs WHERE finished_at IS NOT NULL \
+                   AND finished_at < now() - make_interval(secs => $1))",
+        )
+        .bind(days * 86400.0)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(n)
+    }
+
     /// Tag a run with its content-address cache key (set after insert; the worker doesn't
     /// need it to run — only future recalls query it).
     pub async fn set_run_cache_key(&self, id: i64, key: &str) -> Result<()> {
@@ -1691,6 +1707,91 @@ impl Db {
                 finished_at: r.get("finished_at"),
                 cache: r.get("cache"),
             })
+            .collect())
+    }
+
+    /// SQL-paginated TOP-LEVEL steps (map children excluded) for get_flow_run — pushes
+    /// LIMIT/OFFSET to the query so a huge flow never loads every step into memory. Map child
+    /// counts come from `flow_map_counts` (a GROUP BY), not by fetching the child rows. (TSU-177)
+    pub async fn flow_top_steps(&self, flow_run_id: i64, limit: i64, offset: i64) -> Result<Vec<FlowStep>> {
+        let rows = sqlx::query(
+            "SELECT step_id, script_id, input, depends_on, status, output, \
+                    when_cond, map_ref, compensate, compensated, retries, finished_at, cache \
+             FROM flow_steps WHERE flow_run_id = $1 AND position('#' in step_id) = 0 \
+             ORDER BY id LIMIT $2 OFFSET $3",
+        )
+        .bind(flow_run_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| FlowStep {
+                step_id: r.get("step_id"),
+                script_id: r.get("script_id"),
+                input: r.get::<Option<serde_json::Value>, _>("input").unwrap_or(serde_json::json!({})),
+                depends_on: r.get("depends_on"),
+                status: r.get("status"),
+                output: r.get("output"),
+                when_cond: r.get("when_cond"),
+                map_ref: r.get("map_ref"),
+                compensate: r.get("compensate"),
+                compensated: r.get("compensated"),
+                retries: r.get("retries"),
+                finished_at: r.get("finished_at"),
+                cache: r.get("cache"),
+            })
+            .collect())
+    }
+
+    /// Count of top-level (non-map-child) steps in a flow run — the pagination total.
+    pub async fn flow_top_step_count(&self, flow_run_id: i64) -> Result<i64> {
+        Ok(sqlx::query_scalar(
+            "SELECT count(*) FROM flow_steps WHERE flow_run_id = $1 AND position('#' in step_id) = 0",
+        )
+        .bind(flow_run_id)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
+    /// Per-map-parent child status counts via GROUP BY — so a 1000-child fan-out is aggregated
+    /// in Postgres, never loaded row-by-row into memory. Returns (parent_step_id, status, count).
+    pub async fn flow_map_counts(&self, flow_run_id: i64) -> Result<Vec<(String, String, i64)>> {
+        let rows = sqlx::query(
+            "SELECT split_part(step_id, '#', 1) AS parent, status, count(*) AS n \
+             FROM flow_steps WHERE flow_run_id = $1 AND position('#' in step_id) > 0 \
+             GROUP BY parent, status",
+        )
+        .bind(flow_run_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.get::<String, _>("parent"), r.get::<String, _>("status"), r.get::<i64, _>("n")))
+            .collect())
+    }
+
+    /// Failed map-child indices per parent (bounded by `cap` per parent) — feeds the
+    /// `failed_children` partial-failure detail without fetching every child row.
+    pub async fn flow_failed_child_idx(&self, flow_run_id: i64, cap: i64) -> Result<Vec<(String, i64)>> {
+        let rows = sqlx::query(
+            "SELECT parent, idx FROM ( \
+               SELECT split_part(step_id, '#', 1) AS parent, \
+                      split_part(step_id, '#', 2)::bigint AS idx, \
+                      row_number() OVER (PARTITION BY split_part(step_id, '#', 1) \
+                                         ORDER BY split_part(step_id, '#', 2)::bigint) AS rn \
+               FROM flow_steps \
+               WHERE flow_run_id = $1 AND status = 'failed' AND position('#' in step_id) > 0 \
+             ) t WHERE rn <= $2",
+        )
+        .bind(flow_run_id)
+        .bind(cap)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.get::<String, _>("parent"), r.get::<i64, _>("idx")))
             .collect())
     }
 

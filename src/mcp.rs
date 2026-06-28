@@ -1092,61 +1092,44 @@ impl Dokan {
             .await
             .map_err(internal)?
             .unwrap_or_else(|| "unknown".into());
-        let steps = self.db.flow_steps(a.flow_run_id).await.map_err(internal)?;
-        // Token-frugal: a map fan-out can have thousands of `<id>#<i>` children. Collapse
-        // them into a per-parent {n, ok, failed} count instead of listing every child (and
-        // drop the parent's aggregated array `out`, which would re-inline all child outputs).
-        // On partial failure also surface WHICH child indices failed (capped) so the operator
-        // can see what broke without paging every child.
-        #[derive(Default)]
-        struct MapAgg {
-            n: u32,
-            ok: u32,
-            failed: u32,
-            failed_idx: Vec<i64>,
-        }
-        let mut child: std::collections::HashMap<String, MapAgg> = std::collections::HashMap::new();
-        for s in &steps {
-            if let Some(i) = s.step_id.find('#') {
-                let e = child.entry(s.step_id[..i].to_string()).or_default();
-                e.n += 1;
-                match s.status.as_str() {
-                    "succeeded" => e.ok += 1,
-                    "failed" => {
-                        e.failed += 1;
-                        if let Ok(idx) = s.step_id[i + 1..].parse::<i64>() {
-                            e.failed_idx.push(idx);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        // Cap the surfaced failed-index list so a huge fan-out stays token-frugal.
-        const FAILED_IDX_CAP: usize = 20;
-        // Paginate the distinct top-level steps (map children are already collapsed) so a flow
-        // with many steps never returns an unbounded payload — cursor-based, like list_runs.
-        let top: Vec<&crate::db::FlowStep> =
-            steps.iter().filter(|s| !s.step_id.contains('#')).collect();
-        let total_steps = top.len() as i64;
+        // SQL-level pagination (TSU-177): page the TOP-LEVEL steps with LIMIT/OFFSET and
+        // aggregate the map children with a GROUP BY — so a flow with thousands of fan-out
+        // children never loads every step row into memory. Cursor shape matches list_runs.
+        const FAILED_IDX_CAP: i64 = 20;
         let after = a.after.unwrap_or(0).max(0);
         let limit = a.limit.unwrap_or(200).clamp(1, 1000);
-        let items: Vec<_> = top
+        let total_steps = self.db.flow_top_step_count(a.flow_run_id).await.map_err(internal)?;
+        let page = self.db.flow_top_steps(a.flow_run_id, limit, after).await.map_err(internal)?;
+
+        // Per-map-parent {n, ok, failed} from a GROUP BY (children never fetched row-by-row).
+        let mut counts: std::collections::HashMap<String, (i64, i64, i64)> = std::collections::HashMap::new();
+        for (parent, st, n) in self.db.flow_map_counts(a.flow_run_id).await.map_err(internal)? {
+            let e = counts.entry(parent).or_default();
+            e.0 += n;
+            match st.as_str() {
+                "succeeded" => e.1 += n,
+                "failed" => e.2 += n,
+                _ => {}
+            }
+        }
+        // Failed child indices (capped per parent) for the partial-failure detail.
+        let mut failed_idx: std::collections::HashMap<String, Vec<i64>> = std::collections::HashMap::new();
+        for (parent, idx) in self.db.flow_failed_child_idx(a.flow_run_id, FAILED_IDX_CAP).await.map_err(internal)? {
+            failed_idx.entry(parent).or_default().push(idx);
+        }
+
+        let items: Vec<_> = page
             .iter()
-            .skip(after as usize)
-            .take(limit as usize)
             .map(|s| {
                 let mut o = json!({"id": s.step_id, "status": s.status});
-                match child.get(&s.step_id) {
-                    Some(a) => {
-                        let mut m = json!({"n": a.n, "ok": a.ok, "failed": a.failed});
-                        if a.failed > 0 {
-                            let mut idx = a.failed_idx.clone();
-                            idx.sort_unstable();
-                            m["failed_children"] =
-                                json!(idx.iter().take(FAILED_IDX_CAP).collect::<Vec<_>>());
-                            if idx.len() > FAILED_IDX_CAP {
-                                m["failed_children_truncated"] = json!(idx.len() - FAILED_IDX_CAP);
+                match counts.get(&s.step_id) {
+                    Some((n, ok, failed)) => {
+                        let mut m = json!({"n": n, "ok": ok, "failed": failed});
+                        if *failed > 0 {
+                            let idx = failed_idx.get(&s.step_id).cloned().unwrap_or_default();
+                            m["failed_children"] = json!(idx);
+                            if *failed > idx.len() as i64 {
+                                m["failed_children_truncated"] = json!(*failed - idx.len() as i64);
                             }
                         }
                         o["map"] = m;
