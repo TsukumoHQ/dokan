@@ -825,9 +825,12 @@ impl Db {
         exit_code: Option<i32>,
         error: Option<&str>,
     ) -> Result<()> {
+        // Don't clobber a CANCELED run: when an operator cancels, the killed container's exec
+        // path also tries to finish (as failed) — the guard makes cancel authoritative so a
+        // canceled run never flips to failed on the teardown race. (TSU-190)
         sqlx::query(
             "UPDATE runs SET status = $2, exit_code = $3, error = $4, finished_at = now() \
-             WHERE id = $1",
+             WHERE id = $1 AND status <> 'canceled'",
         )
         .bind(run_id)
         .bind(status)
@@ -836,6 +839,23 @@ impl Db {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Authoritative cancel write (TSU-190): mark a run canceled UNLESS it already succeeded (a
+    /// genuinely-finished run isn't cancelable). Wins over a racing failed-finish from the killed
+    /// container, so the operator's cancel is honored regardless of teardown order. Returns true
+    /// if a row was canceled.
+    pub async fn cancel_run(&self, run_id: i64, reason: &str) -> Result<bool> {
+        let n = sqlx::query(
+            "UPDATE runs SET status = 'canceled', error = $2, finished_at = now() \
+             WHERE id = $1 AND status <> 'succeeded'",
+        )
+        .bind(run_id)
+        .bind(reason)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(n > 0)
     }
 
     pub async fn run_status(&self, id: i64) -> Result<Option<String>> {

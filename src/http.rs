@@ -1182,10 +1182,8 @@ async fn cancel_run(State(s): State<AppState>, Path(id): Path<i64>) -> impl Into
         );
     }
     s.exec.cancel(id).await;
-    let _ = s
-        .db
-        .finish_run(id, "canceled", None, Some("canceled by operator"))
-        .await;
+    // Authoritative cancel write — wins over the killed container's racing failed-finish.
+    let _ = s.db.cancel_run(id, "canceled by operator").await;
     (StatusCode::OK, Json(json!({"run_id": id, "status": "canceled"})))
 }
 

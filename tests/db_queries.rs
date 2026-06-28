@@ -440,3 +440,33 @@ async fn gc_logs_reclaims_aged_logs_keeps_runs() -> anyhow::Result<()> {
     assert_eq!(db.run_status(run_id).await?.as_deref(), Some("succeeded"), "run row kept");
     Ok(())
 }
+
+#[tokio::test]
+async fn cancel_is_authoritative_over_a_racing_finish() -> anyhow::Result<()> {
+    // TSU-190: a cancel must win over the killed container's racing failed-finish, and must
+    // not cancel a genuinely-succeeded run.
+    let db = Db::connect(&db_url()).await?;
+    db.migrate().await?;
+    let (sid, _) = db
+        .insert_script("cancel-race", "bash", "echo hi", None, None, true, None, None, false, None)
+        .await?;
+
+    // Run A: cancel, then the killed exec tries to finish it failed → must STAY canceled.
+    let a = db.insert_run(sid, &serde_json::json!({}), None).await?;
+    assert!(db.cancel_run(a, "canceled by operator").await?, "pending run cancels");
+    db.finish_run(a, "failed", None, Some("container killed")).await?; // the racing teardown
+    assert_eq!(db.run_status(a).await?.as_deref(), Some("canceled"), "cancel not clobbered by failed");
+
+    // Run B: cancel wins even if the failed-finish landed FIRST.
+    let b = db.insert_run(sid, &serde_json::json!({}), None).await?;
+    db.finish_run(b, "failed", None, Some("container killed")).await?;
+    assert!(db.cancel_run(b, "canceled by operator").await?, "cancel overrides a failed run");
+    assert_eq!(db.run_status(b).await?.as_deref(), Some("canceled"));
+
+    // Run C: a genuinely-succeeded run is NOT cancelable.
+    let c = db.insert_run(sid, &serde_json::json!({}), None).await?;
+    db.finish_run(c, "succeeded", Some(0), None).await?;
+    assert!(!db.cancel_run(c, "too late").await?, "succeeded run is not cancelable");
+    assert_eq!(db.run_status(c).await?.as_deref(), Some("succeeded"), "succeeded stays succeeded");
+    Ok(())
+}
