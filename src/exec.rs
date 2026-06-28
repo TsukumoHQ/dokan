@@ -20,6 +20,13 @@ use crate::pool::WarmPool;
 /// run still `running` well past it can only mean the worker died — see the lease reaper.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 300;
 
+/// Non-root uid:gid the JOB runs as (defense-in-depth: a job needs no privilege — it reads
+/// /input, writes /tmp (tmpfs) + /output (a 0777 bind), and hits the network if allowed).
+/// `65534:65534` = nobody:nogroup, present numerically in every image without name lookup.
+/// Combined with cap_drop ALL + no-new-privileges + a read-only rootfs, the blast radius of
+/// untrusted code is minimized.
+const RUN_USER: &str = "65534:65534";
+
 #[derive(Clone)]
 pub struct Executor {
     docker: Docker,
@@ -425,6 +432,9 @@ impl Executor {
                     env: Some(env),
                     attach_stdout: Some(true),
                     attach_stderr: Some(true),
+                    // Drop to a non-root uid for the job itself (the idle `sleep` keeps the
+                    // image default; only the untrusted job is de-privileged).
+                    user: Some(RUN_USER.to_string()),
                     ..Default::default()
                 },
             )
