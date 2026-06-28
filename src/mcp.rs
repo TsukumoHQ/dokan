@@ -140,6 +140,39 @@ fn ok<T: serde::Serialize>(v: T) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![Content::text(s)]))
 }
 
+/// Uniform error envelope for a tool result: a stable machine-readable `error` code, a human
+/// `message`, an optional actionable `hint`, plus any extra context fields (id, run_id, …).
+/// Every tool's expected-error path returns this shape so a caller parses one structure — the
+/// `error` code stays a top-level string for back-compat. (Unexpected/internal failures go
+/// through `internal()` → a JSON-RPC McpError; this is for the handled, returned errors.)
+fn err_ctx(
+    code: &str,
+    message: impl Into<String>,
+    hint: Option<&str>,
+    extra: serde_json::Value,
+) -> Result<CallToolResult, McpError> {
+    ok(error_envelope(code, &message.into(), hint, extra))
+}
+
+/// Pure builder for the uniform error envelope (so the shape is unit-testable).
+fn error_envelope(code: &str, message: &str, hint: Option<&str>, extra: serde_json::Value) -> serde_json::Value {
+    let mut o = json!({"error": code, "message": message});
+    if let Some(h) = hint {
+        o["hint"] = json!(h);
+    }
+    if let serde_json::Value::Object(m) = extra {
+        for (k, v) in m {
+            o[k] = v;
+        }
+    }
+    o
+}
+
+/// Uniform error envelope, no extra context fields.
+fn err(code: &str, message: impl Into<String>, hint: Option<&str>) -> Result<CallToolResult, McpError> {
+    err_ctx(code, message, hint, json!({}))
+}
+
 // ---- tool parameter structs ----
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -314,6 +347,11 @@ pub struct RunFlowArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct FlowRunArgs {
     pub flow_run_id: i64,
+    /// Max top-level steps to return (default 200, max 1000). Map children are always collapsed
+    /// into a per-parent count, so this bounds the distinct-step list, not the fan-out.
+    pub limit: Option<i64>,
+    /// Return only steps after this 0-based offset cursor (use next_cursor from a prior call).
+    pub after: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -488,7 +526,7 @@ impl Dokan {
     ) -> Result<CallToolResult, McpError> {
         let s = self.db.get_script(a.id).await.map_err(internal)?;
         let Some(s) = s else {
-            return ok(json!({"error": "not_found", "id": a.id}));
+            return err_ctx("not_found", "no script with that id", Some("check list_scripts for valid ids"), json!({"id": a.id}));
         };
         let mut v = json!({
             "id": s.id, "name": s.name, "runtime": s.runtime,
@@ -598,12 +636,12 @@ impl Dokan {
     ) -> Result<CallToolResult, McpError> {
         for id in [a.source_script_id, a.target_script_id] {
             if self.db.get_script(id).await.map_err(internal)?.is_none() {
-                return ok(json!({"error": "script_not_found", "id": id}));
+                return err_ctx("script_not_found", "no script with that id", Some("check list_scripts for valid ids"), json!({"id": id}));
             }
         }
         let predicate = a.predicate.unwrap_or(json!({}));
         if !predicate.is_object() {
-            return ok(json!({"error": "predicate_must_be_object"}));
+            return err("predicate_must_be_object", "predicate must be a JSON object", Some("e.g. {\"verdict\":\"FAIL\"}"));
         }
         let id = self
             .db
@@ -657,10 +695,10 @@ impl Dokan {
     ) -> Result<CallToolResult, McpError> {
         match self.db.delete_script(a.script_id).await.map_err(internal)? {
             crate::db::DeleteResult::NotFound => {
-                ok(json!({"error": "script_not_found", "id": a.script_id}))
+                err_ctx("script_not_found", "no script with that id", Some("check list_scripts for valid ids"), json!({"id": a.script_id}))
             }
             crate::db::DeleteResult::BlockedByFlow(n) => ok(json!({
-                "error": "referenced_by_flow", "id": a.script_id, "flow_steps": n,
+                "error": "referenced_by_flow", "message": "a flow still references this script", "id": a.script_id, "flow_steps": n,
                 "hint": "a flow depends on this script; delete/retire the flow first"
             })),
             crate::db::DeleteResult::Deleted { runs, schedules } => {
@@ -725,7 +763,7 @@ impl Dokan {
                 let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
                 ok(json!({ "data": data, "size": bytes.len() }))
             }
-            None => ok(json!({ "error": "unknown_blob_handle", "handle": a.handle })),
+            None => ok(json!({ "error": "unknown_blob_handle", "message": "no blob with that handle", "hint": "the handle is the sha from upload_blob", "handle": a.handle })),
         }
     }
 
@@ -736,7 +774,7 @@ impl Dokan {
     ) -> Result<CallToolResult, McpError> {
         let script = self.db.get_script(a.script_id).await.map_err(internal)?;
         let Some(script) = script else {
-            return ok(json!({"error": "script_not_found", "id": a.script_id}));
+            return err_ctx("script_not_found", "no script with that id", Some("check list_scripts for valid ids"), json!({"id": a.script_id}));
         };
         let input = destringify(a.input.unwrap_or(json!({})));
         // Run artifacts: validate every file handle exists BEFORE a run is created (unknown
@@ -748,13 +786,13 @@ impl Dokan {
                 for (name, handle) in files {
                     if name.is_empty() || name.contains('/') || name.contains("..") {
                         return ok(json!({
-                            "error": "invalid_file_name", "name": name,
+                            "error": "invalid_file_name", "message": "a file dest name is invalid", "name": name,
                             "hint": "dest names must be plain filenames (no '/' or '..')"
                         }));
                     }
                     if !self.db.blob_exists(handle).await.map_err(internal)? {
                         return ok(json!({
-                            "error": "unknown_blob_handle", "name": name, "handle": handle,
+                            "error": "unknown_blob_handle", "message": "an input file handle is unknown", "name": name, "handle": handle,
                             "hint": "upload the file with upload_blob first; no run was created"
                         }));
                     }
@@ -796,7 +834,7 @@ impl Dokan {
         let aid = a.agent_id.trim();
         if aid.is_empty() {
             return ok(json!({
-                "error": "agent_id_required",
+                "error": "agent_id_required", "message": "agent_id is required",
                 "hint": "pass your agent id — it tags provenance, scopes secrets, and meters quota"
             }));
         }
@@ -805,7 +843,7 @@ impl Dokan {
         let n = self.db.agent_running_count(aid).await.map_err(internal)?;
         if n >= AGENT_MAX_CONCURRENT {
             return ok(json!({
-                "error": "quota_exceeded", "agent_id": aid,
+                "error": "quota_exceeded", "message": "this agent has too many runs in flight", "hint": "wait for in-flight runs to finish or back off", "agent_id": aid,
                 "in_flight": n, "limit": AGENT_MAX_CONCURRENT
             }));
         }
@@ -816,7 +854,7 @@ impl Dokan {
             .map_err(internal)?;
         if spent >= AGENT_COMPUTE_BUDGET_SECS {
             return ok(json!({
-                "error": "budget_exceeded", "agent_id": aid,
+                "error": "budget_exceeded", "message": "this agent exhausted its rolling compute budget", "hint": "retry after the budget window rolls over", "agent_id": aid,
                 "compute_seconds_24h": spent, "budget": AGENT_COMPUTE_BUDGET_SECS
             }));
         }
@@ -1016,7 +1054,7 @@ impl Dokan {
     ) -> Result<CallToolResult, McpError> {
         let spec = destringify(a.spec);
         if let Err(e) = crate::flow::validate_spec(&spec) {
-            return ok(json!({"error": "invalid_spec", "detail": e}));
+            return err_ctx("invalid_spec", "the flow spec is invalid", None, json!({"detail": e}));
         }
         let id = self
             .db
@@ -1032,7 +1070,7 @@ impl Dokan {
         Parameters(a): Parameters<RunFlowArgs>,
     ) -> Result<CallToolResult, McpError> {
         let Some(spec) = self.db.get_flow_spec(a.flow_id).await.map_err(internal)? else {
-            return ok(json!({"error": "flow_not_found", "id": a.flow_id}));
+            return err_ctx("flow_not_found", "no flow with that id", Some("check the flow_id from compose_flow"), json!({"id": a.flow_id}));
         };
         let input = destringify(a.input.unwrap_or(json!({})));
         let id = self
@@ -1043,7 +1081,7 @@ impl Dokan {
         ok(json!({"flow_run_id": id, "status": "pending"}))
     }
 
-    #[tool(description = "Status of a flow run: overall status + per-step status/output. Token-frugal step ledger.")]
+    #[tool(description = "Status of a flow run: overall status + per-step status/output. Token-frugal step ledger — map children collapse into a per-parent {n,ok,failed} (+ failed_children indices on partial failure). Top-level steps are paginated: pass limit (default 200, max 1000) + after (cursor); the reply carries total_steps and next_cursor when more remain.")]
     async fn get_flow_run(
         &self,
         Parameters(a): Parameters<FlowRunArgs>,
@@ -1086,9 +1124,17 @@ impl Dokan {
         }
         // Cap the surfaced failed-index list so a huge fan-out stays token-frugal.
         const FAILED_IDX_CAP: usize = 20;
-        let items: Vec<_> = steps
+        // Paginate the distinct top-level steps (map children are already collapsed) so a flow
+        // with many steps never returns an unbounded payload — cursor-based, like list_runs.
+        let top: Vec<&crate::db::FlowStep> =
+            steps.iter().filter(|s| !s.step_id.contains('#')).collect();
+        let total_steps = top.len() as i64;
+        let after = a.after.unwrap_or(0).max(0);
+        let limit = a.limit.unwrap_or(200).clamp(1, 1000);
+        let items: Vec<_> = top
             .iter()
-            .filter(|s| !s.step_id.contains('#'))
+            .skip(after as usize)
+            .take(limit as usize)
             .map(|s| {
                 let mut o = json!({"id": s.step_id, "status": s.status});
                 match child.get(&s.step_id) {
@@ -1113,7 +1159,12 @@ impl Dokan {
                 o
             })
             .collect();
-        ok(json!({"status": status, "steps": items}))
+        let next = after + items.len() as i64;
+        let mut out = json!({"status": status, "steps": items, "total_steps": total_steps});
+        if next < total_steps {
+            out["next_cursor"] = json!(next);
+        }
+        ok(out)
     }
 
     #[tool(description = "Schedule a script on a cron (6-field, leading seconds). Each tick enqueues a run. Returns schedule_id.")]
@@ -1122,13 +1173,13 @@ impl Dokan {
         Parameters(a): Parameters<ScheduleArgs>,
     ) -> Result<CallToolResult, McpError> {
         let Some(cron) = &self.cron else {
-            return ok(json!({"error": "scheduler_disabled"}));
+            return err("scheduler_disabled", "the cron scheduler is not enabled on this daemon", None);
         };
         if let Err(e) = validate_cron(&a.cron) {
-            return ok(json!({"error": "invalid_cron", "detail": e}));
+            return err_ctx("invalid_cron", "the cron expression is invalid", Some("6 fields with leading seconds, e.g. 0 */5 * * * *"), json!({"detail": e}));
         }
         if self.db.get_script(a.script_id).await.map_err(internal)?.is_none() {
-            return ok(json!({"error": "script_not_found", "id": a.script_id}));
+            return err_ctx("script_not_found", "no script with that id", Some("check list_scripts for valid ids"), json!({"id": a.script_id}));
         }
         let input = destringify(a.input.unwrap_or(json!({})));
         let id = self
@@ -1158,7 +1209,7 @@ impl Dokan {
         Parameters(a): Parameters<CreateWebhookArgs>,
     ) -> Result<CallToolResult, McpError> {
         if a.target != "script" && a.target != "flow" {
-            return ok(json!({"error": "bad_target", "detail": "target must be \"script\" or \"flow\""}));
+            return err("bad_target", "target must be \"script\" or \"flow\"", None);
         }
         let exists = if a.target == "flow" {
             self.db.get_flow_spec(a.target_id).await.map_err(internal)?.is_some()
@@ -1166,7 +1217,7 @@ impl Dokan {
             self.db.get_script(a.target_id).await.map_err(internal)?.is_some()
         };
         if !exists {
-            return ok(json!({"error": format!("{}_not_found", a.target), "id": a.target_id}));
+            return err_ctx(&format!("{}_not_found", a.target), "the target does not exist", Some("create the script/flow before the webhook"), json!({"id": a.target_id}));
         }
         let token = crate::crypto::random_token();
         let id = self
@@ -1198,7 +1249,7 @@ impl Dokan {
         Parameters(a): Parameters<SetSecretArgs>,
     ) -> Result<CallToolResult, McpError> {
         if a.name.trim().is_empty() {
-            return ok(json!({"error": "empty_name"}));
+            return err("empty_name", "name must be non-empty", None);
         }
         self.db
             .upsert_secret(&a.name, &a.value, a.agent_id.as_deref())
@@ -1215,7 +1266,7 @@ impl Dokan {
     ) -> Result<CallToolResult, McpError> {
         match self.db.run_receipt(a.run_id).await.map_err(internal)? {
             Some(r) => ok(r),
-            None => ok(json!({"error": "no_receipt", "run_id": a.run_id})),
+            None => err_ctx("no_receipt", "this run has no receipt yet", Some("receipts attach once a run reaches a terminal state"), json!({"run_id": a.run_id})),
         }
     }
 
@@ -1284,7 +1335,7 @@ impl Dokan {
         Parameters(a): Parameters<UnscheduleArgs>,
     ) -> Result<CallToolResult, McpError> {
         let Some(cron) = &self.cron else {
-            return ok(json!({"error": "scheduler_disabled"}));
+            return err("scheduler_disabled", "the cron scheduler is not enabled on this daemon", None);
         };
         let removed = cron.remove(a.schedule_id).await.map_err(internal)?;
         ok(json!({"schedule_id": a.schedule_id, "status": if removed {"unscheduled"} else {"not_found"}}))
@@ -1306,7 +1357,7 @@ impl Dokan {
     #[tool(description = "Verify a run's receipt WITHOUT re-executing — offline, instant. Checks the Ed25519/DSSE signature against the receipt's embedded public key (third-party-verifiable, NO shared secret needed), the HMAC binding with the daemon key (key-holder check), and that the signed in-toto Statement attests THIS run's output. Returns {ok, ed25519_valid, hmac_valid, binding_consistent, hermetic, deterministic, keyid}. hermetic=true means the run was network-disabled (its output is a pure function of inputs). For verify-by-RE-EXECUTION (re-run + byte-compare), use the reproduce primitive.")]
     async fn verify(&self, Parameters(a): Parameters<VerifyArgs>) -> Result<CallToolResult, McpError> {
         let Some(receipt) = self.db.run_receipt(a.run_id).await.map_err(internal)? else {
-            return ok(json!({"error": "no_receipt", "run_id": a.run_id}));
+            return err_ctx("no_receipt", "this run has no receipt yet", Some("receipts attach once a run reaches a terminal state"), json!({"run_id": a.run_id}));
         };
         let rep = crate::receipt::verify_receipt(&receipt);
         let hmac_valid = self.exec.verify_receipt_hmac(&receipt);
@@ -1529,6 +1580,21 @@ mod tests {
         assert!(validate_cron("*/5 * * * *").is_err(), "5-field rejected");
         assert!(validate_cron("0 0 0 0 0 0 0").is_err(), "7-field rejected");
         assert!(validate_cron("  0   0 * * * *  ").is_ok(), "extra whitespace tolerated");
+    }
+
+    #[test]
+    fn error_envelope_is_uniform() {
+        // Code + message always present; hint + extra context fields when supplied.
+        let e = super::error_envelope("not_found", "no script with that id", Some("check list_scripts"), serde_json::json!({"id": 7}));
+        assert_eq!(e["error"], "not_found", "stable machine-readable code");
+        assert_eq!(e["message"], "no script with that id");
+        assert_eq!(e["hint"], "check list_scripts");
+        assert_eq!(e["id"], 7, "extra context merged in");
+        // No hint / no extra → just code + message, no hint key.
+        let e2 = super::error_envelope("empty_name", "name must be non-empty", None, serde_json::json!({}));
+        assert_eq!(e2["error"], "empty_name");
+        assert!(e2.get("hint").is_none(), "hint omitted when not supplied");
+        assert!(e2["message"].is_string());
     }
 
     #[test]
