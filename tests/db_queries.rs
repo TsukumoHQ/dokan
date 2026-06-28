@@ -277,3 +277,39 @@ async fn insert_flow_run_idempotent_collapses_and_builds_steps_once() -> anyhow:
     assert_eq!(steps, 1, "steps built exactly once (only on the fresh insert)");
     Ok(())
 }
+
+#[tokio::test]
+async fn gc_blobs_reclaims_only_orphaned_and_aged() -> anyhow::Result<()> {
+    // Blob retention (TSU-140): gc_blobs deletes a blob ONLY when it is (a) past the TTL AND
+    // (b) referenced by no run. A fresh upload (TTL guard) and a referenced blob both survive.
+    let db = Db::connect(&db_url()).await?;
+    db.migrate().await?;
+    let tag = dokan::crypto::random_token();
+
+    // Distinct bytes per case so content addresses don't collide with other tests.
+    let (orphan_old, _) = db.put_blob(format!("orphan-old-{tag}").as_bytes()).await?;
+    let (orphan_fresh, _) = db.put_blob(format!("orphan-fresh-{tag}").as_bytes()).await?;
+    let (referenced, _) = db.put_blob(format!("referenced-{tag}").as_bytes()).await?;
+
+    // Reference one blob from a run's input_blobs map.
+    let (sid, _) = db
+        .insert_script("gc-blob-ref", "bash", "echo hi", None, None, true, None, None, false, None)
+        .await?;
+    let input_blobs = serde_json::json!({ "note.txt": referenced });
+    db.insert_run_with_blobs(sid, &serde_json::json!({}), None, Some(&input_blobs), false).await?;
+
+    // Age the orphan-old and the referenced blob past the TTL; leave orphan_fresh at now().
+    for sha in [&orphan_old, &referenced] {
+        sqlx::query("UPDATE blobs SET last_used_at = now() - interval '10 days' WHERE sha = $1")
+            .bind(sha)
+            .execute(&db.pool)
+            .await?;
+    }
+
+    let deleted = db.gc_blobs(1.0).await?;
+    assert!(deleted >= 1, "at least the aged orphan was reclaimed (got {deleted})");
+    assert!(!db.blob_exists(&orphan_old).await?, "aged + unreferenced blob is reclaimed");
+    assert!(db.blob_exists(&orphan_fresh).await?, "a fresh upload survives the TTL");
+    assert!(db.blob_exists(&referenced).await?, "a referenced blob is never reclaimed");
+    Ok(())
+}

@@ -947,6 +947,30 @@ impl Db {
         Ok((runs, logs))
     }
 
+    /// Retention GC for the content-addressed blob store: delete blobs that NO run references
+    /// (via `input_blobs` or `output_blobs`) AND whose `last_used_at` is older than `days`.
+    /// The TTL guards a blob uploaded ahead of its run — `put_blob`/`get_blob` stamp
+    /// `last_used_at = now()`, so a fresh upload is never reclaimed before it is attached.
+    /// Run AFTER `gc_old` in a sweep so blobs orphaned by a just-deleted run become
+    /// reclaimable. Returns the number of blobs deleted. (TSU-140 — bounds the bytea store.)
+    pub async fn gc_blobs(&self, days: f64) -> Result<u64> {
+        let n = sqlx::query(
+            "DELETE FROM blobs b \
+             WHERE b.last_used_at < now() - make_interval(secs => $1) \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM runs r, jsonb_each_text(coalesce(r.input_blobs, '{}'::jsonb)) e \
+                 WHERE e.value = b.sha) \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM runs r, jsonb_each_text(coalesce(r.output_blobs, '{}'::jsonb)) e \
+                 WHERE e.value = b.sha)",
+        )
+        .bind(days * 86400.0)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(n)
+    }
+
     /// Tag a run with its content-address cache key (set after insert; the worker doesn't
     /// need it to run — only future recalls query it).
     pub async fn set_run_cache_key(&self, id: i64, key: &str) -> Result<()> {
