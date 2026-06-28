@@ -463,7 +463,12 @@ async fn serve_http(
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("dokan listening: MCP http://{addr}/mcp · UI http://{addr}/");
-    axum::serve(listener, app).await?;
+    // with_connect_info so the inbound-webhook handler can read the source IP (per-IP rate limit).
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 

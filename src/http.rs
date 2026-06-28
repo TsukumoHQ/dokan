@@ -7,8 +7,10 @@ use std::convert::Infallible;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use std::net::SocketAddr;
+
 use axum::body::Bytes;
-use axum::extract::{Path, Query, State};
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, Sse};
 use axum::response::{Html, IntoResponse};
@@ -81,17 +83,25 @@ async fn health(State(s): State<AppState>) -> impl IntoResponse {
 /// POST body as input. Non-blocking (202 + id); the worker/flow engine runs it.
 async fn webhook_fire(
     State(s): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(token): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
+    let now = now_secs();
+    // Per-source-IP guard FIRST — the cheapest, broadest cap, so a hammering/enumerating client
+    // is shed before any token parse or DB work.
+    if !WEBHOOK_IP_LIMITER.check_at(&peer.ip().to_string(), now) {
+        metrics::counter!("dokan_webhook_rate_limited_total").increment(1);
+        return (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response();
+    }
     // Reject a malformed token shape BEFORE touching the DB — same 404 as "unknown" (no leak),
     // but a probe never reaches the webhooks table.
     if !is_well_formed_webhook_token(&token) {
         return (StatusCode::NOT_FOUND, "no such webhook").into_response();
     }
     // Per-token flood guard.
-    if !WEBHOOK_LIMITER.check_at(&token, now_secs()) {
+    if !WEBHOOK_LIMITER.check_at(&token, now) {
         metrics::counter!("dokan_webhook_rate_limited_total").increment(1);
         return (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response();
     }
@@ -255,9 +265,14 @@ impl FixedWindowLimiter {
 }
 
 /// Per-token flood guard for the inbound webhook path: at most 20 fires/sec per token. Bounds
-/// abuse of a leaked token without throttling legitimate providers. (IP-based anti-enumeration
-/// is a follow-up — it needs ConnectInfo wired at serve time.)
+/// abuse of a leaked token without throttling legitimate providers.
 static WEBHOOK_LIMITER: LazyLock<FixedWindowLimiter> = LazyLock::new(|| FixedWindowLimiter::new(1, 20));
+
+/// Per-source-IP guard for the inbound webhook path (TSU-162): a coarser anti-DoS / anti-token-
+/// enumeration cap — at most 100 requests / 10s from one IP (≈10/s sustained, generous for a
+/// retrying provider) so a single hammering client can't overload the endpoint or probe tokens
+/// fast. Keyed by the ConnectInfo peer IP; complements the per-token limiter.
+static WEBHOOK_IP_LIMITER: LazyLock<FixedWindowLimiter> = LazyLock::new(|| FixedWindowLimiter::new(10, 100));
 
 fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)

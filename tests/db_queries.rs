@@ -313,3 +313,40 @@ async fn gc_blobs_reclaims_only_orphaned_and_aged() -> anyhow::Result<()> {
     assert!(db.blob_exists(&referenced).await?, "a referenced blob is never reclaimed");
     Ok(())
 }
+
+#[tokio::test]
+async fn idempotency_partial_unique_indexes_enforce_dedup_at_db_level() -> anyhow::Result<()> {
+    // TSU-162: dedup must hold at the DB level, not just via the app's ON CONFLICT clause.
+    let db = Db::connect(&db_url()).await?;
+    db.migrate().await?;
+
+    // Both partial-unique indexes are deployed.
+    for idx in ["uq_runs_idempotency", "uq_flow_runs_idempotency"] {
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_indexes WHERE indexname = $1")
+            .bind(idx)
+            .fetch_one(&db.pool)
+            .await?;
+        assert_eq!(n, 1, "{idx} exists (DB-level dedup guard)");
+    }
+
+    // Behavioral proof on runs: a RAW duplicate insert (bypassing the app's ON CONFLICT) is
+    // rejected by uq_runs_idempotency — so even a buggy/foreign writer can't create a dup.
+    let (sid, _) = db
+        .insert_script("idem-idx", "bash", "echo hi", None, None, true, None, None, false, None)
+        .await?;
+    let key = format!("idem-idx-{}", dokan::crypto::random_token());
+    let (_id, created) = db
+        .insert_run_idempotent(sid, &serde_json::json!({}), Some("a"), None, false, &key)
+        .await?;
+    assert!(created, "first insert creates the run");
+    let raw = sqlx::query(
+        "INSERT INTO runs (script_id, input, status, idempotency_key) \
+         VALUES ($1, '{}'::jsonb, 'pending', $2)",
+    )
+    .bind(sid)
+    .bind(&key)
+    .execute(&db.pool)
+    .await;
+    assert!(raw.is_err(), "a raw duplicate idempotency_key is rejected by the partial unique index");
+    Ok(())
+}
