@@ -107,8 +107,10 @@ enum Commands {
     /// Print this daemon's Ed25519 PUBLIC verifying key — share it so third parties can verify
     /// receipts offline. Reads the key from DOKAN_RECEIPT_ED25519_SECRET (or the dev key).
     Pubkey,
-    /// Verify a receipt JSON with its embedded public key — no daemon, no shared secret, no
-    /// re-execution. Exit 0 = verified (Ed25519 sig valid + bound to its output), 1 = failed.
+    /// Verify a receipt JSON OFFLINE with its embedded public key — no daemon, no shared secret,
+    /// no re-execution. Prints a verdict: VERIFIED (exit 0), TAMPERED (exit 1 — a signature is
+    /// present but invalid or bound to a different output), or INCONCLUSIVE (exit 2 — no Ed25519
+    /// signature to check offline; try `reproduce` or an HMAC-key check).
     Verify {
         /// Path to a receipt JSON file, or '-' to read from stdin.
         receipt: String,
@@ -150,17 +152,28 @@ async fn main() -> Result<()> {
             let raw = if path == "-" {
                 use std::io::Read;
                 let mut buf = String::new();
-                std::io::stdin().read_to_string(&mut buf)?;
+                std::io::stdin()
+                    .read_to_string(&mut buf)
+                    .map_err(|e| anyhow::anyhow!("reading receipt from stdin: {e}"))?;
                 buf
             } else {
-                std::fs::read_to_string(&path)?
+                std::fs::read_to_string(&path)
+                    .map_err(|e| anyhow::anyhow!("reading receipt file '{path}': {e}"))?
             };
             let r: serde_json::Value = serde_json::from_str(&raw)
                 .map_err(|e| anyhow::anyhow!("receipt is not valid JSON: {e}"))?;
-            let rep = receipt::verify_receipt(&r);
+            let (verdict, rep) = receipt::classify(&r);
+            // Human-facing verdict on stderr (stdout stays clean machine-readable JSON).
+            eprintln!("{}", verdict.label());
+            if verdict == receipt::Verdict::Inconclusive {
+                eprintln!(
+                    "  no Ed25519 signature to verify offline — try `dokan reproduce` or an HMAC-key check"
+                );
+            }
             println!(
                 "{}",
                 serde_json::json!({
+                    "verdict": verdict.label(),
                     "ok": rep.ok(),
                     "ed25519_valid": rep.ed25519_valid,
                     "binding_consistent": rep.binding_consistent,
@@ -168,7 +181,7 @@ async fn main() -> Result<()> {
                     "keyid": rep.keyid,
                 })
             );
-            std::process::exit(if rep.ok() { 0 } else { 1 });
+            std::process::exit(verdict.exit_code());
         }
         None => {}
     }

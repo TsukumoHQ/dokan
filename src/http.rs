@@ -2,9 +2,10 @@
 //! Prometheus `/metrics` endpoint. Deliberately minimal — humans operate here; all
 //! analytical/heavy data belongs in Grafana (PRD §8). The agent uses MCP, not this.
 
+use std::collections::HashMap;
 use std::convert::Infallible;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
@@ -84,6 +85,16 @@ async fn webhook_fire(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
+    // Reject a malformed token shape BEFORE touching the DB — same 404 as "unknown" (no leak),
+    // but a probe never reaches the webhooks table.
+    if !is_well_formed_webhook_token(&token) {
+        return (StatusCode::NOT_FOUND, "no such webhook").into_response();
+    }
+    // Per-token flood guard.
+    if !WEBHOOK_LIMITER.check_at(&token, now_secs()) {
+        metrics::counter!("dokan_webhook_rate_limited_total").increment(1);
+        return (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response();
+    }
     let Some((kind, target_id, agent_id)) =
         s.db.find_webhook_by_token(&token).await.ok().flatten()
     else {
@@ -174,8 +185,87 @@ fn webhook_idempotency_key(token: &str, headers: &HeaderMap, body: &[u8]) -> Str
     format!("wh:{token}:body:{:x}", hsh.finalize())
 }
 
+/// Constant-time byte equality — no early-exit on the first differing byte, so a presented
+/// token can't be recovered by timing the compare. (Lengths differing returns false up front;
+/// token length is not the secret.) Dep-free; sufficient for this RBAC slice.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Does the `Authorization` header carry exactly `Bearer <expected>`? The `Bearer ` scheme is
+/// REQUIRED (a bare token with no scheme is rejected as malformed), and the token is compared
+/// in constant time.
+fn bearer_matches(auth_header: Option<&str>, expected: &str) -> bool {
+    let Some(h) = auth_header else {
+        return false;
+    };
+    let Some(tok) = h.strip_prefix("Bearer ") else {
+        return false; // missing/!Bearer scheme → malformed → reject
+    };
+    ct_eq(tok.as_bytes(), expected.as_bytes())
+}
+
+/// Cheap structural validation of a webhook token BEFORE the DB lookup: an opaque URL-safe
+/// id of bounded length. `crypto::random_token` emits 32 lowercase hex, which satisfies this;
+/// the bound is deliberately a bit wider than the generator so a differently-seeded token
+/// still resolves, while a path-traversal probe (`../`), empty, oversized, or junk path is
+/// rejected without touching the webhooks table. The 404 is identical to "unknown" (no leak).
+fn is_well_formed_webhook_token(t: &str) -> bool {
+    (6..=128).contains(&t.len())
+        && t.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Minimal fixed-window rate limiter (dep-free). `check_at` is true while a key is under `max`
+/// hits inside `window_secs`; `now_secs` is injected so the policy is unit-testable without a
+/// clock. The map is pruned when it grows large so a flood of distinct keys can't OOM it.
+pub struct FixedWindowLimiter {
+    window_secs: u64,
+    max: u32,
+    inner: Mutex<HashMap<String, (u64, u32)>>, // key -> (window_start_secs, count)
+}
+
+impl FixedWindowLimiter {
+    pub fn new(window_secs: u64, max: u32) -> Self {
+        Self { window_secs, max, inner: Mutex::new(HashMap::new()) }
+    }
+
+    pub fn check_at(&self, key: &str, now_secs: u64) -> bool {
+        let mut m = self.inner.lock().unwrap();
+        if m.len() > 4096 {
+            let window = self.window_secs;
+            m.retain(|_, (start, _)| now_secs.saturating_sub(*start) < window);
+        }
+        let e = m.entry(key.to_string()).or_insert((now_secs, 0));
+        if now_secs.saturating_sub(e.0) >= self.window_secs {
+            *e = (now_secs, 0); // window rolled over → reset
+        }
+        if e.1 >= self.max {
+            return false;
+        }
+        e.1 += 1;
+        true
+    }
+}
+
+/// Per-token flood guard for the inbound webhook path: at most 20 fires/sec per token. Bounds
+/// abuse of a leaked token without throttling legitimate providers. (IP-based anti-enumeration
+/// is a follow-up — it needs ConnectInfo wired at serve time.)
+static WEBHOOK_LIMITER: LazyLock<FixedWindowLimiter> = LazyLock::new(|| FixedWindowLimiter::new(1, 20));
+
+fn now_secs() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
 /// Bearer-token gate (RBAC slice). No-op when DOKAN_TOKEN is unset. Full OAuth 2.1 is
-/// available via rmcp for P4; this protects the HTTP surface today.
+/// available via rmcp for P4; this protects the HTTP surface today. The token is compared in
+/// constant time and the `Bearer` scheme is required.
 pub async fn auth(
     State(token): State<Option<String>>,
     headers: HeaderMap,
@@ -183,12 +273,8 @@ pub async fn auth(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     if let Some(expected) = token {
-        let ok = headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .map(|v| v.strip_prefix("Bearer ").unwrap_or(v) == expected)
-            .unwrap_or(false);
-        if !ok {
+        let presented = headers.get("authorization").and_then(|v| v.to_str().ok());
+        if !bearer_matches(presented, &expected) {
             return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
         }
     }
@@ -1261,5 +1347,64 @@ async fn set_secret(
     match s.db.upsert_secret(&b.name, &b.value, None).await {
         Ok(()) => (StatusCode::OK, Json(json!({"name": b.name, "status": "set"}))),
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ct_eq_matches_only_identical_equal_length() {
+        assert!(ct_eq(b"secret-token", b"secret-token"));
+        assert!(!ct_eq(b"secret-token", b"secret-toker"));
+        assert!(!ct_eq(b"short", b"longer-value"));
+        assert!(ct_eq(b"", b""));
+    }
+
+    #[test]
+    fn bearer_requires_scheme_and_exact_token() {
+        assert!(bearer_matches(Some("Bearer abc123"), "abc123"));
+        // A bare token with no scheme is now rejected (was accepted pre-hardening).
+        assert!(!bearer_matches(Some("abc123"), "abc123"));
+        assert!(!bearer_matches(Some("Bearer wrong"), "abc123"));
+        assert!(!bearer_matches(Some("Basic abc123"), "abc123"));
+        assert!(!bearer_matches(None, "abc123"));
+        // Scheme is case-sensitive per RFC 6750 usage here.
+        assert!(!bearer_matches(Some("bearer abc123"), "abc123"));
+    }
+
+    #[test]
+    fn webhook_token_shape_accepts_opaque_ids_rejects_junk() {
+        // The real generator (32 lowercase hex) passes.
+        assert!(is_well_formed_webhook_token("0123456789abcdef0123456789abcdef"));
+        // Differently-seeded but URL-safe ids pass (e.g. the integration-test seeds).
+        assert!(is_well_formed_webhook_token("whtok-54321"));
+        assert!(is_well_formed_webhook_token("whflow-54321"));
+        // Junk / probes are rejected before any DB lookup.
+        assert!(!is_well_formed_webhook_token(""));
+        assert!(!is_well_formed_webhook_token("nope")); // too short (<6) → 404, never hits DB
+        assert!(!is_well_formed_webhook_token(&"a".repeat(129))); // oversized
+        assert!(!is_well_formed_webhook_token("../../etc/passwd")); // path traversal
+        assert!(!is_well_formed_webhook_token("has space")); // non-url-safe
+    }
+
+    #[test]
+    fn limiter_allows_under_max_then_blocks_in_window() {
+        let lim = FixedWindowLimiter::new(1, 3);
+        assert!(lim.check_at("k", 100));
+        assert!(lim.check_at("k", 100));
+        assert!(lim.check_at("k", 100));
+        assert!(!lim.check_at("k", 100), "4th hit in the window is blocked");
+    }
+
+    #[test]
+    fn limiter_resets_after_window_and_is_per_key() {
+        let lim = FixedWindowLimiter::new(1, 1);
+        assert!(lim.check_at("k", 100));
+        assert!(!lim.check_at("k", 100), "second hit same window blocked");
+        assert!(lim.check_at("k", 101), "new window resets the counter");
+        // Distinct keys have independent budgets.
+        assert!(lim.check_at("other", 101));
     }
 }

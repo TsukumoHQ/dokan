@@ -244,6 +244,68 @@ pub fn verify_receipt(receipt: &serde_json::Value) -> VerifyReport {
     VerifyReport { ed25519_valid, binding_consistent, hermetic, keyid }
 }
 
+/// Offline verification verdict — the human-facing outcome of `dokan verify`. Distinct from a
+/// bare bool so the CLI can say WHY: a missing signature ("can't prove this offline") is not
+/// the same as a failed one ("this was altered").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// Ed25519 signature valid AND bound to the receipt's claimed output.
+    Verified,
+    /// A signature is present but does not verify, or attests a different output → altered.
+    Tampered,
+    /// No Ed25519/DSSE signature material to check offline (e.g. an HMAC-only/legacy receipt).
+    /// Not a failure — just unprovable by the key-free path; use `reproduce` or a HMAC-key check.
+    Inconclusive,
+}
+
+impl Verdict {
+    pub fn label(self) -> &'static str {
+        match self {
+            Verdict::Verified => "VERIFIED",
+            Verdict::Tampered => "TAMPERED",
+            Verdict::Inconclusive => "INCONCLUSIVE",
+        }
+    }
+    /// Process exit code for the CLI: 0 verified, 1 tampered, 2 inconclusive.
+    pub fn exit_code(self) -> i32 {
+        match self {
+            Verdict::Verified => 0,
+            Verdict::Tampered => 1,
+            Verdict::Inconclusive => 2,
+        }
+    }
+}
+
+/// True iff the receipt carries the Ed25519/DSSE material the offline path needs: a non-empty
+/// signature, embedded public key, and signed payload. False → nothing to verify key-free.
+pub fn has_ed25519_signature(receipt: &serde_json::Value) -> bool {
+    let nonempty = |v: Option<&serde_json::Value>| {
+        v.and_then(|x| x.as_str()).map(|s| !s.is_empty()).unwrap_or(false)
+    };
+    let dsse = receipt.get("dsse");
+    let sig = dsse
+        .and_then(|d| d.get("signatures"))
+        .and_then(|s| s.get(0))
+        .and_then(|s| s.get("sig"));
+    let pk = receipt.get("ed25519").and_then(|e| e.get("public_key"));
+    let payload = dsse.and_then(|d| d.get("payload"));
+    nonempty(sig) && nonempty(pk) && nonempty(payload)
+}
+
+/// Classify a receipt offline (no key material): no signature → INCONCLUSIVE; signature valid
+/// and output-bound → VERIFIED; otherwise → TAMPERED. Returns the report too for detail output.
+pub fn classify(receipt: &serde_json::Value) -> (Verdict, VerifyReport) {
+    let rep = verify_receipt(receipt);
+    let verdict = if !has_ed25519_signature(receipt) {
+        Verdict::Inconclusive
+    } else if rep.ok() {
+        Verdict::Verified
+    } else {
+        Verdict::Tampered
+    };
+    (verdict, rep)
+}
+
 /// Build the Ed25519 signing key: from `DOKAN_RECEIPT_ED25519_SECRET` (base64 32-byte seed), else
 /// a deterministic, clearly-flagged PUBLIC dev key (forgeable — dev/test only).
 fn ed_from_env() -> SigningKey {
@@ -347,5 +409,67 @@ mod tests {
         let mut bad = sig.clone();
         bad.replace_range(0..2, if &sig[0..2] == "00" { "ff" } else { "00" });
         assert!(!ed_verify(&pubkey, DSSE_PAYLOAD_TYPE, payload, &bad), "tampered sig rejected");
+    }
+
+    // Build a fully-signed receipt (mirrors exec.rs) attesting `output`.
+    fn signed_receipt(output: &str) -> serde_json::Value {
+        use base64::Engine;
+        let s = dev_signer();
+        let statement = serde_json::json!({
+            "_type": "https://in-toto.io/Statement/v1",
+            "predicate": { "output_sha256": output }
+        });
+        let payload_bytes = serde_json::to_vec(&statement).unwrap();
+        let payload_b64 = base64::engine::general_purpose::STANDARD.encode(&payload_bytes);
+        let sig = s.ed_sign(&dsse_pae(DSSE_PAYLOAD_TYPE, &payload_bytes));
+        serde_json::json!({
+            "output_sha256": output,
+            "hermetic": true,
+            "dsse": {
+                "payloadType": DSSE_PAYLOAD_TYPE,
+                "payload": payload_b64,
+                "signatures": [ { "keyid": s.ed_keyid(), "sig": sig } ]
+            },
+            "ed25519": { "public_key": s.ed_public_b64(), "keyid": s.ed_keyid() }
+        })
+    }
+
+    #[test]
+    fn classify_valid_receipt_is_verified() {
+        let r = signed_receipt("abc123");
+        let (v, rep) = classify(&r);
+        assert_eq!(v, Verdict::Verified, "valid signed+bound receipt");
+        assert_eq!(v.exit_code(), 0);
+        assert!(rep.ed25519_valid && rep.binding_consistent);
+    }
+
+    #[test]
+    fn classify_output_mismatch_is_tampered() {
+        let mut r = signed_receipt("abc123");
+        // Alter the claimed output so the signed statement no longer binds it.
+        r["output_sha256"] = serde_json::json!("deadbeef");
+        let (v, _) = classify(&r);
+        assert_eq!(v, Verdict::Tampered, "binding mismatch → tampered");
+        assert_eq!(v.exit_code(), 1);
+    }
+
+    #[test]
+    fn classify_flipped_signature_is_tampered() {
+        let mut r = signed_receipt("abc123");
+        let sig = r["dsse"]["signatures"][0]["sig"].as_str().unwrap().to_string();
+        let flipped = format!("{}{}", if &sig[0..2] == "00" { "ff" } else { "00" }, &sig[2..]);
+        r["dsse"]["signatures"][0]["sig"] = serde_json::json!(flipped);
+        let (v, _) = classify(&r);
+        assert_eq!(v, Verdict::Tampered, "bad signature → tampered");
+    }
+
+    #[test]
+    fn classify_no_signature_is_inconclusive() {
+        // Legacy / HMAC-only receipt: nothing for the key-free path to check.
+        let r = serde_json::json!({ "output_sha256": "abc123", "sig": "hmac-only", "alg": "hmac-sha256" });
+        let (v, _) = classify(&r);
+        assert_eq!(v, Verdict::Inconclusive, "no ed25519 material → inconclusive");
+        assert_eq!(v.exit_code(), 2);
+        assert!(!has_ed25519_signature(&r));
     }
 }
