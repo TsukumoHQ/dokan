@@ -412,6 +412,10 @@ impl Executor {
             format!("DOKAN_SRC={src_b64}"),
             format!("DOKAN_INPUT={input}"),
             format!("DOKAN_RUN_ID={run_id}"),
+            // The job runs as a non-root uid on a read-only rootfs; point HOME at the /tmp
+            // tmpfs so runtime tools that write to ~ (pip ~/.cache, npm ~/.npm) don't hit a
+            // non-writable or nonexistent home. /tmp is the one writable, job-private surface.
+            "HOME=/tmp".to_string(),
         ];
         let mut secret_vals: Vec<String> = Vec::new();
         if let Ok(secrets) = db.all_secrets_for(agent_id).await {
