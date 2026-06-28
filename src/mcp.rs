@@ -222,9 +222,11 @@ pub struct UploadArgs {
     /// re-upload is a cheap no-op (status "unchanged"). Default false. Use it so a respawned agent
     /// can safely re-upload and so you can tune a script's caps without perturbing its source.
     pub upsert: Option<bool>,
-    /// Network access for the job. Default true (monitors that hit APIs need it). Set FALSE
-    /// for a pure-compute script: it runs network-disabled, making its output a deterministic
-    /// function of its inputs — soundly cacheable (cache:true) and provable via its receipt.
+    /// Network access for the job. **Default FALSE (hermetic-by-default, v0.4.0).** A job runs
+    /// network-disabled unless you opt in with `network:true` — making its output a deterministic
+    /// function of its inputs by default: soundly cacheable (cache:true) and provable via its
+    /// receipt/reproduce. Set TRUE for a script that must reach the network (e.g. a monitor that
+    /// hits an API). Pre-0.4.0 the default was true; existing scripts keep their stored value.
     pub network: Option<bool>,
     /// Optional per-job memory cap in MiB; null = the executor's global default. Raise it for a
     /// heavier job that OOMs (exit 137) under the default cap. A script with any override runs
@@ -234,6 +236,10 @@ pub struct UploadArgs {
     pub cpu_limit: Option<f64>,
     /// Opt-in: feed the previous run's structured result into the next run as DOKAN_INPUT.prev_result (for stateful monitors).
     pub feed_prev_result: Option<bool>,
+    /// Optional secret ALLOWLIST: the subset of secret names this script's jobs may see (least
+    /// privilege). null/omitted = back-compat (all of your + global secrets). When set, only these
+    /// names are injected — as env vars AND files under tmpfs /run/secrets/<name>.
+    pub secrets: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -568,13 +574,16 @@ impl Dokan {
                             &a.runtime,
                             a.description.as_deref(),
                             a.created_by.as_deref(),
-                            a.network.unwrap_or(true),
+                            a.network.unwrap_or(false),
                             a.mem_limit_mb,
                             a.cpu_limit,
                             a.feed_prev_result.unwrap_or(false),
                         )
                         .await
                         .map_err(internal)?;
+                    if let Some(ref names) = a.secrets {
+                        self.db.set_script_secrets(id, Some(names)).await.map_err(internal)?;
+                    }
                     let status = if changed { "metadata_updated" } else { "unchanged" };
                     return ok(json!({"script_id": id, "version": version, "status": status}));
                 }
@@ -587,7 +596,7 @@ impl Dokan {
                         &a.source,
                         a.description.as_deref(),
                         a.created_by.as_deref(),
-                        a.network.unwrap_or(true),
+                        a.network.unwrap_or(false),
                         a.mem_limit_mb,
                         a.cpu_limit,
                         a.feed_prev_result.unwrap_or(false),
@@ -595,6 +604,9 @@ impl Dokan {
                     )
                     .await
                     .map_err(internal)?;
+                if let Some(ref names) = a.secrets {
+                    self.db.set_script_secrets(id, Some(names)).await.map_err(internal)?;
+                }
                 return ok(json!({"script_id": id, "version": version, "status": "updated"}));
             }
         // Captured before insert so the duplicate-name warning can compare against it.
@@ -608,7 +620,7 @@ impl Dokan {
                 &a.source,
                 a.description.as_deref(),
                 a.created_by.as_deref(),
-                a.network.unwrap_or(true),
+                a.network.unwrap_or(false),
                 a.mem_limit_mb,
                 a.cpu_limit,
                 a.feed_prev_result.unwrap_or(false),
@@ -616,6 +628,9 @@ impl Dokan {
             )
             .await
             .map_err(internal)?;
+        if let Some(ref names) = a.secrets {
+            self.db.set_script_secrets(id, Some(names)).await.map_err(internal)?;
+        }
         let mut out = json!({"script_id": id, "version": version, "status": "uploaded"});
         // Footgun guard: a plain upload of a name that already exists silently spawns a
         // duplicate script_id (orphan accumulation). `prior` was captured before insert.
@@ -1335,7 +1350,7 @@ impl Dokan {
         ok(json!({"run_id": a.run_id, "status": if canceled { "canceled" } else { "already_succeeded" }}))
     }
 
-    #[tool(description = "Verify a run's receipt WITHOUT re-executing — offline, instant. Checks the Ed25519/DSSE signature against the receipt's embedded public key (third-party-verifiable, NO shared secret needed), the HMAC binding with the daemon key (key-holder check), and that the signed in-toto Statement attests THIS run's output. Returns {ok, ed25519_valid, hmac_valid, binding_consistent, hermetic, deterministic, keyid}. hermetic=true means the run was network-disabled (its output is a pure function of inputs). For verify-by-RE-EXECUTION (re-run + byte-compare), use the reproduce primitive.")]
+    #[tool(description = "Verify a run's receipt WITHOUT re-executing — offline, instant. Checks the Ed25519/DSSE signature against the receipt's embedded public key (third-party-verifiable, NO shared secret needed), the HMAC binding with the daemon key (key-holder check), and that the signed in-toto Statement attests THIS run's output. Returns {ok, ed25519_valid, hmac_valid, binding_consistent, hermetic, deterministic, keyid, trust_enforced, pinned}. hermetic=true means the run was network-disabled (its output is a pure function of inputs). AUTHENTICITY: set DOKAN_TRUSTED_RECEIPT_KEYS (comma-separated trusted signing pubkeys) → trust_enforced=true and ok() requires the signer be pinned (in the set); unset → tamper-evident only (the embedded key is taken on faith). For verify-by-RE-EXECUTION (re-run + byte-compare), use the reproduce primitive.")]
     async fn verify(&self, Parameters(a): Parameters<VerifyArgs>) -> Result<CallToolResult, McpError> {
         let Some(receipt) = self.db.run_receipt(a.run_id).await.map_err(internal)? else {
             return err_ctx("no_receipt", "this run has no receipt yet", Some("receipts attach once a run reaches a terminal state"), json!({"run_id": a.run_id}));
@@ -1351,6 +1366,8 @@ impl Dokan {
             "hermetic": rep.hermetic,
             "deterministic": receipt.get("deterministic").and_then(|v| v.as_bool()).unwrap_or(false),
             "keyid": rep.keyid,
+            "trust_enforced": rep.trust_enforced,
+            "pinned": rep.pinned,
         }))
     }
 }

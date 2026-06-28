@@ -115,8 +115,10 @@ enum Commands {
     Pubkey,
     /// Verify a receipt JSON OFFLINE with its embedded public key — no daemon, no shared secret,
     /// no re-execution. Prints a verdict: VERIFIED (exit 0), TAMPERED (exit 1 — a signature is
-    /// present but invalid or bound to a different output), or INCONCLUSIVE (exit 2 — no Ed25519
-    /// signature to check offline; try `reproduce` or an HMAC-key check).
+    /// present but invalid or bound to a different output), INCONCLUSIVE (exit 2 — no Ed25519
+    /// signature to check offline; try `reproduce` or an HMAC-key check), or UNTRUSTED (exit 3 —
+    /// valid + bound but the signing key isn't in DOKAN_TRUSTED_RECEIPT_KEYS; set that env to a
+    /// comma-separated allow-list of trusted signing public keys to enforce authenticity).
     Verify {
         /// Path to a receipt JSON file, or '-' to read from stdin.
         receipt: String,
@@ -185,6 +187,8 @@ async fn main() -> Result<()> {
                     "binding_consistent": rep.binding_consistent,
                     "hermetic": rep.hermetic,
                     "keyid": rep.keyid,
+                    "trust_enforced": rep.trust_enforced,
+                    "pinned": rep.pinned,
                 })
             );
             std::process::exit(verdict.exit_code());

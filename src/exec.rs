@@ -20,6 +20,13 @@ use crate::pool::WarmPool;
 /// run still `running` well past it can only mean the worker died — see the lease reaper.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 300;
 
+/// Non-root uid:gid the JOB runs as (defense-in-depth: a job needs no privilege — it reads
+/// /input, writes /tmp (tmpfs) + /output (a 0777 bind), and hits the network if allowed).
+/// `65534:65534` = nobody:nogroup, present numerically in every image without name lookup.
+/// Combined with cap_drop ALL + no-new-privileges + a read-only rootfs, the blast radius of
+/// untrusted code is minimized.
+const RUN_USER: &str = "65534:65534";
+
 #[derive(Clone)]
 pub struct Executor {
     docker: Docker,
@@ -393,21 +400,51 @@ impl Executor {
         output_dir: Option<&str>,
     ) -> Result<()> {
         let src_b64 = base64::engine::general_purpose::STANDARD.encode(source);
+        // GAP-2: before exec'ing the job, materialize each injected secret as a file under the
+        // /run/secrets tmpfs (mode 400) — a per-process, non-inherited channel far better than env
+        // for untrusted code. env injection is kept (back-compat) so existing scripts still work;
+        // new scripts should read /run/secrets/<name>. DOKAN_SECRET_NAMES carries the name list
+        // (not values); `eval v=$NAME` reads each value verbatim from env (assignment, not re-parse).
         let bootstrap = format!(
-            "printf '%s' \"$DOKAN_SRC\" | base64 -d > /tmp/dokan_script && exec {interp} /tmp/dokan_script"
+            "mkdir -p /run/secrets 2>/dev/null || true; \
+             for n in $(printf '%s' \"$DOKAN_SECRET_NAMES\" | tr ',' ' '); do \
+               [ -n \"$n\" ] || continue; \
+               eval \"v=\\$$n\"; \
+               printf '%s' \"$v\" > /run/secrets/$n 2>/dev/null && chmod 400 /run/secrets/$n 2>/dev/null || true; \
+             done; \
+             printf '%s' \"$DOKAN_SRC\" | base64 -d > /tmp/dokan_script && exec {interp} /tmp/dokan_script"
         );
 
-        // Inject configured secrets as env vars (best-effort; never logged).
+        // Inject secrets: env channel (back-compat) + /run/secrets tmpfs files (the bootstrap
+        // materializes them). VALUES are collected for log redaction (a leaked $SECRET in
+        // stdout/stderr is masked; <8 chars skipped — collision-prone). Allowlist (GAP-2): a
+        // script may restrict which secrets it sees; None → back-compat (all agent + global).
+        let allow = db.run_secrets_allowlist(run_id).await.ok().flatten();
         let mut env = vec![
             format!("DOKAN_SRC={src_b64}"),
             format!("DOKAN_INPUT={input}"),
             format!("DOKAN_RUN_ID={run_id}"),
+            // The job runs as a non-root uid on a read-only rootfs; point HOME at the /tmp
+            // tmpfs so runtime tools that write to ~ (pip ~/.cache, npm ~/.npm) don't hit a
+            // non-writable or nonexistent home. /tmp is the one writable, job-private surface.
+            "HOME=/tmp".to_string(),
         ];
+        let mut secret_vals: Vec<String> = Vec::new();
+        let mut secret_names: Vec<String> = Vec::new();
         if let Ok(secrets) = db.all_secrets_for(agent_id).await {
             for (k, v) in secrets {
-                env.push(format!("{k}={v}"));
+                if !secret_allowed(&k, allow.as_deref()) {
+                    continue; // GAP-2 allowlist: withhold secrets not on the script's list
+                }
+                if v.len() >= 8 {
+                    secret_vals.push(v.clone()); // for stdout/stderr redaction
+                }
+                secret_names.push(k.clone()); // for DOKAN_SECRET_NAMES → /run/secrets files
+                env.push(format!("{k}={v}")); // env: back-compat channel (kept)
             }
         }
+        // Name list (NOT values) so the bootstrap knows which env vars to write as files.
+        env.push(format!("DOKAN_SECRET_NAMES={}", secret_names.join(",")));
 
         let exec = self
             .docker
@@ -418,6 +455,9 @@ impl Executor {
                     env: Some(env),
                     attach_stdout: Some(true),
                     attach_stderr: Some(true),
+                    // Drop to a non-root uid for the job itself (the idle `sleep` keeps the
+                    // image default; only the untrusted job is de-privileged).
+                    user: Some(RUN_USER.to_string()),
                     ..Default::default()
                 },
             )
@@ -438,7 +478,7 @@ impl Executor {
 
         let last_seq = match tokio::time::timeout(
             Duration::from_secs(DEFAULT_TIMEOUT_SECS),
-            pump_logs(db, run_id, output),
+            pump_logs(db, run_id, output, &secret_vals),
         )
         .await
         {
@@ -669,10 +709,25 @@ const PROGRESS_MARKER: &str = "::dokan:progress::";
 
 /// Stream container output line-by-line into the DB. Returns (last seq written, captured
 /// structured result if the job emitted a RESULT_MARKER line).
+/// Redact any configured secret value that leaked into a log line, replacing each occurrence
+/// with `***`. No-op (single empty loop) on the common path where no secrets are configured.
+/// Scope: run LOGS only — the structured `::dokan:result::` payload is the job's intentional
+/// output and is left intact (masking it could corrupt the JSON the caller parses).
+fn redact_secrets(line: &str, secrets: &[String]) -> String {
+    let mut out = line.to_string();
+    for s in secrets {
+        if out.contains(s.as_str()) {
+            out = out.replace(s.as_str(), "***");
+        }
+    }
+    out
+}
+
 async fn pump_logs(
     db: &Db,
     run_id: i64,
     mut stream: impl Stream<Item = Result<LogOutput, bollard::errors::Error>> + Unpin,
+    secrets: &[String],
 ) -> Result<(i64, Option<String>)> {
     let mut seq = db.max_log_seq(run_id).await.unwrap_or(0);
     let mut buf_out = String::new();
@@ -733,7 +788,7 @@ async fn pump_logs(
                 }
             }
             seq += 1;
-            batch.push((seq, stream_name, line.to_string()));
+            batch.push((seq, stream_name, redact_secrets(line, secrets)));
             metrics::counter!("dokan_log_lines_total", "stream" => stream_name).increment(1);
             if batch.len() >= 256 {
                 flush(db, run_id, &mut batch).await?;
@@ -757,9 +812,67 @@ async fn pump_logs(
             }
         }
         seq += 1;
-        batch.push((seq, stream_name, buf.clone()));
+        batch.push((seq, stream_name, redact_secrets(buf, secrets)));
         metrics::counter!("dokan_log_lines_total", "stream" => stream_name).increment(1);
     }
     flush(db, run_id, &mut batch).await?;
     Ok((seq, result))
+}
+
+/// GAP-2 secret allowlist check: a secret is injected iff there is NO allowlist (None →
+/// back-compat, all visible) or its name is explicitly listed. Pure — unit-tested.
+fn secret_allowed(name: &str, allow: Option<&[String]>) -> bool {
+    match allow {
+        None => true,
+        Some(list) => list.iter().any(|n| n == name),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{redact_secrets, secret_allowed};
+
+    #[test]
+    fn redacts_each_secret_occurrence() {
+        let secrets = vec!["sk-supersecret-1234".to_string()];
+        let line = "calling api with token sk-supersecret-1234 then sk-supersecret-1234 again";
+        assert_eq!(
+            redact_secrets(line, &secrets),
+            "calling api with token *** then *** again"
+        );
+    }
+
+    #[test]
+    fn redacts_multiple_distinct_secrets() {
+        let secrets = vec!["alpha-token-9999".to_string(), "beta-key-8888".to_string()];
+        let line = "alpha-token-9999 / beta-key-8888";
+        assert_eq!(redact_secrets(line, &secrets), "*** / ***");
+    }
+
+    #[test]
+    fn no_secrets_is_identity() {
+        let line = "nothing to hide here";
+        assert_eq!(redact_secrets(line, &[]), line);
+    }
+
+    #[test]
+    fn leaves_non_matching_lines_untouched() {
+        let secrets = vec!["sk-supersecret-1234".to_string()];
+        let line = "ordinary log line with no secret";
+        assert_eq!(redact_secrets(line, &secrets), line);
+    }
+
+    #[test]
+    fn allowlist_none_is_back_compat_all_visible() {
+        assert!(secret_allowed("OPENAI_API_KEY", None), "no allowlist → all secrets visible");
+    }
+
+    #[test]
+    fn allowlist_restricts_to_listed_names() {
+        let allow = vec!["OPENAI_API_KEY".to_string(), "SERPAPI_KEY".to_string()];
+        assert!(secret_allowed("OPENAI_API_KEY", Some(&allow)), "listed name injected");
+        assert!(secret_allowed("SERPAPI_KEY", Some(&allow)));
+        assert!(!secret_allowed("STRIPE_KEY", Some(&allow)), "unlisted name withheld");
+        assert!(!secret_allowed("OPENAI_API_KEY", Some(&[])), "empty allowlist → nothing visible");
+    }
 }

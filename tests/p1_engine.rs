@@ -233,12 +233,23 @@ async fn secret_injected_into_job_env() -> anyhow::Result<()> {
         names["secrets"].as_array().map(|a| a.iter().any(|n| n == "DOKAN_TEST_KEY")).unwrap_or(false),
         "secret name listed (value never returned): {names}"
     );
-    let sid = upload(&c, "bash", "echo KEY=$DOKAN_TEST_KEY\n").await;
+    // v0.4.0: the secret reaches the job via BOTH the env channel (back-compat) AND the GAP-2
+    // /run/secrets tmpfs file — and the log pump REDACTS the value so the raw secret never
+    // persists in logs even if the job echoes it. The script echoes both channels; logs must show
+    // them MASKED (proving injection + file delivery) and never the raw value (proving redaction).
+    let sid = upload(
+        &c,
+        "bash",
+        "echo KEY=$DOKAN_TEST_KEY; echo FILE=$(cat /run/secrets/DOKAN_TEST_KEY)\n",
+    )
+    .await;
     let run = call(&c, "run_script", json!({"script_id": sid, "agent_id": "test"})).await?;
     let run_id = run["run_id"].as_i64().unwrap();
     assert_eq!(wait_status(&c, run_id, 60).await, "succeeded", "ran");
     let text = logs_text(&c, run_id).await;
-    assert!(text.contains("KEY=sekret-42"), "secret reached job env: {text}");
+    assert!(!text.contains("sekret-42"), "raw secret value must NOT leak into logs (redacted): {text}");
+    assert!(text.contains("KEY=***"), "env channel injected, value masked in logs: {text}");
+    assert!(text.contains("FILE=***"), "GAP-2 /run/secrets file channel delivered, value masked: {text}");
     c.cancel().await?;
     Ok(())
 }

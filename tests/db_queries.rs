@@ -470,3 +470,26 @@ async fn cancel_is_authoritative_over_a_racing_finish() -> anyhow::Result<()> {
     assert_eq!(db.run_status(c).await?.as_deref(), Some("succeeded"), "succeeded stays succeeded");
     Ok(())
 }
+
+#[tokio::test]
+async fn script_secrets_allowlist_round_trips_to_run() -> anyhow::Result<()> {
+    // GAP-2: a script's secret allowlist is stored and resolvable from a run of it; None = no limit.
+    let db = Db::connect(&db_url()).await?;
+    db.migrate().await?;
+    let (sid, _) = db
+        .insert_script("gap2-allow", "bash", "echo hi", None, None, true, None, None, false, None)
+        .await?;
+    // Default: no allowlist → back-compat (all secrets).
+    let run0 = db.insert_run(sid, &serde_json::json!({}), None).await?;
+    assert_eq!(db.run_secrets_allowlist(run0).await?, None, "no allowlist by default");
+    // Set an allowlist → a run of the script resolves it.
+    let allow = vec!["OPENAI_API_KEY".to_string(), "SERPAPI_KEY".to_string()];
+    db.set_script_secrets(sid, Some(&allow)).await?;
+    let run1 = db.insert_run(sid, &serde_json::json!({}), None).await?;
+    assert_eq!(db.run_secrets_allowlist(run1).await?, Some(allow), "allowlist resolves from the run");
+    // Clear it → back to no restriction.
+    db.set_script_secrets(sid, None).await?;
+    let run2 = db.insert_run(sid, &serde_json::json!({}), None).await?;
+    assert_eq!(db.run_secrets_allowlist(run2).await?, None, "cleared → no restriction");
+    Ok(())
+}
