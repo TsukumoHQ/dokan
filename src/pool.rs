@@ -168,12 +168,18 @@ impl WarmPool {
             // writable surfaces are two tmpfs + the opt-in /output bind:
             //   - /tmp (mode 1777): the bootstrap drops the script; the non-root job uid writes here.
             //   - /run/secrets (mode 0700, noexec, GAP-2): per-container in-memory secret files,
-            //     writable under the RO rootfs, never persisted in the warm image layer.
+            //     writable under the RO rootfs, never persisted in the warm image layer. OWNED by
+            //     the non-root job uid (uid/gid=65534, matching exec.rs RUN_USER) so the job can
+            //     create the files AND only it can read them — a root-owned 0700 dir would be
+            //     unwritable by the de-privileged job.
             // tmpfs size counts against the container mem cgroup, so the mem cap already bounds it.
             readonly_rootfs: Some(true),
             tmpfs: Some(HashMap::from([
                 ("/tmp".to_string(), "rw,nosuid,nodev".to_string()),
-                ("/run/secrets".to_string(), "rw,nosuid,nodev,noexec,mode=0700".to_string()),
+                (
+                    "/run/secrets".to_string(),
+                    "rw,nosuid,nodev,noexec,mode=0700,uid=65534,gid=65534".to_string(),
+                ),
             ])),
             // network=false → fully network-disabled (deterministic). Else default networking.
             network_mode: if isolated { Some("none".to_string()) } else { None },
