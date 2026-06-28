@@ -267,6 +267,142 @@ async fn flow_saga_compensation() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Map fan-out PARTIAL failure: one child fails → the map parent fails → the flow fails →
+/// the upstream succeeded step with a compensate is rolled back. Proves a partial map
+/// failure both surfaces in the {n,ok,failed} count AND triggers the saga.
+#[tokio::test]
+async fn flow_map_partial_failure_compensates_upstream() -> anyhow::Result<()> {
+    let c = spawn().await?;
+    let good = call(
+        &c,
+        "upload_script",
+        json!({"name":"good","runtime":"bash","source":"echo ok\n","description":"succeeds"}),
+    )
+    .await["script_id"]
+        .as_i64()
+        .unwrap();
+    let comp = call(
+        &c,
+        "upload_script",
+        json!({"name":"comp","runtime":"bash","source":"echo compensated\n","description":"rollback"}),
+    )
+    .await["script_id"]
+        .as_i64()
+        .unwrap();
+    let emit = call(
+        &c,
+        "upload_script",
+        json!({"name":"emit","runtime":"bash","source":"echo '[\"keep\",\"BOOM\",\"keep2\"]'\n","description":"emits a list"}),
+    )
+    .await["script_id"]
+        .as_i64()
+        .unwrap();
+    // A map child sees {flow_input, deps, step}; parse the `step` element exactly (NOT a
+    // substring of the whole input, which also carries deps) and fail only on "BOOM".
+    let proc = call(
+        &c,
+        "upload_script",
+        json!({"name":"proc","runtime":"node","source":"let i;try{i=JSON.parse(process.env.DOKAN_INPUT||'{}')}catch{i={}}\nif(typeof i==='string'){try{i=JSON.parse(i)}catch{}}\nconst s=i&&i.step;console.log('step='+JSON.stringify(s));process.exit(s==='BOOM'?1:0);\n","description":"fails only on the BOOM element"}),
+    )
+    .await["script_id"]
+        .as_i64()
+        .unwrap();
+
+    let flow = call(
+        &c,
+        "compose_flow",
+        json!({
+            "name": "map-partial-saga",
+            "spec": { "steps": [
+                {"id":"s0","script_id": good, "compensate": comp},
+                {"id":"emit","script_id": emit, "depends_on":["s0"]},
+                {"id":"proc","script_id": proc, "depends_on":["emit"], "map":"deps.emit", "retries": 0}
+            ]}
+        }),
+    )
+    .await;
+    let flow_id = flow["flow_id"].as_i64().unwrap_or_else(|| panic!("{}", flow.to_string()));
+    let fr = call(&c, "run_flow", json!({"flow_id": flow_id})).await;
+    let last = poll_flow(&c, fr["flow_run_id"].as_i64().unwrap()).await;
+    eprintln!("map-partial-saga -> {last}");
+
+    // A failed map child fails the flow and triggers the saga. (The engine compensates on the
+    // first failed child and returns, so the map parent may remain `expanded` and sibling
+    // children may not all reach terminal — assert only the deterministic facts.)
+    assert_eq!(last["status"], "failed", "a failed map child fails the flow: {last}");
+    let steps = last["steps"].as_array().unwrap();
+    let proc = step(steps, "proc");
+    assert!(
+        proc["map"]["failed"].as_i64().unwrap_or(0) >= 1,
+        "at least the BOOM child failed: {last}"
+    );
+    // The upstream succeeded step is rolled back by the saga.
+    assert_eq!(step(steps, "s0")["comp"], json!(true), "s0 compensated on map failure: {last}");
+
+    c.cancel().await?;
+    Ok(())
+}
+
+/// Saga only compensates SUCCEEDED steps: a step skipped by a false `when` is never rolled
+/// back even when it carries a compensate, while a sibling that actually ran is.
+#[tokio::test]
+async fn flow_compensation_skips_skipped_step() -> anyhow::Result<()> {
+    let c = spawn().await?;
+    let good = call(
+        &c,
+        "upload_script",
+        json!({"name":"good","runtime":"bash","source":"echo ok\n","description":"succeeds"}),
+    )
+    .await["script_id"]
+        .as_i64()
+        .unwrap();
+    let comp = call(
+        &c,
+        "upload_script",
+        json!({"name":"comp","runtime":"bash","source":"echo compensated\n","description":"rollback"}),
+    )
+    .await["script_id"]
+        .as_i64()
+        .unwrap();
+    let bad = call(
+        &c,
+        "upload_script",
+        json!({"name":"bad","runtime":"bash","source":"exit 1\n","description":"fails"}),
+    )
+    .await["script_id"]
+        .as_i64()
+        .unwrap();
+
+    let flow = call(
+        &c,
+        "compose_flow",
+        json!({
+            "name": "saga-skip",
+            "spec": { "steps": [
+                {"id":"s0","script_id": good, "compensate": comp},
+                // sx is gated false (s0 != "spam") → skipped → must NOT be compensated.
+                {"id":"sx","script_id": good, "depends_on":["s0"], "compensate": comp,
+                 "when":{"ref":"deps.s0","op":"eq","value":"spam"}},
+                {"id":"s2","script_id": bad, "depends_on":["s0"], "retries": 0}
+            ]}
+        }),
+    )
+    .await;
+    let flow_id = flow["flow_id"].as_i64().unwrap_or_else(|| panic!("{}", flow.to_string()));
+    let fr = call(&c, "run_flow", json!({"flow_id": flow_id})).await;
+    let last = poll_flow(&c, fr["flow_run_id"].as_i64().unwrap()).await;
+    eprintln!("saga-skip -> {last}");
+
+    assert_eq!(last["status"], "failed", "flow fails: {last}");
+    let steps = last["steps"].as_array().unwrap();
+    assert_eq!(step(steps, "s0")["comp"], json!(true), "ran step s0 is compensated: {last}");
+    assert_eq!(step(steps, "sx")["status"], "skipped", "sx gated off: {last}");
+    assert_ne!(step(steps, "sx")["comp"], json!(true), "a skipped step is NOT compensated: {last}");
+
+    c.cancel().await?;
+    Ok(())
+}
+
 /// A `cache:true` step recalls a prior identical run instead of re-executing (partial
 /// flow recall). The script echoes its own run id, which differs on every real execution —
 /// so an identical output across two flow runs proves the second was recalled.
