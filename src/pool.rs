@@ -164,6 +164,13 @@ impl WarmPool {
             // scripts hitting APIs; none need caps. Relax per-deployment if ever needed.
             cap_drop: Some(vec!["ALL".to_string()]),
             security_opt: Some(vec!["no-new-privileges".to_string()]),
+            // GAP-2: a tmpfs for /run/secrets — secret files the job reads live in memory, are
+            // per-container (never persisted in the warm image layer), and stay writable even
+            // under a read-only rootfs. nosuid/nodev/noexec: it's data, never executed.
+            tmpfs: Some(HashMap::from([(
+                "/run/secrets".to_string(),
+                "rw,nosuid,nodev,noexec,mode=0700".to_string(),
+            )])),
             // network=false → fully network-disabled (deterministic). Else default networking.
             network_mode: if isolated { Some("none".to_string()) } else { None },
             mounts,

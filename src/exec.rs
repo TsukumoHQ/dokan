@@ -393,21 +393,41 @@ impl Executor {
         output_dir: Option<&str>,
     ) -> Result<()> {
         let src_b64 = base64::engine::general_purpose::STANDARD.encode(source);
+        // GAP-2: before exec'ing the job, materialize each injected secret as a file under the
+        // /run/secrets tmpfs (mode 400) — a per-process, non-inherited channel far better than env
+        // for untrusted code. env injection is kept (back-compat) so existing scripts still work;
+        // new scripts should read /run/secrets/<name>. DOKAN_SECRET_NAMES carries the name list
+        // (not values); `eval v=$NAME` reads each value verbatim from env (assignment, not re-parse).
         let bootstrap = format!(
-            "printf '%s' \"$DOKAN_SRC\" | base64 -d > /tmp/dokan_script && exec {interp} /tmp/dokan_script"
+            "mkdir -p /run/secrets 2>/dev/null || true; \
+             for n in $(printf '%s' \"$DOKAN_SECRET_NAMES\" | tr ',' ' '); do \
+               [ -n \"$n\" ] || continue; \
+               eval \"v=\\$$n\"; \
+               printf '%s' \"$v\" > /run/secrets/$n 2>/dev/null && chmod 400 /run/secrets/$n 2>/dev/null || true; \
+             done; \
+             printf '%s' \"$DOKAN_SRC\" | base64 -d > /tmp/dokan_script && exec {interp} /tmp/dokan_script"
         );
 
-        // Inject configured secrets as env vars (best-effort; never logged).
+        // Secret allowlist (GAP-2): a script may restrict which secrets its jobs see (least
+        // privilege). None → back-compat (all of the agent's + global secrets).
+        let allow = db.run_secrets_allowlist(run_id).await.ok().flatten();
         let mut env = vec![
             format!("DOKAN_SRC={src_b64}"),
             format!("DOKAN_INPUT={input}"),
             format!("DOKAN_RUN_ID={run_id}"),
         ];
+        let mut secret_names: Vec<String> = Vec::new();
         if let Ok(secrets) = db.all_secrets_for(agent_id).await {
             for (k, v) in secrets {
-                env.push(format!("{k}={v}"));
+                if !secret_allowed(&k, allow.as_deref()) {
+                    continue;
+                }
+                secret_names.push(k.clone());
+                env.push(format!("{k}={v}")); // env: back-compat channel (kept; see bootstrap for files)
             }
         }
+        // Name list (NOT values) so the bootstrap knows which env vars to write as files.
+        env.push(format!("DOKAN_SECRET_NAMES={}", secret_names.join(",")));
 
         let exec = self
             .docker
@@ -762,4 +782,32 @@ async fn pump_logs(
     }
     flush(db, run_id, &mut batch).await?;
     Ok((seq, result))
+}
+
+/// GAP-2 secret allowlist check: a secret is injected iff there is NO allowlist (None →
+/// back-compat, all visible) or its name is explicitly listed. Pure — unit-tested.
+fn secret_allowed(name: &str, allow: Option<&[String]>) -> bool {
+    match allow {
+        None => true,
+        Some(list) => list.iter().any(|n| n == name),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::secret_allowed;
+
+    #[test]
+    fn allowlist_none_is_back_compat_all_visible() {
+        assert!(secret_allowed("OPENAI_API_KEY", None), "no allowlist → all secrets visible");
+    }
+
+    #[test]
+    fn allowlist_restricts_to_listed_names() {
+        let allow = vec!["OPENAI_API_KEY".to_string(), "SERPAPI_KEY".to_string()];
+        assert!(secret_allowed("OPENAI_API_KEY", Some(&allow)), "listed name injected");
+        assert!(secret_allowed("SERPAPI_KEY", Some(&allow)));
+        assert!(!secret_allowed("STRIPE_KEY", Some(&allow)), "unlisted name withheld");
+        assert!(!secret_allowed("OPENAI_API_KEY", Some(&[])), "empty allowlist → nothing visible");
+    }
 }

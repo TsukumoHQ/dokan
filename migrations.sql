@@ -273,3 +273,8 @@ ALTER TABLE runs ADD COLUMN IF NOT EXISTS input_blobs JSONB;  -- { "<dest-name>"
 -- receipt). NULL/absent → no /output, the warm path is untouched.
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS capture_output BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS output_blobs JSONB;  -- { "<relative-name>": "<sha>" }
+
+-- Secret allowlist (GAP-2, v0.4.0): per-script opt-in subset of secrets the job sees. NULL =
+-- back-compat (all of the agent's + global secrets, today's behavior). When set, only these names
+-- are injected (env + the tmpfs /run/secrets files). Additive; pairs with the tmpfs delivery.
+ALTER TABLE scripts ADD COLUMN IF NOT EXISTS secrets_allowlist TEXT[];
