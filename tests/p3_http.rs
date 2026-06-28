@@ -150,7 +150,8 @@ async fn operator_surface_and_relay() -> anyhow::Result<()> {
     }
     assert!(relayed, "relay egress fired");
 
-    // 7. Metrics expose the run counter.
+    // 7. Observability: /metrics exposes run health (failure/terminal counter + per-run
+    //    latency histogram) AND is self-documenting (HELP/TYPE) so a scraper needs no shell-in.
     let metrics = cli
         .get(format!("{base}/metrics"))
         .header("authorization", &auth)
@@ -158,7 +159,9 @@ async fn operator_surface_and_relay() -> anyhow::Result<()> {
         .await?
         .text()
         .await?;
-    assert!(metrics.contains("dokan_runs_finished_total"), "metrics: {metrics}");
+    assert!(metrics.contains("dokan_runs_finished_total"), "terminal-status counter: {metrics}");
+    assert!(metrics.contains("dokan_run_duration_seconds"), "per-run latency histogram: {metrics}");
+    assert!(metrics.contains("# HELP dokan_runs_finished_total"), "metrics self-documented (HELP/TYPE)");
 
     // 8. Secrets: write-only, names listed.
     cli.post(format!("{base}/api/secrets"))

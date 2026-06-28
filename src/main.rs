@@ -540,4 +540,16 @@ fn describe_metrics() {
     metrics::describe_counter!("dokan_flow_steps_finished_total", Unit::Count, "Flow steps reaching a terminal status, by status (succeeded/failed/skipped)");
     metrics::describe_counter!("dokan_flow_compensations_total", Unit::Count, "Saga compensation script runs (rollback of a succeeded step after the flow failed), by result");
     metrics::describe_counter!("dokan_flow_steps_recalled_total", Unit::Count, "Flow steps served from the content-addressed cache (partial flow recall) instead of running a container");
+    metrics::describe_counter!("dokan_run_cache_total", Unit::Count, "run_script cache lookups when cache:true, by result (hit = recalled without a container / miss = enqueued) — cache hit-rate");
+    // Triggers, GC, autoscale, and the inbound-webhook surface.
+    metrics::describe_counter!("dokan_triggers_fired_total", Unit::Count, "on_result reactive triggers fired (a run's result matched a registered predicate)");
+    metrics::describe_counter!("dokan_gc_runs_total", Unit::Count, "Old runs garbage-collected (retention sweep)");
+    metrics::describe_counter!("dokan_gc_logs_total", Unit::Count, "Old log lines garbage-collected (retention sweep)");
+    metrics::describe_counter!("dokan_webhook_fires_total", Unit::Count, "Inbound webhook deliveries that enqueued a run/flow, by target");
+    metrics::describe_counter!("dokan_webhook_dedup_total", Unit::Count, "Inbound webhook redeliveries collapsed to the first run (at-least-once dedup)");
+    metrics::describe_counter!("dokan_webhook_rate_limited_total", Unit::Count, "Inbound webhook requests rejected by the per-token rate limit (429)");
+    metrics::describe_gauge!("dokan_autoscale_arrival_rate", Unit::Count, "Autoscaler: observed run arrival rate λ (Little's Law)");
+    metrics::describe_gauge!("dokan_autoscale_in_system", Unit::Count, "Autoscaler: estimated runs in system L = λW");
+    metrics::describe_gauge!("dokan_autoscale_concurrency", Unit::Count, "Autoscaler: current worker concurrency target");
+    metrics::describe_gauge!("dokan_autoscale_warm_target", Unit::Count, "Autoscaler: current warm-pool depth target");
 }
