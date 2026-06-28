@@ -139,4 +139,63 @@ mod tests {
         assert_eq!(c.set(3), 3, "forgets now-available permits");
         assert_eq!(c.set(0), 1, "clamp to floor 1");
     }
+
+    // ---- pool-saturation invariants (TSU-150): the worker concurrency limiter must bound
+    // in-flight work to the cap AND make progress under saturation (no deadlock/starvation). ----
+
+    #[tokio::test]
+    async fn saturation_bounds_inflight_and_serves_everyone() {
+        use std::sync::atomic::AtomicUsize;
+        // Far more tasks than slots → the limiter is saturated for most of the run.
+        let cap = 3usize;
+        let tasks = 50usize;
+        let c = Concurrency::new(cap, cap);
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let done = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..tasks {
+            let (c, inflight, max_seen, done) =
+                (c.clone(), inflight.clone(), max_seen.clone(), done.clone());
+            handles.push(tokio::spawn(async move {
+                let _permit = c.acquire().await.expect("acquire");
+                let now = inflight.fetch_add(1, Ordering::SeqCst) + 1;
+                max_seen.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(2)).await; // hold the slot briefly
+                inflight.fetch_sub(1, Ordering::SeqCst);
+                done.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        // No over-subscription: never more than `cap` permits held at once.
+        assert!(max_seen.load(Ordering::SeqCst) <= cap, "in-flight never exceeds the cap");
+        assert!(max_seen.load(Ordering::SeqCst) >= 1, "the limiter actually ran work");
+        // No deadlock / starvation: every task eventually got a slot and finished.
+        assert_eq!(done.load(Ordering::SeqCst), tasks, "all queued work completes under saturation");
+    }
+
+    #[tokio::test]
+    async fn acquire_pends_when_saturated_then_proceeds_on_release() {
+        use std::sync::atomic::AtomicBool;
+        let c = Concurrency::new(1, 1);
+        let held = c.acquire().await.unwrap(); // saturate the single slot
+        let proceeded = Arc::new(AtomicBool::new(false));
+        let waiter = {
+            let (c, proceeded) = (c.clone(), proceeded.clone());
+            tokio::spawn(async move {
+                let _p = c.acquire().await.unwrap();
+                proceeded.store(true, Ordering::SeqCst);
+            })
+        };
+        // While saturated, the waiter must NOT acquire.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!proceeded.load(Ordering::SeqCst), "a waiter blocks while the limiter is full");
+        // Releasing the permit lets the waiter through (liveness).
+        drop(held);
+        waiter.await.unwrap();
+        assert!(proceeded.load(Ordering::SeqCst), "the waiter proceeds once a slot frees");
+    }
 }
