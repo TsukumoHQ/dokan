@@ -176,20 +176,49 @@ pub struct VerifyReport {
     pub hermetic: bool,
     /// DSSE keyid the receipt was signed under.
     pub keyid: String,
+    /// A trust anchor is configured (DOKAN_TRUSTED_RECEIPT_KEYS set) — authenticity is enforced.
+    pub trust_enforced: bool,
+    /// The receipt's embedded public key is in the trusted set. Meaningful only when
+    /// `trust_enforced`; without a trust anchor the embedded key is taken on faith
+    /// (tamper-EVIDENT, not authenticated). (TSU — Ed25519 trust-anchor + rotation)
+    pub pinned: bool,
 }
 
 impl VerifyReport {
-    /// A receipt is publicly sound iff its Ed25519 signature verifies AND the signed statement
-    /// is bound to the receipt's claimed output.
+    /// A receipt is sound iff its Ed25519 signature verifies AND the signed statement is bound to
+    /// the receipt's claimed output AND — when a trust anchor is configured — the signing key is
+    /// trusted. Without a trust anchor (no DOKAN_TRUSTED_RECEIPT_KEYS) it stays tamper-evident:
+    /// valid+bound passes, since there's no authenticity policy to enforce (back-compat).
     pub fn ok(&self) -> bool {
-        self.ed25519_valid && self.binding_consistent
+        self.ed25519_valid && self.binding_consistent && (!self.trust_enforced || self.pinned)
     }
+}
+
+/// The configured trust anchor: base64 Ed25519 public keys allowed to sign receipts, from
+/// `DOKAN_TRUSTED_RECEIPT_KEYS` (comma-separated). None when unset/empty → no authenticity
+/// policy (verify stays tamper-evident). Rotation = list the current PLUS retired-but-trusted
+/// public keys here; the receipt's keyid identifies which signed it. (TSU)
+pub fn trusted_receipt_keys() -> Option<std::collections::HashSet<String>> {
+    let raw = std::env::var("DOKAN_TRUSTED_RECEIPT_KEYS").ok()?;
+    let set: std::collections::HashSet<String> =
+        raw.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    if set.is_empty() { None } else { Some(set) }
 }
 
 /// Verify a receipt with NO key material — the third-party path. Checks the DSSE/Ed25519
 /// signature against the receipt's embedded public key, then that the signed statement attests
 /// the same output the receipt claims at top level. Never panics on a malformed receipt.
 pub fn verify_receipt(receipt: &serde_json::Value) -> VerifyReport {
+    verify_receipt_with(receipt, trusted_receipt_keys().as_ref())
+}
+
+/// Core of `verify_receipt` with the trust anchor passed explicitly (so it's unit-testable
+/// without touching the process env). `trusted` = the allowed signing public keys, or None for
+/// no authenticity policy (tamper-evident only).
+pub fn verify_receipt_with(
+    receipt: &serde_json::Value,
+    trusted: Option<&std::collections::HashSet<String>>,
+) -> VerifyReport {
     use base64::Engine;
     let dsse = receipt.get("dsse");
     let public_b64 = receipt
@@ -241,7 +270,12 @@ pub fn verify_receipt(receipt: &serde_json::Value) -> VerifyReport {
     };
     let hermetic = receipt.get("hermetic").and_then(|v| v.as_bool()).unwrap_or(false);
 
-    VerifyReport { ed25519_valid, binding_consistent, hermetic, keyid }
+    // Trust-anchor pinning: when a trust set is configured, the embedded signing key must be one
+    // we trust (authenticity). None → no policy, pinned=false but ok() ignores it.
+    let trust_enforced = trusted.is_some();
+    let pinned = trusted.map(|set| !public_b64.is_empty() && set.contains(public_b64)).unwrap_or(false);
+
+    VerifyReport { ed25519_valid, binding_consistent, hermetic, keyid, trust_enforced, pinned }
 }
 
 /// Offline verification verdict — the human-facing outcome of `dokan verify`. Distinct from a
@@ -253,6 +287,10 @@ pub enum Verdict {
     Verified,
     /// A signature is present but does not verify, or attests a different output → altered.
     Tampered,
+    /// The signature is VALID and output-bound, but the signing key is NOT in the configured
+    /// trust anchor (DOKAN_TRUSTED_RECEIPT_KEYS) — authentic-looking but not from a key we trust
+    /// (a forger can self-sign). Fail-closed. Only possible when a trust anchor is set. (TSU)
+    Untrusted,
     /// No Ed25519/DSSE signature material to check offline (e.g. an HMAC-only/legacy receipt).
     /// Not a failure — just unprovable by the key-free path; use `reproduce` or a HMAC-key check.
     Inconclusive,
@@ -263,15 +301,17 @@ impl Verdict {
         match self {
             Verdict::Verified => "VERIFIED",
             Verdict::Tampered => "TAMPERED",
+            Verdict::Untrusted => "UNTRUSTED",
             Verdict::Inconclusive => "INCONCLUSIVE",
         }
     }
-    /// Process exit code for the CLI: 0 verified, 1 tampered, 2 inconclusive.
+    /// Process exit code for the CLI: 0 verified, 1 tampered, 2 inconclusive, 3 untrusted-key.
     pub fn exit_code(self) -> i32 {
         match self {
             Verdict::Verified => 0,
             Verdict::Tampered => 1,
             Verdict::Inconclusive => 2,
+            Verdict::Untrusted => 3,
         }
     }
 }
@@ -295,11 +335,23 @@ pub fn has_ed25519_signature(receipt: &serde_json::Value) -> bool {
 /// Classify a receipt offline (no key material): no signature → INCONCLUSIVE; signature valid
 /// and output-bound → VERIFIED; otherwise → TAMPERED. Returns the report too for detail output.
 pub fn classify(receipt: &serde_json::Value) -> (Verdict, VerifyReport) {
-    let rep = verify_receipt(receipt);
+    classify_with(receipt, trusted_receipt_keys().as_ref())
+}
+
+/// Core of `classify` with the trust anchor passed explicitly (unit-testable without env).
+pub fn classify_with(
+    receipt: &serde_json::Value,
+    trusted: Option<&std::collections::HashSet<String>>,
+) -> (Verdict, VerifyReport) {
+    let rep = verify_receipt_with(receipt, trusted);
     let verdict = if !has_ed25519_signature(receipt) {
         Verdict::Inconclusive
     } else if rep.ok() {
         Verdict::Verified
+    } else if rep.ed25519_valid && rep.binding_consistent && rep.trust_enforced && !rep.pinned {
+        // Valid + output-bound, but the signer isn't in the trust anchor → authentic-looking
+        // but not trusted (distinct from an altered receipt).
+        Verdict::Untrusted
     } else {
         Verdict::Tampered
     };
@@ -471,5 +523,53 @@ mod tests {
         assert_eq!(v, Verdict::Inconclusive, "no ed25519 material → inconclusive");
         assert_eq!(v.exit_code(), 2);
         assert!(!has_ed25519_signature(&r));
+    }
+
+    // ---- Trust anchor + rotation (env-free via *_with so parallel tests don't race on env) ----
+
+    fn keyset(keys: &[&str]) -> std::collections::HashSet<String> {
+        keys.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn trust_anchor_unset_stays_tamper_evident() {
+        let r = signed_receipt("abc123");
+        let (v, rep) = classify_with(&r, None);
+        assert_eq!(v, Verdict::Verified, "no trust anchor → valid+bound passes (tamper-evident)");
+        assert!(!rep.trust_enforced, "no policy enforced");
+        assert!(!rep.pinned);
+    }
+
+    #[test]
+    fn trust_anchor_pins_the_trusted_signer() {
+        let r = signed_receipt("abc123");
+        let pubkey = dev_signer().ed_public_b64();
+        let (v, rep) = classify_with(&r, Some(&keyset(&[&pubkey])));
+        assert_eq!(v, Verdict::Verified, "signer in the trust anchor → verified");
+        assert!(rep.trust_enforced && rep.pinned);
+        assert_eq!(v.exit_code(), 0);
+    }
+
+    #[test]
+    fn trust_anchor_rejects_untrusted_signer() {
+        // Valid signature + output-bound, but the signing key is NOT in the trust anchor:
+        // authentic-looking but not ours → UNTRUSTED (fail-closed), distinct from TAMPERED.
+        let r = signed_receipt("abc123");
+        let (v, rep) = classify_with(&r, Some(&keyset(&["some-other-pubkey-b64"])));
+        assert_eq!(v, Verdict::Untrusted, "valid sig, untrusted key → untrusted");
+        assert!(rep.trust_enforced && !rep.pinned);
+        assert!(rep.ed25519_valid && rep.binding_consistent, "the sig itself is valid");
+        assert_eq!(v.exit_code(), 3);
+        assert!(!rep.ok(), "fail-closed: not sound under an enforced anchor");
+    }
+
+    #[test]
+    fn trust_anchor_rotation_keeps_old_keys_verifying() {
+        // Rotation = list the current PLUS retired public keys. A receipt signed by the (now
+        // retired) key still verifies because its pubkey is still trusted + carried in-receipt.
+        let r = signed_receipt("abc123");
+        let retired = dev_signer().ed_public_b64();
+        let (v, _) = classify_with(&r, Some(&keyset(&["new-primary-pubkey", &retired])));
+        assert_eq!(v, Verdict::Verified, "retired-but-trusted signer still verifies post-rotation");
     }
 }

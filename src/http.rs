@@ -1338,6 +1338,8 @@ async fn verify_run(State(s): State<AppState>, Path(id): Path<i64>) -> impl Into
                     "hermetic": rep.hermetic,
                     "deterministic": r.get("deterministic").and_then(|v| v.as_bool()).unwrap_or(false),
                     "keyid": rep.keyid,
+                    "trust_enforced": rep.trust_enforced,
+                    "pinned": rep.pinned,
                 })),
             )
         }

@@ -1335,7 +1335,7 @@ impl Dokan {
         ok(json!({"run_id": a.run_id, "status": if canceled { "canceled" } else { "already_succeeded" }}))
     }
 
-    #[tool(description = "Verify a run's receipt WITHOUT re-executing — offline, instant. Checks the Ed25519/DSSE signature against the receipt's embedded public key (third-party-verifiable, NO shared secret needed), the HMAC binding with the daemon key (key-holder check), and that the signed in-toto Statement attests THIS run's output. Returns {ok, ed25519_valid, hmac_valid, binding_consistent, hermetic, deterministic, keyid}. hermetic=true means the run was network-disabled (its output is a pure function of inputs). For verify-by-RE-EXECUTION (re-run + byte-compare), use the reproduce primitive.")]
+    #[tool(description = "Verify a run's receipt WITHOUT re-executing — offline, instant. Checks the Ed25519/DSSE signature against the receipt's embedded public key (third-party-verifiable, NO shared secret needed), the HMAC binding with the daemon key (key-holder check), and that the signed in-toto Statement attests THIS run's output. Returns {ok, ed25519_valid, hmac_valid, binding_consistent, hermetic, deterministic, keyid, trust_enforced, pinned}. hermetic=true means the run was network-disabled (its output is a pure function of inputs). AUTHENTICITY: set DOKAN_TRUSTED_RECEIPT_KEYS (comma-separated trusted signing pubkeys) → trust_enforced=true and ok() requires the signer be pinned (in the set); unset → tamper-evident only (the embedded key is taken on faith). For verify-by-RE-EXECUTION (re-run + byte-compare), use the reproduce primitive.")]
     async fn verify(&self, Parameters(a): Parameters<VerifyArgs>) -> Result<CallToolResult, McpError> {
         let Some(receipt) = self.db.run_receipt(a.run_id).await.map_err(internal)? else {
             return err_ctx("no_receipt", "this run has no receipt yet", Some("receipts attach once a run reaches a terminal state"), json!({"run_id": a.run_id}));
@@ -1351,6 +1351,8 @@ impl Dokan {
             "hermetic": rep.hermetic,
             "deterministic": receipt.get("deterministic").and_then(|v| v.as_bool()).unwrap_or(false),
             "keyid": rep.keyid,
+            "trust_enforced": rep.trust_enforced,
+            "pinned": rep.pinned,
         }))
     }
 }
