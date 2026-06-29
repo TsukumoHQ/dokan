@@ -13,3 +13,6 @@ secrets*
 # local-only Claude config (personal hooks with machine paths)
 .claude/settings.local.json
 .claude/hooks/path-guard.sh
+
+# release-gate build input (the just-built binary, copied in by CI)
+dokan-gate-bin

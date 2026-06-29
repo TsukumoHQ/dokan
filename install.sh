@@ -67,23 +67,30 @@ if [ -z "$TAG" ]; then
 fi
 BASE="https://github.com/$REPO/releases/download/$TAG"
 
-# --- 3. download + verify the binary -----------------------------------------
+# --- 3. obtain the binary -----------------------------------------------------
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/dokan-install.XXXXXX")" || die "could not create a temp dir."
 trap 'rm -rf "$tmp"' EXIT INT TERM
-info "Downloading dokan $TAG ($ASSET)…"
-curl -fsSL "$BASE/$ASSET" -o "$tmp/dokan" \
-  || die "download failed for $BASE/$ASSET. Check the tag exists for your platform, or set DOKAN_VERSION."
-if curl -fsSL "$BASE/SHA256SUMS" -o "$tmp/SHA256SUMS" 2>/dev/null; then
-  want="$(grep " ${ASSET}\$" "$tmp/SHA256SUMS" 2>/dev/null | awk '{print $1}' | head -n1)"
-  if [ -n "$want" ]; then
-    got="$($SHA "$tmp/dokan" | awk '{print $1}')"
-    [ "$want" = "$got" ] || die "checksum mismatch for $ASSET (expected $want, got $got). Aborting — not installing an unverified binary."
-    info "Checksum verified."
-  else
-    warn "no checksum line for $ASSET in SHA256SUMS — skipping verification."
-  fi
+# DOKAN_BINARY=<path> uses a local binary as-is (skip download + checksum). The release-gate CI
+# uses this to install the JUST-BUILT binary before it is published; normal users never set it.
+if [ -n "${DOKAN_BINARY:-}" ]; then
+  info "Using provided binary $DOKAN_BINARY (DOKAN_BINARY set — skipping download + checksum)."
+  cp "$DOKAN_BINARY" "$tmp/dokan" || die "cannot read DOKAN_BINARY=$DOKAN_BINARY"
 else
-  warn "SHA256SUMS not published for $TAG — skipping checksum verification."
+  info "Downloading dokan $TAG ($ASSET)…"
+  curl -fsSL "$BASE/$ASSET" -o "$tmp/dokan" \
+    || die "download failed for $BASE/$ASSET. Check the tag exists for your platform, or set DOKAN_VERSION."
+  if curl -fsSL "$BASE/SHA256SUMS" -o "$tmp/SHA256SUMS" 2>/dev/null; then
+    want="$(grep " ${ASSET}\$" "$tmp/SHA256SUMS" 2>/dev/null | awk '{print $1}' | head -n1)"
+    if [ -n "$want" ]; then
+      got="$($SHA "$tmp/dokan" | awk '{print $1}')"
+      [ "$want" = "$got" ] || die "checksum mismatch for $ASSET (expected $want, got $got). Aborting — not installing an unverified binary."
+      info "Checksum verified."
+    else
+      warn "no checksum line for $ASSET in SHA256SUMS — skipping verification."
+    fi
+  else
+    warn "SHA256SUMS not published for $TAG — skipping checksum verification."
+  fi
 fi
 
 # --- 4. install the binary ----------------------------------------------------

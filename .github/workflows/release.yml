@@ -52,8 +52,27 @@ jobs:
           path: dokan-${{ matrix.target }}
           if-no-files-found: error
 
-  release:
+  # Install gate (TSU-224): install the JUST-BUILT linux binary on a LEAN base with no libssl and
+  # assert it runs + the skill lands. A red gate BLOCKS the release (the publish job needs it), so
+  # a binary that "builds but won't run on a clean box" never ships.
+  gate:
     needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download the x86_64 linux binary
+        uses: actions/download-artifact@v4
+        with:
+          name: dokan-x86_64-unknown-linux-gnu
+          path: gate
+      - name: Install-gate on a lean image (portability proof)
+        run: |
+          cp gate/dokan-x86_64-unknown-linux-gnu dokan-gate-bin
+          docker build -f install-smoke/dokan-release-gate.Dockerfile \
+            --build-arg TAG="${GITHUB_REF_NAME}" -t dokan-release-gate .
+
+  release:
+    needs: [build, gate]
     runs-on: ubuntu-latest
     permissions:
       contents: write
