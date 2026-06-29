@@ -1,0 +1,4 @@
+# Shell scripts + Dockerfiles must stay LF, or a CRLF checkout breaks the shebang
+# (`#!/bin/sh\r`) and `curl | sh`. Forces LF regardless of core.autocrlf.
+*.sh        text eol=lf
+*.Dockerfile text eol=lf
