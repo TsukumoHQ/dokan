@@ -35,13 +35,28 @@ flowchart LR
 A single Rust daemon (axum + an rmcp MCP server, stdio or Streamable HTTP). State lives in Postgres. Execution is one job → one fresh container (`python:3.12-slim` / `node:22-slim` / `alpine`), discarded after the run, with per-job caps and a hard timeout. Logs stream into Postgres, served cursor-paginated. A thin operator cockpit runs at `/`, Prometheus at `/metrics`. **No LLM runs inside dokan** — the agent is the only place tokens are spent.
 
 ## Quickstart
-Prereqs: a Rust toolchain and Docker running. The daemon talks to the default Docker socket — set `DOCKER_HOST` if you run colima / podman / a remote engine. Its default `DATABASE_URL` already points at the compose database, so there's nothing to configure.
+**Prereq:** Docker running (Docker Desktop, or colima / podman). The daemon talks to the default Docker socket — set `DOCKER_HOST` for colima/podman. No Rust toolchain needed.
+
+One command stands up the runtime and installs the Claude Code operator skill:
+```sh
+curl -fsSL https://raw.githubusercontent.com/TsukumoHQ/dokan/main/install.sh | sh
+```
+It downloads and SHA-256-verifies the binary into `~/.local/bin`, lands the operator skill in `~/.claude/skills/dokan/` (where Claude Code loads it), generates per-install crypto keys (secure-by-default — secrets sealed at rest, receipts signed; saved `0600` in `~/.dokan/dokan.env`), starts Postgres on `:5499`, and brings up the daemon on `127.0.0.1:8088`. **Re-running is safe** (idempotent). Then wire your agent:
+```sh
+claude mcp add --transport http dokan http://127.0.0.1:8088/mcp
+```
+Verify it's up: open <http://127.0.0.1:8088/> (the operator cockpit) — once it loads, an agent can wire MCP and run scripts. Schema migrations apply automatically on boot.
+
+<details><summary><b>Build from source instead</b> (contributors / unsupported platforms)</summary>
+
+Needs a Rust toolchain. The default `DATABASE_URL` already points at the compose database, so there's nothing to configure.
 ```sh
 docker compose up -d            # Postgres state store (pgvector) on :5499
 cargo build --release
 ./target/release/dokan          # HTTP daemon on 127.0.0.1:8088 — UI at /, MCP at /mcp
 ```
-Schema migrations apply automatically on boot. Verify it's up: open <http://127.0.0.1:8088/> (the operator cockpit) — once it loads, an agent can wire MCP and run scripts.
+You'll need crypto keys set (`DOKAN_SECRET_KEY`, `DOKAN_RECEIPT_KEY`, `DOKAN_RECEIPT_ED25519_SECRET`) or `DOKAN_DEV_INSECURE=1` for local dev — the daemon fails closed otherwise.
+</details>
 
 ## Run your first job
 With the daemon up, run the flagship demo — it drives a real DAG over MCP exactly the way an agent does (uploads 4 deterministic steps, wires a flow with `map` fan-out + a `when` branch, runs it, prints the result). No secrets, no job network, fully reproducible. Needs `curl` + `jq`:
