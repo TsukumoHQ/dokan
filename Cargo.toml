@@ -44,7 +44,14 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 tokio-cron-scheduler = "0.15"
 uuid = "1"
-fastembed = "5"
+# rustls everywhere (not native-tls) so the release binary carries NO dynamic libssl.so.3 dep —
+# fastembed's default pulls hf-hub + ort on native-tls/openssl, which makes `dokan` fail to run on
+# lean images that lack libssl (node/debian-slim). TSU-224 portability fix.
+fastembed = { version = "5", default-features = false, features = [
+    "ort-download-binaries-rustls-tls",
+    "hf-hub-rustls-tls",
+    "image-models",
+] }
 pgvector = { version = "0.4", features = ["sqlx"] }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.17", default-features = false }
