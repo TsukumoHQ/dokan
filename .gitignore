@@ -16,3 +16,5 @@ secrets*
 
 # release-gate build input (the just-built binary, copied in by CI)
 dokan-gate-bin
+
+install-smoke/__pycache__/
