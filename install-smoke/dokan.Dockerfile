@@ -19,16 +19,14 @@ RUN apt-get update \
 
 # Run ONLY the documented install command — nothing pre-installed beyond curl + CA certs.
 COPY install.sh /opt/dokan/install.sh
+COPY install-smoke/assert.sh /assert.sh
 RUN DOKAN_SKIP_RUNTIME=1 sh /opt/dokan/install.sh
 
-# Assert contract (shared with TSU-224): exits 0, CLI on PATH + --version, skill landed where
-# Claude Code resolves it, and a second run is idempotent (no error / no clobber).
+# Idempotency: a second run must not error or clobber.
+RUN DOKAN_SKIP_RUNTIME=1 sh /opt/dokan/install.sh
+
+# Shared assert contract (TSU-224). dokan's operator install lands the skill only — it ships no
+# Claude Code hooks to users — so HOOKS_* are unset (n/a).
 ENV PATH="/root/.local/bin:${PATH}"
-RUN set -eux; \
-    command -v dokan; \
-    dokan --version; \
-    test -f /root/.claude/skills/dokan/SKILL.md; \
-    grep -q 'name: dokan' /root/.claude/skills/dokan/SKILL.md; \
-    DOKAN_SKIP_RUNTIME=1 sh /opt/dokan/install.sh; \
-    dokan --version; \
-    echo "INSTALL-SMOKE OK"
+RUN TOOL=dokan TOOL_BIN=dokan SKILL_FILE=/root/.claude/skills/dokan/SKILL.md sh /assert.sh \
+ && echo "INSTALL-SMOKE OK"
