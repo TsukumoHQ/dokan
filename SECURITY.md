@@ -52,10 +52,10 @@ that and are **not** vulnerabilities:
 ## What dokan does defend
 
 - **Containment.** Each job runs in a fresh container with **no host filesystem
-  and no host services**, discarded after the run. Outbound network is **on by
-  default** (most monitors need it); set `network=false` per job for a hermetic,
-  no-outbound-network run (the container is then fully network-isolated and its
-  output is a deterministic function of its inputs).
+  and no host services**, discarded after the run. Outbound network is **disabled
+  by default** (hermetic-by-default, v0.4.0): a job is fully network-isolated and
+  its output is a deterministic function of its inputs unless it opts in with
+  `network=true` (most monitors need it).
 - **Resource caps.** Per-job CPU and memory limits (cgroup) and a hard
   timeout — a runaway or OOM job is killed, not allowed to starve the host.
 - **Write-only secrets.** Secret values are never returned by any MCP tool,

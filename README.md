@@ -15,7 +15,7 @@ Think *Sidekiq/cron for AI agents*: the agent scripts the mechanical 80%, dokan 
 ## Why dokan
 - **Agent-operated.** your agent uploads, wires, triggers, reads logs over MCP. No UI.
 - **Zero LLM inside = zero token burn.** deterministic code, not LLM-in-the-loop. The platform never spends tokens to run your workflows.
-- **Deterministic when hermetic.** one job = one clean container, per-job CPU/mem caps, timeouts, retries. Network is **on by default** (most monitors hit an API); set `network=false` for a hermetic run whose output is a pure function of its inputs — those identical inputs hit a content-addressed cache instead of recomputing. Every run carries a tamper-evident receipt (advisory for networked runs, since their output can depend on the outside world).
+- **Hermetic by default.** one job = one clean container, per-job CPU/mem caps, timeouts, retries. Jobs run with **network disabled by default** (v0.4.0) — output is a pure function of its inputs, so identical inputs hit a content-addressed cache instead of recomputing, and the run is provable by re-execution. Set `network=true` for a job that must reach an API (most monitors do). Every run carries a tamper-evident receipt (advisory for networked runs, since their output can depend on the outside world).
 - **Real triggers.** cron + inbound webhooks (POST /hook/<token>, Stripe/Calendly/GitHub-ready).
 - **Token-frugal.** every MCP response is shaped for an agent's context budget — IDs over payloads, paginated logs, counts over dumps.
 
@@ -25,7 +25,7 @@ Think *Sidekiq/cron for AI agents*: the agent scripts the mechanical 80%, dokan 
 flowchart LR
   agent["your coding agent"] -- MCP --> dokan["dokan daemon<br/>(Rust · axum + rmcp)"]
   dokan -- state --> pg[("Postgres")]
-  dokan -- one job, one container --> c1["job container<br/>(isolated; network on by default, off = hermetic)"]
+  dokan -- one job, one container --> c1["job container<br/>(isolated; hermetic by default, network=true to opt in)"]
   c1 -- "stdout · ::dokan:result::" --> dokan
   dokan -- "result POST" --> relay["your agent / relay"]
   human["operator (optional)"] -. watch .-> cockpit["cockpit /"]
