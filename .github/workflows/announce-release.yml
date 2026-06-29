@@ -40,15 +40,19 @@ jobs:
 
           # --- publish-gate: WAIT for a published, non-prerelease GitHub Release ---
           # tag-push fires this workflow BEFORE the Release object exists (race) — poll for it.
+          # The release workflow builds 4 triples + the install-gate before publishing (~5-7 min),
+          # so the budget MUST exceed that: 60 × 12s = 12 min. (Was 120s → expired mid-build → the
+          # announce silently skipped every real release.) A bare tag / draft / prerelease /
+          # cancelled cut never satisfies the gate and skips after the full budget — rare + harmless.
           rel=""
-          for i in $(seq 1 10); do
+          for i in $(seq 1 60); do
             rel=$(gh api "repos/${REPO}/releases/tags/${TAG}" 2>/dev/null || true)
             if [ -n "$rel" ] \
                && [ "$(printf '%s' "$rel" | jq -r '.draft')" = "false" ] \
                && [ "$(printf '%s' "$rel" | jq -r '.prerelease')" != "true" ]; then
               break
             fi
-            echo "Release for ${TAG} not published yet (attempt $i/10) — waiting 12s..." >&2
+            echo "Release for ${TAG} not published yet (attempt $i/60) — waiting 12s..." >&2
             rel=""; sleep 12
           done
           if [ -z "$rel" ]; then
