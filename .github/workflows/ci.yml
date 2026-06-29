@@ -79,3 +79,9 @@ jobs:
       # mismatch (e.g. the kind that crashed a daemon) fails here, before merge.
       - name: Test
         run: cargo test --locked -- --test-threads=1
+
+      # The `embed` feature (semantic search) is OFF in release binaries, so the default run above
+      # skips its proof. Exercise it here so semantic search keeps coverage. Builds fastembed/ort,
+      # which has an x86_64-linux prebuilt (the missing one is x86_64-darwin — why it's opt-in).
+      - name: Test (embed feature)
+        run: cargo test --locked --features embed --test p3_semantic -- --test-threads=1

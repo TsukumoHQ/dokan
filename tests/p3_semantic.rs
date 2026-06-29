@@ -1,3 +1,7 @@
+// Semantic search is behind the optional `embed` feature (release binaries omit it); without it the
+// spawned dokan has no embedder, so this proof only compiles + runs under `--features embed`.
+#![cfg(feature = "embed")]
+
 //! P3 proof: semantic search_script via local fastembed + pgvector. A query with no
 //! lexical overlap with the target description still ranks it first — substring match
 //! cannot do this. Requires --embed (loads the BGE model from .fastembed_cache).

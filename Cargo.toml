@@ -10,6 +10,14 @@ readme = "README.md"
 keywords = ["mcp", "automation", "docker", "agent", "workflow"]
 categories = ["command-line-utilities", "development-tools"]
 
+[features]
+default = []
+# Local semantic search (fastembed → ONNX). OFF in release binaries: it pulls a heavy onnxruntime
+# (`ort`) native dep that bloats the binary and has no x86_64-apple-darwin prebuilt (breaks the
+# Intel-mac build, native AND cross). Prod never runs `--embed`; build `--features embed` to enable
+# it (search falls back to substring/pg_trgm otherwise). TSU-224.
+embed = ["dep:fastembed"]
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"
@@ -47,7 +55,7 @@ uuid = "1"
 # rustls everywhere (not native-tls) so the release binary carries NO dynamic libssl.so.3 dep —
 # fastembed's default pulls hf-hub + ort on native-tls/openssl, which makes `dokan` fail to run on
 # lean images that lack libssl (node/debian-slim). TSU-224 portability fix.
-fastembed = { version = "5", default-features = false, features = [
+fastembed = { version = "5", optional = true, default-features = false, features = [
     "ort-download-binaries-rustls-tls",
     "hf-hub-rustls-tls",
     "image-models",

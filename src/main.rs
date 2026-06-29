@@ -256,7 +256,9 @@ async fn main() -> Result<()> {
         "docker connected, warm pool armed"
     );
 
-    // Optional local embeddings for semantic search.
+    // Optional local embeddings for semantic search — behind the `embed` cargo feature, which
+    // release binaries omit (heavy ort/onnxruntime dep). Without it, search uses substring/pg_trgm.
+    #[cfg(feature = "embed")]
     let embedder = if cli.embed {
         match embed::Embedder::try_load(&cli.embed_cache) {
             Ok(e) => {
@@ -269,6 +271,17 @@ async fn main() -> Result<()> {
             }
         }
     } else {
+        None
+    };
+    #[cfg(not(feature = "embed"))]
+    let embedder: Option<embed::Embedder> = {
+        if cli.embed {
+            tracing::warn!(
+                "--embed requested but this binary was built without the `embed` feature; \
+                 using substring search. Rebuild with `--features embed` for semantic search."
+            );
+        }
+        let _ = &cli.embed_cache;
         None
     };
 
