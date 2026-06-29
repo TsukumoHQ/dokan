@@ -166,7 +166,13 @@ impl WarmPool {
             security_opt: Some(vec!["no-new-privileges".to_string()]),
             // Read-only root filesystem (TSU-118): untrusted code cannot mutate the image. Only
             // writable surfaces are two tmpfs + the opt-in /output bind:
-            //   - /tmp (mode 1777): the bootstrap drops the script; the non-root job uid writes here.
+            //   - /tmp (mode 1777, EXEC): the bootstrap drops the script; the non-root job uid writes
+            //     here. `exec` is REQUIRED — Docker mounts a tmpfs noexec by default, which blocks
+            //     PROT_EXEC mmap of native addons installed at runtime (npm `.node`, pip native
+            //     wheels). Without it, `require('@resvg/resvg-js')` etc. fail with "failed to map
+            //     segment from shared object" (TSU-226 regression from the v0.4.0 RO-rootfs flip).
+            //     We keep nosuid+nodev (those bound real escalation); exec only lets a script run a
+            //     binary it could already produce via its interpreter, so the containment delta is nil.
             //   - /run/secrets (mode 0700, noexec, GAP-2): per-container in-memory secret files,
             //     writable under the RO rootfs, never persisted in the warm image layer. OWNED by
             //     the non-root job uid (uid/gid=65534, matching exec.rs RUN_USER) so the job can
@@ -175,7 +181,7 @@ impl WarmPool {
             // tmpfs size counts against the container mem cgroup, so the mem cap already bounds it.
             readonly_rootfs: Some(true),
             tmpfs: Some(HashMap::from([
-                ("/tmp".to_string(), "rw,nosuid,nodev".to_string()),
+                ("/tmp".to_string(), "rw,nosuid,nodev,exec".to_string()),
                 (
                     "/run/secrets".to_string(),
                     "rw,nosuid,nodev,noexec,mode=0700,uid=65534,gid=65534".to_string(),
