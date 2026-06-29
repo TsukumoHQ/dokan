@@ -17,11 +17,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # All 4 supported triples (src/update.rs::asset_name_for) — each on a NATIVE runner so no
+        # cross toolchain is needed. Missing the Intel-mac / arm-Linux assets left those users with
+        # no working install (install.sh dies "unsupported"); TSU-224.
         include:
-          - os: macos-14
+          - os: macos-14            # Apple Silicon
             target: aarch64-apple-darwin
-          - os: ubuntu-latest
+          - os: macos-13            # Intel mac
+            target: x86_64-apple-darwin
+          - os: ubuntu-latest       # x86_64 Linux
             target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm    # arm64 Linux (GitHub-hosted arm runner)
+            target: aarch64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@v4
 
