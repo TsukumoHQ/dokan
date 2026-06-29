@@ -1,0 +1,27 @@
+name: install-smoke
+
+# Clean-room proof that the documented one-command install works on a bare image:
+# binary + operator skill land, CLI runs, re-run is idempotent (TSU-222 / TSU-224).
+# The Dockerfile self-asserts via install-smoke/assert.sh — a successful build == green.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]            # every release tag — a red install should block shipping
+  pull_request:
+    paths:
+      - install.sh
+      - install-smoke/**
+      - .github/workflows/install-smoke.yml
+  workflow_dispatch:
+
+concurrency:
+  group: install-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dokan:
+    runs-on: ubuntu-latest      # native amd64 → matches the dokan-x86_64-unknown-linux-gnu asset
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build dokan clean room (self-asserting)
+        run: docker build -f install-smoke/dokan.Dockerfile -t dokan-install-smoke .
