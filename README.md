@@ -143,4 +143,4 @@ Server instructions ship in-band so the agent self-limits.
 Apache-2.0. Use it, embed it, build on it.
 
 ---
-*Part of the [tsukumo](https://tsukumo.ch) suite: open tools for running AI agents well at scale.*
+*dokan is one of four open tools from the [Tsukumo](https://tsukumo.ch) studio for running AI agents well at scale: [trovex](https://trovex.dev) (canonical context) · [yoru](https://yoru.sh) (session record + replay) · **dokan** (job runtime) · [wrai.th](https://wrai.th) (agent relay).*
