@@ -40,7 +40,7 @@ echo "::dokan:result:: {\"alert\":false}"
 
 ## Secrets (API keys for jobs)
 
-`set_secret(name, value)` once → injected as an env var into **every** job container (e.g. `$OPENAI_API_KEY`). **Write-only**: values are never returned or logged. `list_secrets()` shows names only. Read them in-script as normal env (`os.environ["OPENAI_API_KEY"]`). Use for OPENAI/PERPLEXITY/GEMINI/SERPAPI, Metricool `MC_USER_ID`/`MC_USER_TOKEN`, etc. Note: secrets are **global** to all jobs — fine for a trusted single-tenant box.
+`set_secret(name, value)` once → available to a job as a **tmpfs file at `/run/secrets/<name>`** (mode 0400) and, for back-compat, as an env var (e.g. `$OPENAI_API_KEY`). **Write-only**: values are never returned or logged. `list_secrets()` shows names only. Read them in-script via `/run/secrets/<name>` or normal env (`os.environ["OPENAI_API_KEY"]`). Use for OPENAI/PERPLEXITY/GEMINI/SERPAPI, Metricool `MC_USER_ID`/`MC_USER_TOKEN`, etc. By default a job gets all globals; scope it with a **per-script allowlist** — `upload_script(..., secrets=["openai_key"])` injects only those (defense-in-depth on a trusted single-tenant box).
 
 ## Host data (trovex store, etc.)
 

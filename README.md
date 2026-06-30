@@ -100,7 +100,7 @@ The engine gives you:
 - **`create_webhook`** — an external `POST /hook/<token>` enqueues a script or flow with the request body as input. The unguessable URL token is the auth (the endpoint sits outside the bearer gate).
 
 ### Secrets
-`set_secret(name, value)` once → injected as an env var into every job container (e.g. `$OPENAI_API_KEY`). **Write-only**: values are never returned or logged; `list_secrets` shows names only.
+`set_secret(name, value)` once → available to a job as a **tmpfs file at `/run/secrets/<name>`** (mode 0400, never persisted) and, for back-compat, as an env var (e.g. `$OPENAI_API_KEY`). **Write-only**: values are never returned or logged; `list_secrets` shows names only. By default a script gets all globals; scope it with a **per-script allowlist** — `upload_script(..., secrets=["openai_key"])` injects only those.
 
 ### Resource limits
 Per-job caps default to **1024 MiB / 2.0 CPU**, set globally on the daemon. A single heavier script can override them — `upload_script(..., mem_limit_mb, cpu_limit)` — and only that script runs on a dedicated container with the raised cap; everything else is untouched.
@@ -116,7 +116,7 @@ To hand a job a real document — a PDF, a dataset, a big `.md` — without stuf
 ### Determinism & receipts
 A `network=false` job is a **pure function of its inputs** — source + `DOKAN_INPUT` + input-file blobs + the pinned image digest. Two consequences:
 - **Content-addressed cache.** `run_script(..., cache=true)` recalls a prior identical success instead of recomputing — no container spawned.
-- **Tamper-evident receipt.** every run carries a receipt binding (image digest, source hash, input hash, output hash, input-blob hashes) under an HMAC keyed by `DOKAN_RECEIPT_KEY`. It detects tampering for anyone holding the key; it is *not* a public, third-party-verifiable signature (that would need an asymmetric scheme — on the roadmap). A networked job's receipt is advisory, since its output can depend on the outside world.
+- **Tamper-evident, publicly-verifiable receipt.** every run carries a receipt binding (image digest, source hash, input hash, output hash, input-blob hashes). It's HMAC-keyed for holders of `DOKAN_RECEIPT_KEY` **and Ed25519-signed inside an in-toto / DSSE envelope** — so a third party can `verify` it **offline with only the public key** (no shared secret), and `reproduce` re-executes the run and byte-compares the output against the receipt (`REPRODUCED` / `DIVERGED` / `TAMPERED`). A networked job's receipt is advisory, since its output can depend on the outside world.
 
 ## MCP surface (token-frugal)
 | Tool | Returns |
@@ -129,15 +129,15 @@ A `network=false` job is a **pure function of its inputs** — source + `DOKAN_I
 | compose_flow · run_flow · get_flow_run | declarative DAG; per-step status (map children collapsed to a count) |
 | create_webhook · list_webhooks · delete_webhook | inbound HTTP trigger to a script/flow |
 | upload_blob · download_blob · list_blobs | content-addressed input/output files |
-| get_receipt | a run's tamper-evident reproducibility receipt |
-| set_secret · list_secrets | write-only secrets, injected as job env |
+| get_receipt · verify · reproduce | fetch / offline-Ed25519-verify / re-execute + byte-compare a run's receipt |
+| set_secret · list_secrets | write-only secrets → `/run/secrets` tmpfs (+ env); per-script allowlist |
 | on_result · list_triggers · delete_trigger | reactive triggers: enqueue a script when a result matches |
 | cancel · list_runs · list_executors | … |
 
 Server instructions ship in-band so the agent self-limits.
 
 ## Status
-**v0.2.x — beta / preview.** Active development, built and run in production by the team that makes it (we run our own agent fleet's automation on dokan). **Ready for: demos, design partners, technical early adopters.** Not yet turnkey multi-tenant enterprise (no SSO/RBAC/HA, secrets are global to all jobs — see [SECURITY.md](SECURITY.md)). Honest about where it is.
+**v0.4.x — beta / preview.** Active development, built and run in production by the team that makes it (we run our own agent fleet's automation on dokan). **Ready for: demos, design partners, technical early adopters.** Not yet turnkey multi-tenant enterprise (no SSO/RBAC/HA; the MCP control plane is unauthenticated + single-tenant — see [SECURITY.md](SECURITY.md)). Honest about where it is.
 
 ## License
 Apache-2.0. Use it, embed it, build on it.
