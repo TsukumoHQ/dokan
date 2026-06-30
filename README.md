@@ -117,6 +117,7 @@ To hand a job a real document — a PDF, a dataset, a big `.md` — without stuf
 A `network=false` job is a **pure function of its inputs** — source + `DOKAN_INPUT` + input-file blobs + the pinned image digest. Two consequences:
 - **Content-addressed cache.** `run_script(..., cache=true)` recalls a prior identical success instead of recomputing — no container spawned.
 - **Tamper-evident, publicly-verifiable receipt.** every run carries a receipt binding (image digest, source hash, input hash, output hash, input-blob hashes). It's HMAC-keyed for holders of `DOKAN_RECEIPT_KEY` **and Ed25519-signed inside an in-toto / DSSE envelope** — so a third party can `verify` it **offline with only the public key** (no shared secret), and `reproduce` re-executes the run and byte-compares the output against the receipt (`REPRODUCED` / `DIVERGED` / `TAMPERED`). A networked job's receipt is advisory, since its output can depend on the outside world.
+  - *Honesty note:* the structured `::dokan:result::` output is compared by JSON value (object key order doesn't matter). **Output FILES are compared by raw bytes** — dokan does not yet canonicalize file-packaging metadata, so an artifact that differs only in non-content metadata (gzip mtime, tar entry order, embedded build timestamps) will `DIVERGE`. Emit reproducible archives (e.g. `gzip -n`, sorted `tar`, `SOURCE_DATE_EPOCH`) for a clean `REPRODUCED`. (Canonicalizing this safely is a tracked follow-up.)
 
 ## MCP surface (token-frugal)
 | Tool | Returns |
