@@ -537,20 +537,45 @@ impl Executor {
             },
             None => None,
         };
-        if let Some(ob) = &output_blobs {
-            let _ = db.set_run_output_blobs(run_id, ob).await;
+        // Persist the run's output set (blobs + structured result) BEFORE recording the receipt,
+        // and record the receipt ONLY if those writes succeeded. The receipt binds the output set
+        // under its HMAC/Ed25519 signature, so persisting a receipt while the run row failed to
+        // store the same outputs would let a verifier see outputs the run doesn't show — a
+        // provenance divergence a verifiability product must not have. Every write error is logged,
+        // never swallowed; a failed provenance write means the run finishes WITHOUT a receipt
+        // (verify → INCONCLUSIVE — honest "can't prove it", not a false claim).
+        let mut provenance_ok = true;
+        if let Some(ob) = &output_blobs
+            && let Err(e) = db.set_run_output_blobs(run_id, ob).await
+        {
+            tracing::error!(run_id, "failed to persist output_blobs: {e}");
+            provenance_ok = false;
+        }
+        if let Some(r) = &result
+            && let Err(e) = db.set_run_result(run_id, r).await
+        {
+            tracing::error!(run_id, "failed to persist run result: {e}");
+            provenance_ok = false;
         }
         // Tamper-evident reproducibility receipt: binds (image digest, source, input, secrets gen,
-        // input/output blobs) to (output, exit) under a keyed HMAC. Sound check for network=false
-        // runs; advisory for networked ones.
+        // input/output blobs) to (output, exit) under a keyed HMAC + Ed25519. Sound check for
+        // network=false runs; advisory for networked ones.
         let receipt = self
             .build_receipt(db, run_id, image, source, input, &result, exit_code, network, input_blobs, output_blobs.as_ref())
             .await;
-        let _ = db.set_run_receipt(run_id, &receipt).await;
+        if provenance_ok {
+            if let Err(e) = db.set_run_receipt(run_id, &receipt).await {
+                tracing::error!(run_id, "failed to persist receipt: {e}");
+            }
+        } else {
+            tracing::error!(
+                run_id,
+                "NOT recording a receipt — a provenance write (output_blobs/result) failed; refusing a receipt that would disagree with the run record"
+            );
+        }
+        // Reactive composition: fire agent-defined triggers whose predicate the result matches,
+        // enqueuing their target scripts. Independent of receipt persistence — the result matched.
         if let Some(r) = &result {
-            let _ = db.set_run_result(run_id, r).await;
-            // Reactive composition: fire agent-defined triggers whose predicate the result
-            // matches, enqueuing their target scripts. No external orchestrator.
             match db.fire_triggers(run_id, r).await {
                 Ok(fired) if !fired.is_empty() => {
                     metrics::counter!("dokan_triggers_fired_total").increment(fired.len() as u64);
