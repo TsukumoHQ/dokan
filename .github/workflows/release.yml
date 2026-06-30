@@ -94,12 +94,33 @@ jobs:
           echo "Published assets:"
           cat SHA256SUMS
 
+      # Sign SHA256SUMS with the Ed25519 release-signing key so the updater can verify provenance,
+      # not just integrity (TSU-252). No-op until DOKAN_RELEASE_SIGNING_KEY (an Ed25519 private-key
+      # PEM, `openssl genpkey -algorithm ed25519`) is configured as a repo secret. Output is base64
+      # of the raw 64-byte signature — exactly what src/update.rs::ed25519_verify_detached expects.
+      - name: Sign SHA256SUMS (Ed25519)
+        env:
+          SIGNING_KEY: ${{ secrets.DOKAN_RELEASE_SIGNING_KEY }}
+        run: |
+          if [ -z "$SIGNING_KEY" ]; then
+            echo "DOKAN_RELEASE_SIGNING_KEY not set — skipping SHA256SUMS.sig (checksum-only release)."
+            exit 0
+          fi
+          printf '%s' "$SIGNING_KEY" > /tmp/release_key.pem
+          openssl pkeyutl -sign -inkey /tmp/release_key.pem -rawin -in out/SHA256SUMS -out /tmp/sig.bin
+          base64 -w0 /tmp/sig.bin > out/SHA256SUMS.sig
+          rm -f /tmp/release_key.pem
+          echo "Signed SHA256SUMS -> out/SHA256SUMS.sig"
+
       - name: Publish to the GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           # `-rc` tags publish as a PRERELEASE so they never become "Latest" (install.sh resolves
           # via /releases/latest, which skips prereleases). Real cuts (no `-rc`) publish normally.
           prerelease: ${{ contains(github.ref_name, '-rc') }}
+          # SHA256SUMS.sig is published only when the signing key is configured (missing files are
+          # skipped — action-gh-release does not fail on an unmatched path).
           files: |
             out/dokan-*
             out/SHA256SUMS
+            out/SHA256SUMS.sig

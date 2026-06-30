@@ -238,6 +238,49 @@ async fn download(client: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
     Ok(bytes.to_vec())
 }
 
+/// Pinned base64 Ed25519 public key of the dokan **release-signing** key. When non-empty, the
+/// updater REQUIRES a valid `SHA256SUMS.sig` (detached Ed25519 over the SHA256SUMS bytes) before
+/// trusting any checksum — so the channel that replaces the receipt-SIGNING binary has provenance
+/// at least as strong as the receipts that binary issues. Empty = not yet provisioned: the updater
+/// warns and falls back to checksum-only (bootstrap, before the release key + CI signing exist).
+/// `DOKAN_RELEASE_PUBKEY` overrides it (staging/tests). TSU-252.
+const RELEASE_SIGNING_PUBKEY: &str = "";
+
+/// The active pinned release public key, if any (env override wins; else the baked-in const).
+fn release_pubkey() -> Option<String> {
+    if let Ok(k) = std::env::var("DOKAN_RELEASE_PUBKEY") {
+        let k = k.trim().to_string();
+        if !k.is_empty() {
+            return Some(k);
+        }
+    }
+    (!RELEASE_SIGNING_PUBKEY.is_empty()).then(|| RELEASE_SIGNING_PUBKEY.to_string())
+}
+
+/// Verify a detached Ed25519 signature (base64) over `msg` against a base64 32-byte public key.
+/// Returns false on any malformed input — never panics.
+fn ed25519_verify_detached(pubkey_b64: &str, msg: &[u8], sig_b64: &str) -> bool {
+    use base64::Engine;
+    use ed25519_dalek::{Signature, VerifyingKey};
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let Ok(pk_bytes) = b64.decode(pubkey_b64.trim()) else {
+        return false;
+    };
+    let Ok(pk_arr): Result<[u8; 32], _> = pk_bytes.try_into() else {
+        return false;
+    };
+    let Ok(vk) = VerifyingKey::from_bytes(&pk_arr) else {
+        return false;
+    };
+    let Ok(sig_bytes) = b64.decode(sig_b64.trim()) else {
+        return false;
+    };
+    let Ok(sig_arr): Result<[u8; 64], _> = sig_bytes.try_into() else {
+        return false;
+    };
+    vk.verify_strict(msg, &Signature::from_bytes(&sig_arr)).is_ok()
+}
+
 /// Acquire (step 5) → verify (step 6) → install atomically (step 7) → verify the staged binary
 /// (step 10). Any error short-circuits BEFORE the rename, so the running install is never touched.
 async fn install(client: &reqwest::Client, release: &Release, latest: &Version) -> Result<()> {
@@ -260,6 +303,36 @@ async fn install(client: &reqwest::Client, release: &Release, latest: &Version) 
     let sums_raw = download(client, &sums_asset.browser_download_url)
         .await
         .context("downloading SHA256SUMS")?;
+
+    // Provenance (TSU-252): when a release-signing key is pinned, REQUIRE a valid Ed25519 signature
+    // over SHA256SUMS before trusting any checksum. The binary that owns the receipt-signing keys
+    // must not update through a channel weaker than the receipts it issues. No pinned key yet → warn
+    // and fall back to checksum-only (bootstrap before the release key + CI signing land).
+    match release_pubkey() {
+        Some(pubkey) => {
+            let sig_asset = release
+                .assets
+                .iter()
+                .find(|a| a.name == "SHA256SUMS.sig")
+                .context("a release-signing key is pinned but the release has no SHA256SUMS.sig")?;
+            let sig_raw = download(client, &sig_asset.browser_download_url)
+                .await
+                .context("downloading SHA256SUMS.sig")?;
+            let sig_b64 = String::from_utf8(sig_raw).context("SHA256SUMS.sig is not valid UTF-8")?;
+            if !ed25519_verify_detached(&pubkey, &sums_raw, &sig_b64) {
+                anyhow::bail!(
+                    "SHA256SUMS signature does not verify against the pinned release key — refusing to update"
+                );
+            }
+            tracing::info!("SHA256SUMS Ed25519 signature verified against the pinned release key");
+        }
+        None => {
+            tracing::warn!(
+                "no pinned release-signing key — SHA256SUMS is checksum-only, not provenance-verified (TSU-252)"
+            );
+        }
+    }
+
     let sums = String::from_utf8(sums_raw).context("SHA256SUMS is not valid UTF-8")?;
 
     // Verify integrity BEFORE installing (step 6).
@@ -447,6 +520,29 @@ mod tests {
         assert_eq!(parse_tag("v1.2.3").unwrap(), v("1.2.3"));
         assert_eq!(parse_tag("1.2.3").unwrap(), v("1.2.3"));
         assert!(parse_tag("not-a-version").is_err());
+    }
+
+    #[test]
+    fn sha256sums_signature_verify_accepts_genuine_rejects_tampered() {
+        use base64::Engine;
+        use ed25519_dalek::{Signer, SigningKey};
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let pubkey = b64.encode(sk.verifying_key().to_bytes());
+        let sums = b"abc123  dokan-x86_64-unknown-linux-gnu\n";
+        let sig = b64.encode(sk.sign(sums).to_bytes());
+
+        // Genuine signature over the genuine SHA256SUMS verifies.
+        assert!(ed25519_verify_detached(&pubkey, sums, &sig), "genuine sig accepted");
+        // A tampered SHA256SUMS body (attacker swaps the checksum) is rejected.
+        let tampered = b"deadbeef  dokan-x86_64-unknown-linux-gnu\n";
+        assert!(!ed25519_verify_detached(&pubkey, tampered, &sig), "tampered SHA256SUMS rejected");
+        // A signature from a different key is rejected (forged provenance).
+        let other = b64.encode(SigningKey::from_bytes(&[9u8; 32]).sign(sums).to_bytes());
+        assert!(!ed25519_verify_detached(&pubkey, sums, &other), "wrong-key sig rejected");
+        // Garbage inputs never panic, always reject.
+        assert!(!ed25519_verify_detached("not-base64", sums, &sig));
+        assert!(!ed25519_verify_detached(&pubkey, sums, "not-base64"));
     }
 
     #[test]
