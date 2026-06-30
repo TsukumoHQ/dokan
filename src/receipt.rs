@@ -254,18 +254,25 @@ pub fn verify_receipt_with(
     let ed25519_valid =
         !payload_bytes.is_empty() && ed_verify(public_b64, payload_type, &payload_bytes, sig);
 
-    // Binding coherence: the signed statement must attest the receipt's own claimed output.
-    let claimed = receipt.get("output_sha256").and_then(|v| v.as_str());
-    let signed = serde_json::from_slice::<serde_json::Value>(&payload_bytes)
+    // Binding coherence: the signed statement must attest the receipt's own claimed output AND the
+    // served artifact handles. Binding `output_sha256` alone is NOT enough — the bytes a holder
+    // actually downloads come from the top-level `input_blobs` / `output_blobs` handles, so a relay
+    // could substitute artifacts (swap those handles) while `output_sha256` stays intact and verify
+    // still passed. Require the top-level blob sets to equal the SIGNED predicate's (canonical,
+    // order-independent). The HMAC path already binds these; this closes the public-verify gap.
+    let claimed_out = receipt.get("output_sha256").and_then(|v| v.as_str());
+    let signed_pred = serde_json::from_slice::<serde_json::Value>(&payload_bytes)
         .ok()
-        .and_then(|st| {
-            st.get("predicate")
-                .and_then(|p| p.get("output_sha256"))
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-        });
-    let binding_consistent = match (claimed, signed.as_deref()) {
-        (Some(a), Some(b)) => a == b,
+        .and_then(|st| st.get("predicate").cloned());
+    let binding_consistent = match (claimed_out, signed_pred.as_ref()) {
+        (Some(out), Some(pred)) => {
+            use crate::mcp::canonical_input_blobs;
+            pred.get("output_sha256").and_then(|v| v.as_str()) == Some(out)
+                && canonical_input_blobs(receipt.get("input_blobs"))
+                    == canonical_input_blobs(pred.get("input_blobs"))
+                && canonical_input_blobs(receipt.get("output_blobs"))
+                    == canonical_input_blobs(pred.get("output_blobs"))
+        }
         _ => false,
     };
     let hermetic = receipt.get("hermetic").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -513,6 +520,43 @@ mod tests {
         r["dsse"]["signatures"][0]["sig"] = serde_json::json!(flipped);
         let (v, _) = classify(&r);
         assert_eq!(v, Verdict::Tampered, "bad signature → tampered");
+    }
+
+    // A signed receipt that also attests an output_blobs handle (both top-level + signed predicate).
+    fn signed_receipt_with_output_blob(output: &str, name: &str, sha: &str) -> serde_json::Value {
+        use base64::Engine;
+        let s = dev_signer();
+        let blobs = serde_json::json!({ name: sha });
+        let statement = serde_json::json!({
+            "_type": "https://in-toto.io/Statement/v1",
+            "predicate": { "output_sha256": output, "input_blobs": serde_json::Value::Null, "output_blobs": blobs }
+        });
+        let payload_bytes = serde_json::to_vec(&statement).unwrap();
+        let payload_b64 = base64::engine::general_purpose::STANDARD.encode(&payload_bytes);
+        let sig = s.ed_sign(&dsse_pae(DSSE_PAYLOAD_TYPE, &payload_bytes));
+        serde_json::json!({
+            "output_sha256": output,
+            "hermetic": true,
+            "input_blobs": serde_json::Value::Null,
+            "output_blobs": blobs,
+            "dsse": { "payloadType": DSSE_PAYLOAD_TYPE, "payload": payload_b64,
+                      "signatures": [ { "keyid": s.ed_keyid(), "sig": sig } ] },
+            "ed25519": { "public_key": s.ed_public_b64(), "keyid": s.ed_keyid() }
+        })
+    }
+
+    #[test]
+    fn classify_swapped_served_blob_is_tampered() {
+        // A legit receipt with an output artifact verifies.
+        let r = signed_receipt_with_output_blob("abc123", "report.csv", "sha-good");
+        assert_eq!(classify(&r).0, Verdict::Verified, "legit artifact receipt verifies");
+        // Swapping the SERVED top-level handle (artifact substitution) while the signed statement is
+        // untouched must FAIL — binding output_sha256 alone would NOT catch this.
+        let mut swapped = r.clone();
+        swapped["output_blobs"]["report.csv"] = serde_json::json!("sha-EVIL");
+        let (v, rep) = classify(&swapped);
+        assert!(!rep.binding_consistent, "swapped served blob breaks the binding");
+        assert_eq!(v, Verdict::Tampered, "substituted artifact → tampered");
     }
 
     #[test]
