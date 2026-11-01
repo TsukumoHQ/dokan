@@ -1,6 +1,6 @@
 [package]
 name = "dokan"
-version = "0.4.3"
+version = "0.5.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "Agent-operated, MCP-first runtime for deterministic scripts in Docker. Zero LLM inside."
@@ -51,6 +51,12 @@ base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 tokio-cron-scheduler = "0.15"
+# Per-schedule IANA time zone (`schedule(..., timezone="Europe/Zurich")`). Both are already in the
+# tree through tokio-cron-scheduler (same versions), so no new crate is compiled. We drive tz
+# schedules ourselves with croner + chrono-tz because tokio-cron-scheduler's `new_async_tz`
+# freezes the UTC offset at job creation (FixedOffset) and so drifts by an hour across DST.
+croner = "3"
+chrono-tz = "0.10"
 uuid = "1"
 # rustls everywhere (not native-tls) so the release binary carries NO dynamic libssl.so.3 dep —
 # fastembed's default pulls hf-hub + ort on native-tls/openssl, which makes `dokan` fail to run on

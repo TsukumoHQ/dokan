@@ -25,17 +25,10 @@ pub struct Dokan {
     tool_router: rmcp::handler::server::router::tool::ToolRouter<Self>,
 }
 
-/// Default per-agent in-flight (pending+running) cap — backpressure so one agent can't
-/// swamp the shared runtime. Generous; tighten per deployment if needed.
-const AGENT_MAX_CONCURRENT: i64 = 25;
+use crate::quota::{AGENT_BUDGET_WINDOW_SECS, AGENT_COMPUTE_BUDGET_SECS, AGENT_MAX_CONCURRENT};
 
 /// Runtimes dokan can execute (reported by whoami so an agent self-configures).
 const SUPPORTED_RUNTIMES: [&str; 3] = ["python", "node", "bash"];
-
-/// Per-agent compute budget: max container service-seconds over the rolling window. Cheap
-/// runaway guard the agent can see (whoami) and reason about. Generous default.
-const AGENT_COMPUTE_BUDGET_SECS: f64 = 3600.0;
-const AGENT_BUDGET_WINDOW_SECS: i64 = 86400;
 
 /// Canonicalize a JSON value to a deterministic string (object keys sorted recursively),
 /// so the cache key is stable regardless of input key order.
@@ -105,6 +98,46 @@ pub(crate) fn validate_blob_bytes(len: usize) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Validate a `files` map ({ "<dest-name>": "<handle>" }, handles from upload_blob) and build
+/// the content-addressed `input_blobs` map stored on a run or a schedule. `Ok(Err(envelope))`
+/// = a caller error to return as-is (nothing is created); `Ok(Ok(None))` = no files.
+async fn resolve_files(
+    db: &Db,
+    files: Option<&std::collections::HashMap<String, String>>,
+) -> Result<Result<Option<serde_json::Value>, serde_json::Value>, McpError> {
+    let Some(files) = files.filter(|f| !f.is_empty()) else {
+        return Ok(Ok(None));
+    };
+    let mut map = serde_json::Map::with_capacity(files.len());
+    for (name, handle) in files {
+        if name.is_empty() || name.contains('/') || name.contains("..") {
+            return Ok(Err(json!({
+                "error": "invalid_file_name", "message": "a file dest name is invalid", "name": name,
+                "hint": "dest names must be plain filenames (no '/' or '..')"
+            })));
+        }
+        if !db.blob_exists(handle).await.map_err(internal)? {
+            return Ok(Err(json!({
+                "error": "unknown_blob_handle", "message": "an input file handle is unknown", "name": name, "handle": handle,
+                "hint": "upload the file with upload_blob first; nothing was created"
+            })));
+        }
+        map.insert(name.clone(), json!(handle));
+    }
+    Ok(Ok(Some(serde_json::Value::Object(map))))
+}
+
+/// Validate an optional per-script `timeout_secs` against the daemon bound. Pure — unit-tested.
+pub(crate) fn validate_timeout(timeout_secs: Option<i64>, max_secs: u64) -> Result<(), String> {
+    match timeout_secs {
+        None => Ok(()),
+        Some(t) if t >= 1 && (t as u64) <= max_secs => Ok(()),
+        Some(t) => Err(format!(
+            "timeout_secs must be between 1 and {max_secs} (this daemon's --max-timeout-secs); got {t}"
+        )),
+    }
 }
 
 /// Content-address a run: hash(runtime + source + canonical(input) + secrets generation +
@@ -236,6 +269,12 @@ pub struct UploadArgs {
     pub cpu_limit: Option<f64>,
     /// Opt-in: feed the previous run's structured result into the next run as DOKAN_INPUT.prev_result (for stateful monitors).
     pub feed_prev_result: Option<bool>,
+    /// Optional wall-clock limit per job, in seconds; null = the default 300 s. Bounded by the
+    /// daemon's max (whoami → limits.max_timeout_secs, 3600 by default): a larger value is
+    /// refused. A job past its limit is killed and fails with error "timeout"; when the script
+    /// set its own timeout_secs that timeout is final (not retried). Like mem_limit_mb, an upsert
+    /// re-asserts it: omit it on re-upload and the script goes back to the default.
+    pub timeout_secs: Option<i64>,
     /// Optional secret ALLOWLIST: the subset of secret names this script's jobs may see (least
     /// privilege). null/omitted = back-compat (all of your + global secrets). When set, only these
     /// names are injected — as env vars AND files under tmpfs /run/secrets/<name>.
@@ -387,6 +426,25 @@ pub struct ScheduleArgs {
     pub cron: String,
     /// JSON input passed to each scheduled run. Optional.
     pub input: Option<serde_json::Value>,
+    /// Agent every tick runs as — exactly what run_script's agent_id does: provenance, the
+    /// agent's scoped secrets (global + this agent's, filtered by the script's allowlist), and
+    /// its concurrency/compute quota, checked at EVERY tick (a refused tick is recorded as a
+    /// failed run with the reason). Omit = legacy schedule (no agent: global secrets only, no
+    /// quota). Unauthenticated provenance, not an auth boundary (see SECURITY.md).
+    pub agent_id: Option<String>,
+    /// Input files for every tick: { "<dest-name>": "<handle>" } (handles from upload_blob),
+    /// materialized READ-ONLY at /input/<dest-name>. Validated now (unknown handle → error, no
+    /// schedule). A blob mounted by an enabled schedule is kept by the blob GC.
+    pub files: Option<std::collections::HashMap<String, String>>,
+    /// Mount a writable /output on every tick and capture its files (see run_script).
+    pub capture_output: Option<bool>,
+    /// One run per tick even when several daemons share this database: each tick enqueues with
+    /// the key `schedule:<id>:<tick epoch seconds>`. Default false.
+    pub idempotency: Option<bool>,
+    /// IANA time zone the cron fields are read in, e.g. "Europe/Zurich" (wall-clock time,
+    /// DST-aware: a fixed time in the spring-forward gap fires right after the gap, a fixed time
+    /// repeated by the fall-back overlap fires once). Omit = UTC.
+    pub timezone: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -458,6 +516,35 @@ fn validate_cron(expr: &str) -> std::result::Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Token-frugal view of a schedule: always id/script/cron/next_fire, run options only when set.
+pub(crate) fn schedule_json(
+    s: &crate::db::Schedule,
+    now: chrono::DateTime<chrono::Utc>,
+) -> serde_json::Value {
+    let mut o = json!({
+        "schedule_id": s.id, "script_id": s.script_id, "script": s.script_name, "cron": s.cron,
+        "next_fire": crate::cron::schedule_next_fire(s, now).map(|t| t.to_rfc3339()),
+    });
+    if let Some(a) = &s.agent_id {
+        o["agent_id"] = json!(a);
+    }
+    if let Some(tz) = &s.timezone {
+        o["timezone"] = json!(tz);
+    }
+    if let Some(serde_json::Value::Object(m)) = &s.input_blobs
+        && !m.is_empty()
+    {
+        o["files"] = json!(m.keys().collect::<Vec<_>>());
+    }
+    if s.capture_output {
+        o["capture_output"] = json!(true);
+    }
+    if s.idempotency {
+        o["idempotency"] = json!(true);
+    }
+    o
 }
 
 #[tool_router]
@@ -540,6 +627,7 @@ impl Dokan {
             "network": s.network, "created_at": s.created_at.to_rfc3339(),
             "mem_limit_mb": s.mem_limit_mb, "cpu_limit": s.cpu_limit,
             "feed_prev_result": s.feed_prev_result,
+            "timeout_secs": s.timeout_secs,
         });
         if a.include_source.unwrap_or(false) {
             v["source"] = json!(s.source);
@@ -549,11 +637,24 @@ impl Dokan {
         ok(v)
     }
 
-    #[tool(description = "Upload a script. Returns script_id + version. Runtime: python|node|bash. INPUT CONTRACT: the script reads its input from the DOKAN_INPUT env var (a JSON string) — NOT stdin or argv. Secrets set via set_secret arrive as their own env vars (e.g. $OPENAI_API_KEY). A nonzero exit is treated as the script's own deterministic verdict (e.g. a monitor finding) and is NOT retried; only a container/infra failure retries. Pass upsert=true to re-provision by name idempotently (no duplicate rows on respawn). STRUCTURED RESULT: print a line `::dokan:result:: {json}` on stdout to attach a structured result to the run — it is captured (not logged), returned by wait_for/read_logs, and POSTed to the relay, so a monitor's finding reaches the agent event-driven. PROGRESS: print `::dokan:progress:: <text>` to set the run's live status line (latest wins, overwritten each emit) — surfaced by list_runs/read_logs/wait_for and the UI, NOT logged. Use it in a long loop (e.g. `meeting 3/6`) so the operator sees current state without paging logs; flush stdout (Python: print(..., flush=True)) so it lands live. STATEFUL MONITORS: set feed_prev_result=true and this script's previous structured result is injected as DOKAN_INPUT.prev_result on the next run (null on the first) — for week-over-week diffs without external state. Per-job caps: mem_limit_mb / cpu_limit / network (see args).")]
+    #[tool(
+        description = "Upload a script. Returns script_id + version. Runtime: python|node|bash. INPUT CONTRACT: the script reads its input from the DOKAN_INPUT env var (a JSON string) — NOT stdin or argv. Secrets set via set_secret arrive as their own env vars (e.g. $OPENAI_API_KEY). A nonzero exit is treated as the script's own deterministic verdict (e.g. a monitor finding) and is NOT retried; only a container/infra failure retries. Pass upsert=true to re-provision by name idempotently (no duplicate rows on respawn). STRUCTURED RESULT: print a line `::dokan:result:: {json}` on stdout to attach a structured result to the run — it is captured (not logged), returned by wait_for/read_logs, and POSTed to the relay, so a monitor's finding reaches the agent event-driven. PROGRESS: print `::dokan:progress:: <text>` to set the run's live status line (latest wins, overwritten each emit) — surfaced by list_runs/read_logs/wait_for and the UI, NOT logged. Use it in a long loop (e.g. `meeting 3/6`) so the operator sees current state without paging logs; flush stdout (Python: print(..., flush=True)) so it lands live. STATEFUL MONITORS: set feed_prev_result=true and this script's previous structured result is injected as DOKAN_INPUT.prev_result on the next run (null on the first) — for week-over-week diffs without external state. Per-job caps: mem_limit_mb / cpu_limit / network / timeout_secs (default 300 s, up to the daemon max — whoami → limits.max_timeout_secs; a long job keeps its lease via heartbeat, so it is never re-run while alive) (see args)."
+    )]
     async fn upload_script(
         &self,
         Parameters(a): Parameters<UploadArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let max_timeout = self.exec.max_timeout_secs();
+        if let Err(e) = validate_timeout(a.timeout_secs, max_timeout) {
+            return err_ctx(
+                "invalid_timeout",
+                e,
+                Some(
+                    "omit timeout_secs for the 300 s default, or ask the operator to raise DOKAN_MAX_TIMEOUT_SECS",
+                ),
+                json!({"max_timeout_secs": max_timeout}),
+            );
+        }
         // Idempotent re-provision: with upsert, reuse the script of the same name. No-op
         // when the source is unchanged (a respawned agent re-uploading the same thing),
         // update + version bump when it changed — never a duplicate row.
@@ -578,6 +679,7 @@ impl Dokan {
                             a.mem_limit_mb,
                             a.cpu_limit,
                             a.feed_prev_result.unwrap_or(false),
+                            a.timeout_secs,
                         )
                         .await
                         .map_err(internal)?;
@@ -600,6 +702,7 @@ impl Dokan {
                         a.mem_limit_mb,
                         a.cpu_limit,
                         a.feed_prev_result.unwrap_or(false),
+                        a.timeout_secs,
                         embedding,
                     )
                     .await
@@ -624,6 +727,7 @@ impl Dokan {
                 a.mem_limit_mb,
                 a.cpu_limit,
                 a.feed_prev_result.unwrap_or(false),
+                a.timeout_secs,
                 embedding,
             )
             .await
@@ -795,27 +899,9 @@ impl Dokan {
         // Run artifacts: validate every file handle exists BEFORE a run is created (unknown
         // handle → loud error, no run). Build the content-addressed input_blobs map
         // { "<dest-name>": "<sha>" } stored on the run and folded into the cache key + receipt.
-        let input_blobs: Option<serde_json::Value> = match &a.files {
-            Some(files) if !files.is_empty() => {
-                let mut map = serde_json::Map::with_capacity(files.len());
-                for (name, handle) in files {
-                    if name.is_empty() || name.contains('/') || name.contains("..") {
-                        return ok(json!({
-                            "error": "invalid_file_name", "message": "a file dest name is invalid", "name": name,
-                            "hint": "dest names must be plain filenames (no '/' or '..')"
-                        }));
-                    }
-                    if !self.db.blob_exists(handle).await.map_err(internal)? {
-                        return ok(json!({
-                            "error": "unknown_blob_handle", "message": "an input file handle is unknown", "name": name, "handle": handle,
-                            "hint": "upload the file with upload_blob first; no run was created"
-                        }));
-                    }
-                    map.insert(name.clone(), json!(handle));
-                }
-                Some(serde_json::Value::Object(map))
-            }
-            _ => None,
+        let input_blobs = match resolve_files(&self.db, a.files.as_ref()).await? {
+            Ok(b) => b,
+            Err(envelope) => return ok(envelope),
         };
         // Run-or-recall: if opted in and an identical run already succeeded, return its
         // result instead of spawning a container. The key folds in the secrets generation +
@@ -854,24 +940,10 @@ impl Dokan {
             }));
         }
         // Per-agent backpressure: concurrency quota + rolling compute budget. A runaway
-        // agent can't swamp the shared runtime or burn unbounded compute.
-        let n = self.db.agent_running_count(aid).await.map_err(internal)?;
-        if n >= AGENT_MAX_CONCURRENT {
-            return ok(json!({
-                "error": "quota_exceeded", "message": "this agent has too many runs in flight", "hint": "wait for in-flight runs to finish or back off", "agent_id": aid,
-                "in_flight": n, "limit": AGENT_MAX_CONCURRENT
-            }));
-        }
-        let spent = self
-            .db
-            .agent_compute_seconds(aid, AGENT_BUDGET_WINDOW_SECS)
-            .await
-            .map_err(internal)?;
-        if spent >= AGENT_COMPUTE_BUDGET_SECS {
-            return ok(json!({
-                "error": "budget_exceeded", "message": "this agent exhausted its rolling compute budget", "hint": "retry after the budget window rolls over", "agent_id": aid,
-                "compute_seconds_24h": spent, "budget": AGENT_COMPUTE_BUDGET_SECS
-            }));
+        // agent can't swamp the shared runtime or burn unbounded compute. Same check as a
+        // schedule tick carrying this agent_id (crate::quota).
+        if let Some(refusal) = crate::quota::check(&self.db, aid).await.map_err(internal)? {
+            return ok(refusal.envelope(aid));
         }
         // Enqueue only — a worker claims it from the queue (FOR UPDATE SKIP LOCKED). When an
         // idempotency_key is supplied, insert-or-return atomically: two racing identical
@@ -1165,7 +1237,9 @@ impl Dokan {
         ok(out)
     }
 
-    #[tool(description = "Schedule a script on a cron (6-field, leading seconds). Each tick enqueues a run. Returns schedule_id.")]
+    #[tool(
+        description = "Schedule a script on a cron (6-field, leading seconds). Each tick enqueues a run. Returns schedule_id + next_fire (UTC). A tick takes the same options as run_script: agent_id (scoped secrets + quota, checked at every tick — a refused tick shows up as a failed run with the reason), files={\"<name>\": \"<handle>\"} mounted read-only at /input, capture_output, plus idempotency=true for one run per tick across daemons sharing the database. timezone=\"Europe/Zurich\" (any IANA name) reads the cron fields as local wall-clock time, DST-aware; omit for UTC. There is no update: to change a schedule (e.g. a new code blob after a deploy), unschedule it and schedule again."
+    )]
     async fn schedule(
         &self,
         Parameters(a): Parameters<ScheduleArgs>,
@@ -1176,28 +1250,106 @@ impl Dokan {
         if let Err(e) = validate_cron(&a.cron) {
             return err_ctx("invalid_cron", "the cron expression is invalid", Some("6 fields with leading seconds, e.g. 0 */5 * * * *"), json!({"detail": e}));
         }
-        if self.db.get_script(a.script_id).await.map_err(internal)?.is_none() {
-            return err_ctx("script_not_found", "no script with that id", Some("check list_scripts for valid ids"), json!({"id": a.script_id}));
+        // Parse before inserting, so a bad expression never leaves an enabled row behind.
+        let parsed = match crate::cron::parse_cron(&a.cron) {
+            Ok(c) => c,
+            Err(e) => {
+                return err_ctx(
+                    "invalid_cron",
+                    "the cron expression is invalid",
+                    Some("6 fields with leading seconds, e.g. 0 */5 * * * *"),
+                    json!({"detail": e}),
+                );
+            }
+        };
+        let tz = match a
+            .timezone
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
+            Some(name) => match crate::cron::parse_timezone(name) {
+                Ok(tz) => Some(tz),
+                Err(e) => {
+                    return err_ctx(
+                        "invalid_timezone",
+                        e,
+                        Some("use an IANA name, e.g. Europe/Zurich or America/New_York"),
+                        json!({"timezone": name}),
+                    );
+                }
+            },
+            None => None,
+        };
+        if self
+            .db
+            .get_script(a.script_id)
+            .await
+            .map_err(internal)?
+            .is_none()
+        {
+            return err_ctx(
+                "script_not_found",
+                "no script with that id",
+                Some("check list_scripts for valid ids"),
+                json!({"id": a.script_id}),
+            );
         }
+        // Same rule as run_script: an agent id, when given, must be non-empty.
+        let agent_id = match a.agent_id.as_deref().map(str::trim) {
+            Some("") => {
+                return err(
+                    "agent_id_required",
+                    "agent_id must be non-empty when given",
+                    Some("pass your agent id, or omit it for a schedule without agent"),
+                );
+            }
+            Some(aid) => Some(aid.to_string()),
+            None => None,
+        };
+        let input_blobs = match resolve_files(&self.db, a.files.as_ref()).await? {
+            Ok(b) => b,
+            Err(envelope) => return ok(envelope),
+        };
         let input = destringify(a.input.unwrap_or(json!({})));
+        let opts = crate::db::ScheduleOpts {
+            agent_id,
+            input_blobs,
+            capture_output: a.capture_output.unwrap_or(false),
+            idempotency: a.idempotency.unwrap_or(false),
+            timezone: tz.map(|t| t.name().to_string()),
+        };
         let id = self
             .db
-            .insert_schedule(a.script_id, &a.cron, &input)
+            .insert_schedule(a.script_id, &a.cron, &input, &opts)
             .await
             .map_err(internal)?;
-        cron.add_job(id, a.script_id, &a.cron, input)
-            .await
-            .map_err(internal)?;
-        ok(json!({"schedule_id": id, "cron": a.cron, "status": "scheduled"}))
+        let Some(stored) = self.db.get_schedule(id).await.map_err(internal)? else {
+            return Err(internal(anyhow::anyhow!(
+                "schedule {id} vanished after insert"
+            )));
+        };
+        if let Err(e) = cron.add(&stored).await {
+            // Don't leave an enabled row that no ticker serves.
+            let _ = self.db.set_schedule_enabled(id, false).await;
+            return Err(internal(e));
+        }
+        let next = crate::cron::next_fire(&parsed, tz, chrono::Utc::now()).map(|t| t.to_rfc3339());
+        let mut out =
+            json!({"schedule_id": id, "cron": a.cron, "status": "scheduled", "next_fire": next});
+        if let Some(tz) = &opts.timezone {
+            out["timezone"] = json!(tz);
+        }
+        ok(out)
     }
 
-    #[tool(description = "List active cron schedules: id, script_id, script name, cron expression.")]
+    #[tool(
+        description = "List active cron schedules: id, script_id, script name, cron expression, next_fire (UTC). Run options appear only when set: agent_id, timezone, files (dest names), capture_output, idempotency."
+    )]
     async fn list_schedules(&self) -> Result<CallToolResult, McpError> {
         let rows = self.db.list_schedules().await.map_err(internal)?;
-        let items: Vec<_> = rows
-            .iter()
-            .map(|s| json!({"schedule_id": s.id, "script_id": s.script_id, "script": s.script_name, "cron": s.cron}))
-            .collect();
+        let now = chrono::Utc::now();
+        let items: Vec<_> = rows.iter().map(|s| schedule_json(s, now)).collect();
         ok(json!({"schedules": items}))
     }
 
@@ -1292,7 +1444,9 @@ impl Dokan {
         ok(json!({"secrets": names}))
     }
 
-    #[tool(description = "Self-describe the runtime for the calling agent: supported runtimes, per-job mem/cpu caps, secret names you can see (global + your scoped), and your concurrency quota + current in-flight usage. Use to self-configure instead of guessing.")]
+    #[tool(
+        description = "Self-describe the runtime for the calling agent: supported runtimes, per-job mem/cpu caps + default/max timeout, secret names you can see (global + your scoped), and your concurrency quota + current in-flight usage. Use to self-configure instead of guessing."
+    )]
     async fn whoami(
         &self,
         Parameters(a): Parameters<WhoamiArgs>,
@@ -1316,7 +1470,11 @@ impl Dokan {
         ok(json!({
             "agent_id": a.agent_id,
             "runtimes": SUPPORTED_RUNTIMES,
-            "limits": { "mem_mb": mem_bytes / (1024 * 1024), "cpus": nano_cpus as f64 / 1e9 },
+            "limits": {
+                "mem_mb": mem_bytes / (1024 * 1024), "cpus": nano_cpus as f64 / 1e9,
+                "default_timeout_secs": crate::exec::DEFAULT_TIMEOUT_SECS,
+                "max_timeout_secs": self.exec.max_timeout_secs(),
+            },
             "secrets": secrets,
             "quota": { "max_concurrent": AGENT_MAX_CONCURRENT, "in_flight": in_flight },
             "budget": {
@@ -1498,7 +1656,7 @@ impl ServerHandler for Dokan {
              Provenance: every run gets a tamper-evident receipt (get_receipt); verify checks it \
              OFFLINE (Ed25519/DSSE, no shared secret); reproduce re-executes + byte-compares \
              (REPRODUCED/DIVERGED/TAMPERED/INCONCLUSIVE) — sound for network=false runs. \
-             Recurring: schedule (6-field cron) / create_webhook (inbound POST /hook/<token>). \
+             Recurring: schedule (6-field cron; optional agent_id, files, capture_output, idempotency like run_script, and an IANA timezone, UTC by default) / create_webhook (inbound POST /hook/<token>). Long jobs: upload_script timeout_secs (default 300 s, max in whoami). \
              Secrets: set_secret (write-only, env-injected); list_secrets = names only. \
              Errors are a uniform {error: code, message, hint?} envelope. \
              Discover the rest with whoami (caps, your secrets, quota) and list_runs (outcome= \
@@ -1511,7 +1669,66 @@ impl ServerHandler for Dokan {
 
 #[cfg(test)]
 mod tests {
-    use super::{canonical_input_blobs, canonical_json, destringify, run_cache_key, validate_cron};
+    use super::{
+        canonical_input_blobs, canonical_json, destringify, run_cache_key, schedule_json,
+        validate_cron, validate_timeout,
+    };
+
+    #[test]
+    fn timeout_validation_is_bounded_by_the_daemon_max() {
+        assert!(validate_timeout(None, 3600).is_ok(), "absent = default");
+        assert!(validate_timeout(Some(1), 3600).is_ok());
+        assert!(validate_timeout(Some(3600), 3600).is_ok());
+        assert!(
+            validate_timeout(Some(3601), 3600)
+                .unwrap_err()
+                .contains("3600")
+        );
+        assert!(validate_timeout(Some(0), 3600).is_err());
+        assert!(validate_timeout(Some(-1), 3600).is_err());
+    }
+
+    #[test]
+    fn schedule_json_is_frugal_for_a_legacy_schedule() {
+        let s = crate::db::Schedule {
+            id: 1,
+            script_id: 2,
+            script_name: "n".into(),
+            cron: "0 30 7 * * *".into(),
+            input: serde_json::json!({}),
+            agent_id: None,
+            input_blobs: None,
+            capture_output: false,
+            idempotency: false,
+            timezone: None,
+        };
+        let now = chrono::DateTime::parse_from_rfc3339("2026-01-10T00:00:00Z")
+            .unwrap()
+            .to_utc();
+        let v = schedule_json(&s, now);
+        assert_eq!(v["next_fire"], "2026-01-10T07:30:00+00:00");
+        for k in [
+            "agent_id",
+            "timezone",
+            "files",
+            "capture_output",
+            "idempotency",
+        ] {
+            assert!(v.get(k).is_none(), "{k} absent on a legacy schedule: {v}");
+        }
+        let zoned = crate::db::Schedule {
+            agent_id: Some("a".into()),
+            timezone: Some("Europe/Zurich".into()),
+            input_blobs: Some(serde_json::json!({"code.tar.gz": "abc"})),
+            ..s
+        };
+        let v = schedule_json(&zoned, now);
+        assert_eq!(
+            v["next_fire"], "2026-01-10T06:30:00+00:00",
+            "07:30 CET = 06:30 UTC"
+        );
+        assert_eq!(v["files"], serde_json::json!(["code.tar.gz"]));
+    }
     use serde_json::json;
 
     #[test]

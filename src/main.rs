@@ -93,6 +93,12 @@ struct Cli {
     #[arg(long, env = "DOKAN_TOKEN")]
     token: Option<String>,
 
+    /// Upper bound (seconds) on a script's own `timeout_secs`. Scripts without one keep the
+    /// 300 s default. An upload above this bound is refused; at exec time limits are clamped
+    /// to it again, so lowering it also caps scripts stored before.
+    #[arg(long, default_value_t = exec::DEFAULT_MAX_TIMEOUT_SECS, env = "DOKAN_MAX_TIMEOUT_SECS")]
+    max_timeout_secs: u64,
+
     /// Fail runs stuck `pending` longer than this (never claimed — no capable worker, or a
     /// dead enqueuer). 0 = keep forever. Generous so a healthy backlog is never touched.
     #[arg(long, default_value_t = 1800.0, env = "DOKAN_PENDING_TIMEOUT_SECS")]
@@ -243,16 +249,15 @@ async fn main() -> Result<()> {
 
     let mem_bytes = cli.mem_limit_mb * 1024 * 1024;
     let nano_cpus = (cli.cpu_limit * 1e9) as i64;
-    let exec = Arc::new(Executor::connect(
-        cli.warm_idle,
-        mem_bytes,
-        nano_cpus,
-        cli.relay_url.clone(),
-    )?);
+    let exec = Arc::new(
+        Executor::connect(cli.warm_idle, mem_bytes, nano_cpus, cli.relay_url.clone())?
+            .with_max_timeout_secs(cli.max_timeout_secs),
+    );
     tracing::info!(
         warm_idle = cli.warm_idle,
         mem_limit_mb = cli.mem_limit_mb,
         cpu_limit = cli.cpu_limit,
+        max_timeout_secs = cli.max_timeout_secs,
         "docker connected, warm pool armed"
     );
 
@@ -400,12 +405,14 @@ async fn main() -> Result<()> {
         tracing::info!("flow engine started");
 
         // Orphan reaper: a worker/engine that dies mid-run leaves rows stuck `running`.
-        // Lease-based reclaim hands them back to `pending` once past a generous lease
-        // (well beyond the hard job timeout), without disturbing healthy concurrent
+        // Lease-based reclaim hands them back to `pending` once their heartbeat is older than
+        // the lease (a live job beats all along, however long it runs), without disturbing healthy concurrent
         // workers — the safety net that makes multi-worker against one Postgres correct.
         {
             let db = db.clone();
-            let lease = (exec::DEFAULT_TIMEOUT_SECS * 2) as f64; // 2× the hard job timeout
+            // Heartbeat-based lease: a live job beats every RUN_HEARTBEAT_SECS whatever its own
+            // limit, so this stays short (dead-worker detection) without touching long jobs.
+            let lease = exec::RUN_LEASE_SECS as f64;
             let pending_to = cli.pending_timeout_secs;
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));

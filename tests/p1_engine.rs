@@ -725,3 +725,159 @@ async fn cron_enqueues_runs() -> anyhow::Result<()> {
     c.cancel().await?;
     Ok(())
 }
+
+/// A per-script timeout_secs is enforced, bounded by the daemon max, and its timeout is final
+/// (one attempt, no 3× replay of a long job). v0.5.0.
+#[tokio::test]
+async fn per_script_timeout_kills_once_and_is_bounded() -> anyhow::Result<()> {
+    let c = spawn().await?;
+    let too_long = call(
+        &c,
+        "upload_script",
+        json!({"name": "tmo-big", "runtime": "bash", "source": "true", "timeout_secs": 999_999}),
+    )
+    .await?;
+    assert_eq!(
+        too_long["error"], "invalid_timeout",
+        "above max refused: {too_long}"
+    );
+    assert_eq!(too_long["max_timeout_secs"], 3600);
+
+    let up = call(
+        &c,
+        "upload_script",
+        json!({"name": "tmo-short", "runtime": "bash", "source": "echo start; sleep 30\n", "timeout_secs": 2}),
+    )
+    .await?;
+    let sid = up["script_id"].as_i64().unwrap();
+    let meta = call(&c, "get_script", json!({"id": sid})).await?;
+    assert_eq!(meta["timeout_secs"], 2);
+    let who = call(&c, "whoami", json!({})).await?;
+    assert_eq!(who["limits"]["default_timeout_secs"], 300);
+    assert_eq!(who["limits"]["max_timeout_secs"], 3600);
+
+    let r = call(
+        &c,
+        "run_script",
+        json!({"script_id": sid, "agent_id": "test"}),
+    )
+    .await?;
+    let run_id = r["run_id"].as_i64().unwrap();
+    assert_eq!(wait_status(&c, run_id, 60).await, "failed");
+    // Give a (wrong) retry the time to requeue, then check it stayed a single attempt.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    let db_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://dokan:dokan@127.0.0.1:5499/dokan".into());
+    let db = dokan::db::Db::connect(&db_url).await?;
+    let (status, error, attempts): (String, Option<String>, i32) =
+        sqlx::query_as("SELECT status, error, attempts FROM runs WHERE id = $1")
+            .bind(run_id)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        (status.as_str(), error.as_deref(), attempts),
+        ("failed", Some("timeout"), 1)
+    );
+    assert!(logs_text(&c, run_id).await.contains("timeout after 2 s"));
+    c.cancel().await?;
+    Ok(())
+}
+
+/// A schedule carries run_script's options onto every tick: agent_id (scoped secrets), files
+/// at /input, capture_output, a time zone. v0.5.0.
+#[tokio::test]
+async fn schedule_ticks_with_agent_files_output_and_timezone() -> anyhow::Result<()> {
+    use base64::Engine;
+    let c = spawn().await?;
+    let agent = "sched-opts-agent";
+    call(
+        &c,
+        "set_secret",
+        json!({"name": "SCHED_TOKEN", "value": "scoped-value-123456", "agent_id": agent}),
+    )
+    .await?;
+    let blob = call(
+        &c,
+        "upload_blob",
+        json!({"data": base64::engine::general_purpose::STANDARD.encode("hello-file")}),
+    )
+    .await?;
+    let handle = blob["handle"].as_str().unwrap().to_string();
+    let src = r#"f=$(cat /input/note.txt); o=false; [ -d /output ] && o=true
+echo "::dokan:result:: {\"file\":\"$f\",\"sec\":${#SCHED_TOKEN},\"out\":$o}"
+"#;
+    let sid = upload(&c, "bash", src).await;
+
+    // Bad options are refused before anything is stored.
+    let bad_tz = call(
+        &c,
+        "schedule",
+        json!({"script_id": sid, "cron": "* * * * * *", "timezone": "Europe/Atlantis"}),
+    )
+    .await?;
+    assert_eq!(bad_tz["error"], "invalid_timezone", "{bad_tz}");
+    let bad_file = call(
+        &c,
+        "schedule",
+        json!({"script_id": sid, "cron": "* * * * * *", "files": {"x": "nope"}}),
+    )
+    .await?;
+    assert_eq!(bad_file["error"], "unknown_blob_handle", "{bad_file}");
+    let empty_agent = call(
+        &c,
+        "schedule",
+        json!({"script_id": sid, "cron": "* * * * * *", "agent_id": " "}),
+    )
+    .await?;
+    assert_eq!(empty_agent["error"], "agent_id_required", "{empty_agent}");
+
+    let s = call(
+        &c,
+        "schedule",
+        json!({"script_id": sid, "cron": "* * * * * *", "agent_id": agent,
+               "files": {"note.txt": handle}, "capture_output": true,
+               "idempotency": true, "timezone": "Europe/Zurich"}),
+    )
+    .await?;
+    let schedule_id = s["schedule_id"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("scheduled: {s}"));
+    assert_eq!(s["timezone"], "Europe/Zurich");
+    assert!(s["next_fire"].is_string(), "{s}");
+    let listed = call(&c, "list_schedules", json!({})).await?;
+    let mine = listed["schedules"]
+        .as_array()
+        .and_then(|a| {
+            a.iter()
+                .find(|x| x["schedule_id"].as_i64() == Some(schedule_id))
+                .cloned()
+        })
+        .expect("listed");
+    assert_eq!(mine["agent_id"], agent);
+    assert_eq!(mine["files"], json!(["note.txt"]));
+    assert_eq!(mine["timezone"], "Europe/Zurich");
+
+    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+    let un = call(&c, "unschedule", json!({"schedule_id": schedule_id})).await?;
+    assert_eq!(un["status"], "unscheduled");
+
+    let runs = call(&c, "list_runs", json!({"script_id": sid, "limit": 20})).await?;
+    let run_id = runs["recent"]
+        .as_array()
+        .and_then(|a| a.last())
+        .and_then(|r| r["run_id"].as_i64())
+        .unwrap_or_else(|| panic!("the zoned ticker enqueued runs: {runs}"));
+    let done = call(&c, "wait_for", json!({"run_id": run_id, "timeout": 60})).await?;
+    assert_eq!(done["status"], "succeeded", "{done}");
+    assert_eq!(
+        done["result"]["file"], "hello-file",
+        "file mounted at /input: {done}"
+    );
+    assert_eq!(
+        done["result"]["sec"], 19,
+        "agent-scoped secret injected: {done}"
+    );
+    assert_eq!(done["result"]["out"], true, "/output mounted: {done}");
+    c.cancel().await?;
+    Ok(())
+}

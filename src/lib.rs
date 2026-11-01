@@ -13,6 +13,7 @@ pub mod flow;
 pub mod http;
 pub mod mcp;
 pub mod pool;
+pub mod quota;
 pub mod receipt;
 pub mod scale;
 pub mod update;

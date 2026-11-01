@@ -16,9 +16,41 @@ use std::time::Duration;
 use crate::db::Db;
 use crate::pool::WarmPool;
 
-/// Hard wall-clock ceiling per job. A live worker kills + finalizes at this bound, so a
-/// run still `running` well past it can only mean the worker died — see the lease reaper.
+/// Default wall-clock ceiling per job, for a script that sets no `timeout_secs`. A live
+/// worker kills + finalizes the job at its limit.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 300;
+
+/// Default daemon-wide upper bound on a per-script `timeout_secs` (`--max-timeout-secs` /
+/// `DOKAN_MAX_TIMEOUT_SECS`). An upload asking for more is refused; at exec time the limit is
+/// clamped again, so lowering the bound later also caps scripts stored before.
+pub const DEFAULT_MAX_TIMEOUT_SECS: u64 = 3600;
+
+/// Run lease: the orphan reaper reclaims a `running` run whose heartbeat is older than this.
+/// Independent of the job's own limit — a live executor beats every `RUN_HEARTBEAT_SECS` for
+/// as long as the job runs, so a one-hour job is never reclaimed while alive.
+pub const RUN_LEASE_SECS: u64 = DEFAULT_TIMEOUT_SECS * 2;
+
+/// Heartbeat period for a running job (well inside `RUN_LEASE_SECS`: ~40 missed beats).
+pub const RUN_HEARTBEAT_SECS: u64 = 15;
+
+/// Aborts a background task when dropped (the run heartbeat).
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// The wall-clock limit a job actually gets: the script's own `timeout_secs` (or the default),
+/// clamped to [1, max]. Pure — unit-tested.
+pub fn effective_timeout_secs(script_timeout: Option<i64>, max_secs: u64) -> u64 {
+    let max = max_secs.max(1);
+    match script_timeout {
+        Some(t) if t >= 1 => (t as u64).min(max),
+        _ => DEFAULT_TIMEOUT_SECS.min(max),
+    }
+}
 
 /// Non-root uid:gid the JOB runs as (defense-in-depth: a job needs no privilege — it reads
 /// /input, writes /tmp (tmpfs) + /output (a 0777 bind), and hits the network if allowed).
@@ -37,6 +69,8 @@ pub struct Executor {
     relay: Option<String>,
     http: reqwest::Client,
     signer: crate::receipt::Signer,
+    /// Upper bound on any job's wall-clock limit (see `effective_timeout_secs`).
+    max_timeout_secs: u64,
 }
 
 /// Maps a declared runtime to its base image and in-container interpreter.
@@ -70,7 +104,19 @@ impl Executor {
             relay,
             http: reqwest::Client::new(),
             signer: crate::receipt::Signer::from_env(),
+            max_timeout_secs: DEFAULT_MAX_TIMEOUT_SECS,
         })
+    }
+
+    /// Set the daemon-wide bound on per-script timeouts (`--max-timeout-secs`).
+    pub fn with_max_timeout_secs(mut self, secs: u64) -> Self {
+        self.max_timeout_secs = secs.max(1);
+        self
+    }
+
+    /// The daemon-wide bound on per-script timeouts (reported by whoami, enforced at upload).
+    pub fn max_timeout_secs(&self) -> u64 {
+        self.max_timeout_secs
     }
 
     /// Record terminal metrics and POST the outcome to the relay (mesh egress). The
@@ -272,14 +318,32 @@ impl Executor {
         cpu_limit: Option<f64>,
         input_blobs: Option<&serde_json::Value>,
         capture_output: bool,
+        timeout_secs: Option<i64>,
     ) {
         let t0 = std::time::Instant::now();
         metrics::gauge!("dokan_runs_active").increment(1.0);
         let mut terminal = "succeeded";
-        if let Err(e) = self
-            .run_inner(db, run_id, runtime, source, input, agent_id, network, mem_limit_mb, cpu_limit, input_blobs, capture_output)
-            .await
-        {
+        let limit =
+            Duration::from_secs(effective_timeout_secs(timeout_secs, self.max_timeout_secs));
+        // Lease heartbeat for the whole lifetime of the job (container acquire → finalize), so
+        // the orphan reaper never hands a live long job to a second worker. The guard aborts the
+        // beat when this future ends OR is dropped (cancel-safe: no beat outlives its run).
+        let _beat = AbortOnDrop({
+            let db = db.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(RUN_HEARTBEAT_SECS));
+                loop {
+                    tick.tick().await;
+                    if let Err(e) = db.touch_run(run_id).await {
+                        tracing::warn!(run_id, "run heartbeat failed: {e}");
+                    }
+                }
+            })
+        });
+        let outcome = self
+            .run_inner(db, run_id, runtime, source, input, agent_id, network, mem_limit_mb, cpu_limit, input_blobs, capture_output, limit)
+            .await;
+        if let Err(e) = outcome {
             // Err here = dokan-side failure (could not execute) — distinct from a script
             // that ran and exited nonzero, which finishes inside exec_job.
             metrics::counter!("dokan_run_internal_errors_total").increment(1);
@@ -319,6 +383,7 @@ impl Executor {
         cpu_limit: Option<f64>,
         input_blobs: Option<&serde_json::Value>,
         capture_output: bool,
+        limit: Duration,
     ) -> Result<()> {
         let (image, interp) =
             runtime_spec(runtime).ok_or_else(|| anyhow!("unknown runtime: {runtime}"))?;
@@ -369,7 +434,20 @@ impl Executor {
         // plain bind dir, readable without a docker archive call — and folds the captured map
         // into the receipt before the dir is cleaned up below.
         let result = self
-            .exec_job(db, run_id, &cid, image, interp, source, input, agent_id, network, input_blobs, output_dir.as_deref())
+            .exec_job(
+                db,
+                run_id,
+                &cid,
+                image,
+                interp,
+                source,
+                input,
+                agent_id,
+                network,
+                input_blobs,
+                output_dir.as_deref(),
+                limit,
+            )
             .await;
 
         // Run clean, discard — never reuse a dirty container.
@@ -398,6 +476,7 @@ impl Executor {
         network: bool,
         input_blobs: Option<&serde_json::Value>,
         output_dir: Option<&str>,
+        limit: Duration,
     ) -> Result<()> {
         let src_b64 = base64::engine::general_purpose::STANDARD.encode(source);
         // GAP-2: before exec'ing the job, materialize each injected secret as a file under the
@@ -476,24 +555,29 @@ impl Executor {
             StartExecResults::Detached => return Err(anyhow!("exec detached unexpectedly")),
         };
 
-        let last_seq = match tokio::time::timeout(
-            Duration::from_secs(DEFAULT_TIMEOUT_SECS),
-            pump_logs(db, run_id, output, &secret_vals),
-        )
-        .await
-        {
-            Ok(r) => r?,
-            Err(_) => {
-                metrics::counter!("dokan_run_timeouts_total").increment(1);
-                let _ = self.docker.kill_container(cid, None).await;
-                let s = db.max_log_seq(run_id).await.unwrap_or(0) + 1;
-                db.append_log(run_id, s, "stderr", "dokan: timeout, container killed")
+        let last_seq =
+            match tokio::time::timeout(limit, pump_logs(db, run_id, output, &secret_vals)).await {
+                Ok(r) => r?,
+                Err(_) => {
+                    metrics::counter!("dokan_run_timeouts_total").increment(1);
+                    let _ = self.docker.kill_container(cid, None).await;
+                    let s = db.max_log_seq(run_id).await.unwrap_or(0) + 1;
+                    db.append_log(
+                        run_id,
+                        s,
+                        "stderr",
+                        &format!(
+                            "dokan: timeout after {} s, container killed",
+                            limit.as_secs()
+                        ),
+                    )
                     .await?;
-                db.finish_run(run_id, "failed", None, Some("timeout")).await?;
-                self.finalize(run_id, "failed", None, None).await;
-                return Ok(());
-            }
-        };
+                    db.finish_run(run_id, "failed", None, Some("timeout"))
+                        .await?;
+                    self.finalize(run_id, "failed", None, None).await;
+                    return Ok(());
+                }
+            };
         let (last_seq, result_raw) = last_seq;
         let _ = last_seq;
         // Parse the structured result (best-effort: non-JSON is wrapped as a string so the
@@ -855,7 +939,37 @@ fn secret_allowed(name: &str, allow: Option<&[String]>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{redact_secrets, secret_allowed};
+    use super::{
+        DEFAULT_TIMEOUT_SECS, RUN_HEARTBEAT_SECS, RUN_LEASE_SECS, effective_timeout_secs,
+        redact_secrets, secret_allowed,
+    };
+
+    #[test]
+    fn timeout_defaults_to_300_when_unset() {
+        assert_eq!(effective_timeout_secs(None, 3600), DEFAULT_TIMEOUT_SECS);
+        // Garbage stored values fall back to the default, never to 0 (= instant kill).
+        assert_eq!(effective_timeout_secs(Some(0), 3600), DEFAULT_TIMEOUT_SECS);
+        assert_eq!(effective_timeout_secs(Some(-5), 3600), DEFAULT_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn timeout_uses_script_value_within_max() {
+        assert_eq!(effective_timeout_secs(Some(3600), 3600), 3600);
+        assert_eq!(effective_timeout_secs(Some(30), 3600), 30);
+    }
+
+    #[test]
+    fn timeout_is_clamped_to_daemon_max() {
+        // A max lowered after upload still caps the stored value, and the default too.
+        assert_eq!(effective_timeout_secs(Some(7200), 3600), 3600);
+        assert_eq!(effective_timeout_secs(None, 120), 120);
+        assert_eq!(effective_timeout_secs(Some(10), 0), 1);
+    }
+
+    #[test]
+    fn heartbeat_is_well_inside_the_lease() {
+        const { assert!(RUN_HEARTBEAT_SECS * 10 <= RUN_LEASE_SECS) };
+    }
 
     #[test]
     fn redacts_each_secret_occurrence() {
