@@ -22,7 +22,11 @@ Logs are CSV-ish `seq|stream|text`, error-first. Don't re-read from cursor 0 —
 
 ## Exit code = verdict (monitors, read this)
 
-A run that **ran to completion and exited nonzero is a deterministic verdict — NOT a crash, and NOT retried.** So a monitor/gate can legitimately `exit 1` / `exit 2` to signal "found something" and it runs **exactly once** (no 3× reprint). Only genuine infra failures (NULL exit: container vanished / timeout) retry. You no longer need a monitor(exit0)/strict(exit1) split.
+A run that **ran to completion and exited nonzero is a deterministic verdict — NOT a crash, and NOT retried.** So a monitor/gate can legitimately `exit 1` / `exit 2` to signal "found something" and it runs **exactly once** (no 3× reprint). Only genuine infra failures (NULL exit: container vanished / timeout) retry — except the timeout of a script that set its own `timeout_secs`, which is final. You no longer need a monitor(exit0)/strict(exit1) split.
+
+## Long jobs
+
+Each job is killed after **300 s** by default. For a longer job: `upload_script(..., timeout_secs=1800)`, up to the daemon max (`whoami` → `limits.max_timeout_secs`, 3600 by default; above it the upload is refused with `invalid_timeout`). The lease is renewed every 15 s while the job runs, so a live long job is never re-run by the reaper. Emit `::dokan:progress::` lines so the operator sees where it is.
 
 `exit 137` = the job hit the memory cap (cgroup OOM). Per-job caps default **1024 MiB / 2.0 CPU**; ask the operator to raise `--mem-limit-mb` / `--cpu-limit` for heavy jobs.
 
@@ -65,7 +69,9 @@ Each step is one container run, seeing `{flow_input, deps:{upstream_id: last_std
 
 ## Schedule
 
-`schedule(script_id, cron, input?)` — **6-field cron, leading seconds** (`0 */5 * * * *` = every 5 min). A 5-field expression is **rejected loudly** (it would otherwise silently never fire). Each tick enqueues a run. `list_schedules()` shows id + **script name** + cron. `unschedule(schedule_id)` stops a cron (always clean up test crons).
+`schedule(script_id, cron, input?)` — **6-field cron, leading seconds** (`0 */5 * * * *` = every 5 min). A 5-field expression is **rejected loudly** (it would otherwise silently never fire). Each tick enqueues a run. `list_schedules()` shows id + **script name** + cron + `next_fire`. `unschedule(schedule_id)` stops a cron (always clean up test crons).
+
+A tick takes `run_script`'s options: `agent_id` (your scoped secrets + your quota, checked at every tick), `files={"code.tar.gz": "<handle>"}` (read-only at `/input`), `capture_output`, `idempotency=true` (one run per tick across daemons). `timezone="Europe/Zurich"` reads the cron in local time, DST-aware (`0 30 7 * * *` = 07:30 in Geneva all year); omit for UTC. No update: after a deploy that changes a blob, `unschedule` + `schedule` again.
 
 ## Find existing work
 

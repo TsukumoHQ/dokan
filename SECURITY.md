@@ -7,8 +7,8 @@ dokan is in active `0.x` development. Security fixes land on the latest
 
 | Version | Supported |
 |---------|-----------|
-| 0.4.x   | ✅ latest  |
-| < 0.4   | ❌ (superseded) |
+| 0.5.x   | ✅ latest  |
+| < 0.5   | ❌ (superseded) |
 
 ## Reporting a vulnerability
 
@@ -43,6 +43,14 @@ that and are **not** vulnerabilities:
   **defense-in-depth on a trusted box, not a guarantee** against a malicious caller.
   Only run scripts you trust on a box that holds secrets. (True non-spoofable
   isolation = per-agent auth tokens, a planned upgrade.)
+- **A schedule with an `agent_id` is a stored `run_script` with that `agent_id`,
+  no more.** Each tick gets exactly what a direct run would: the global secrets plus
+  that agent's scoped secrets, filtered by the script's allowlist, and the same
+  per-agent concurrency and compute quota, checked at every tick (a refused tick is
+  recorded as a failed run with the reason). Its `files` are validated when the
+  schedule is created. Like `run_script`, `agent_id` is unauthenticated: whoever can
+  call `schedule` can name any agent, which is the same exposure as `run_script`
+  on this single-tenant control plane.
 - **The MCP control plane is unauthenticated** and binds to `127.0.0.1:8088`
   by default. It assumes anything that can reach it is already trusted. **Do
   not expose `:8088` to an untrusted network** — put it behind your own
@@ -63,7 +71,10 @@ that and are **not** vulnerabilities:
   (`cap_drop: ALL`) and **`no-new-privileges`**. The only writable surfaces are a
   `/tmp` tmpfs, an opt-in `/output` bind, and the `/run/secrets` tmpfs.
 - **Resource caps.** Per-job CPU and memory limits (cgroup) and a hard
-  timeout — a runaway or OOM job is killed, not allowed to starve the host.
+  timeout — a runaway or OOM job is killed, not allowed to starve the host. The
+  timeout is 300 s by default; a script may ask for more, never beyond the
+  daemon's `DOKAN_MAX_TIMEOUT_SECS` (default 3600 s), which bounds how long a single
+  job can hold a container.
 - **Write-only secrets.** Secret values are never returned by any MCP tool,
   never logged, and not echoed back; `list_secrets` exposes names only.
 - **Tamper-evident, publicly-verifiable run receipts.** Completed runs carry a

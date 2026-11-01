@@ -97,6 +97,9 @@ The engine gives you:
 
 ### Schedules & triggers
 - **`schedule(script_id, cron)`** — **6-field cron with leading seconds** (`0 */5 * * * *` = every 5 min). A 5-field expression is rejected loudly rather than silently never firing. Each tick enqueues a run.
+  - A tick takes the same options as `run_script`: `agent_id` (the agent's scoped secrets, and its quota checked at every tick), `files` (blobs mounted read-only at `/input`), `capture_output`, plus `idempotency=true` for one run per tick when several daemons share the database.
+  - `timezone="Europe/Zurich"` (any IANA name) reads the cron as local wall-clock time, DST-aware; without it, UTC. `0 30 7 * * *` in `Europe/Zurich` fires at 07:30 in Geneva all year (06:30 UTC in winter, 05:30 UTC in summer).
+  - No in-place update: `unschedule` then `schedule` to change one.
 - **`create_webhook`** — an external `POST /hook/<token>` enqueues a script or flow with the request body as input. The unguessable URL token is the auth (the endpoint sits outside the bearer gate).
 
 ### Secrets
@@ -104,6 +107,8 @@ The engine gives you:
 
 ### Resource limits
 Per-job caps default to **1024 MiB / 2.0 CPU**, set globally on the daemon. A single heavier script can override them — `upload_script(..., mem_limit_mb, cpu_limit)` — and only that script runs on a dedicated container with the raised cap; everything else is untouched.
+
+Each job has a wall-clock limit of **300 s** by default. A long job sets its own: `upload_script(..., timeout_secs=3600)`, up to the daemon's `--max-timeout-secs` / `DOKAN_MAX_TIMEOUT_SECS` (default **3600 s**; `whoami` reports both). While a job runs, the executor renews its lease every 15 s, so the orphan reaper never re-runs a live long job; a timeout of a script that set its own `timeout_secs` is final (not retried).
 
 ### Structured results & stateful monitors
 A job prints a line `::dokan:result:: {json}` on stdout; dokan captures the **last** one as the run's structured result. It is returned by `wait_for`/`read_logs` and POSTed to the relay on completion — so a monitor emits a finding and the agent reacts **event-driven**, no polling.
@@ -123,10 +128,10 @@ A `network=false` job is a **pure function of its inputs** — source + `DOKAN_I
 | Tool | Returns |
 |---|---|
 | search_script · list_scripts · get_script | ranked / listed IDs + 1-line desc; bodies only on request |
-| upload_script | script_id + version (flags: network, mem/cpu limit, feed_prev_result) |
+| upload_script | script_id + version (flags: network, mem/cpu limit, timeout_secs, feed_prev_result) |
 | run_script | run_id immediately, never blocks (input + `files` for /input artifacts) |
 | read_logs · wait_for | cursor logs / long-poll to terminal + tail + structured result |
-| schedule · list_schedules · unschedule | cron a script (6-field) |
+| schedule · list_schedules · unschedule | cron a script (6-field, optional IANA timezone) with run_script's agent_id / files / capture_output; next_fire |
 | compose_flow · run_flow · get_flow_run | declarative DAG; per-step status (map children collapsed to a count) |
 | create_webhook · list_webhooks · delete_webhook | inbound HTTP trigger to a script/flow |
 | upload_blob · download_blob · list_blobs | content-addressed input/output files |
@@ -138,7 +143,7 @@ A `network=false` job is a **pure function of its inputs** — source + `DOKAN_I
 Server instructions ship in-band so the agent self-limits.
 
 ## Status
-**v0.4.x — beta / preview.** Active development, built and run in production by the team that makes it (we run our own agent fleet's automation on dokan). **Ready for: demos, design partners, technical early adopters.** Not yet turnkey multi-tenant enterprise (no SSO/RBAC/HA; the MCP control plane is unauthenticated + single-tenant — see [SECURITY.md](SECURITY.md)). Honest about where it is.
+**v0.5.x — beta / preview.** Active development, built and run in production by the team that makes it (we run our own agent fleet's automation on dokan). **Ready for: demos, design partners, technical early adopters.** Not yet turnkey multi-tenant enterprise (no SSO/RBAC/HA; the MCP control plane is unauthenticated + single-tenant — see [SECURITY.md](SECURITY.md)). Honest about where it is.
 
 ## License
 Apache-2.0. Use it, embed it, build on it.

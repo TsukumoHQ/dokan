@@ -8,6 +8,51 @@ from `0.1.0` onward.
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-11-02
+
+Long scheduled jobs: a job that runs 30 minutes every morning, as an agent, with its code
+mounted from a blob, at a local wall-clock time.
+
+### Added
+- **Per-script timeout.** `upload_script(..., timeout_secs)` sets the job's wall-clock limit
+  (stored in `scripts.timeout_secs`, shown by `get_script` and the cockpit). Bounded by a new
+  daemon setting `--max-timeout-secs` / `DOKAN_MAX_TIMEOUT_SECS` (default **3600 s**): a larger
+  value is refused with `invalid_timeout`, and limits are clamped again at exec time. `whoami`
+  reports `limits.default_timeout_secs` (300) and `limits.max_timeout_secs`.
+- **Schedules take run_script's options.** `schedule(..., agent_id, files, capture_output,
+  idempotency)` stores them on the schedule and applies them to every tick: the agent's scoped
+  secrets and quota, input blobs mounted read-only at `/input`, a captured `/output`, and an
+  optional per-tick key `schedule:<id>:<tick epoch>` so daemons sharing one database enqueue a
+  single run per tick. Files are validated at creation (unknown handle → no schedule).
+- **Time zone per schedule.** `schedule(..., timezone="Europe/Zurich")` (any IANA name) reads
+  the cron fields as local wall-clock time. DST follows croner's OCPS rules: a fixed time in the
+  spring-forward gap fires right after the gap, a fixed time repeated by the fall-back overlap
+  fires once. `schedule` and `list_schedules` return `next_fire` (UTC); the cockpit shows it.
+
+### Changed
+- **Run lease = heartbeat.** The executor bumps `runs.heartbeat_at` every 15 s while a job runs,
+  and the orphan reaper reclaims a `running` run only when its heartbeat (or `started_at`, for
+  rows from an older executor) is older than 600 s. A live long job is no longer handed to a
+  second worker after 10 minutes; a dead worker's run is still reclaimed one lease later.
+- A timeout of a script that declared its own `timeout_secs` is **final** (one attempt). A
+  script without one keeps the previous behavior (a timeout is retried as an infra failure).
+- A tick of a schedule with an `agent_id` passes the same quota check as `run_script`; a refused
+  tick is recorded as a failed, never-started run whose `error` gives the reason.
+- The blob GC keeps blobs mounted by an enabled schedule.
+- `schedule` parses the cron before storing it, so an unparsable expression no longer leaves an
+  enabled row behind.
+
+### Notes
+- Zoned schedules tick on dokan's own loop (croner + chrono-tz), not on tokio-cron-scheduler's
+  `new_async_tz`, which freezes the UTC offset when the job is created and so drifts by one hour
+  across DST. UTC schedules (no `timezone`) keep the tokio-cron-scheduler path unchanged.
+- Migration is additive and idempotent (`ADD COLUMN IF NOT EXISTS`, nullable or default false):
+  existing scripts keep 300 s, existing schedules keep UTC, no agent, no files.
+- There is no `update_schedule`: to change a schedule (new code blob after a deploy),
+  `unschedule` then `schedule` again.
+
+[0.5.0]: https://github.com/TsukumoHQ/dokan/releases/tag/v0.5.0
+
 ## [0.2.1] — 2026-06-26
 
 ### Added

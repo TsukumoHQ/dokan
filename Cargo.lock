@@ -1005,7 +1005,7 @@ dependencies = [
 
 [[package]]
 name = "dokan"
-version = "0.4.3"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "axum",
