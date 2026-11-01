@@ -33,6 +33,15 @@ pub const RUN_LEASE_SECS: u64 = DEFAULT_TIMEOUT_SECS * 2;
 /// Heartbeat period for a running job (well inside `RUN_LEASE_SECS`: ~40 missed beats).
 pub const RUN_HEARTBEAT_SECS: u64 = 15;
 
+/// Aborts a background task when dropped (the run heartbeat).
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// The wall-clock limit a job actually gets: the script's own `timeout_secs` (or the default),
 /// clamped to [1, max]. Pure — unit-tested.
 pub fn effective_timeout_secs(script_timeout: Option<i64>, max_secs: u64) -> u64 {
@@ -317,8 +326,9 @@ impl Executor {
         let limit =
             Duration::from_secs(effective_timeout_secs(timeout_secs, self.max_timeout_secs));
         // Lease heartbeat for the whole lifetime of the job (container acquire → finalize), so
-        // the orphan reaper never hands a live long job to a second worker. Aborted below.
-        let beat = {
+        // the orphan reaper never hands a live long job to a second worker. The guard aborts the
+        // beat when this future ends OR is dropped (cancel-safe: no beat outlives its run).
+        let _beat = AbortOnDrop({
             let db = db.clone();
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(Duration::from_secs(RUN_HEARTBEAT_SECS));
@@ -329,24 +339,10 @@ impl Executor {
                     }
                 }
             })
-        };
+        });
         let outcome = self
-            .run_inner(
-                db,
-                run_id,
-                runtime,
-                source,
-                input,
-                agent_id,
-                network,
-                mem_limit_mb,
-                cpu_limit,
-                input_blobs,
-                capture_output,
-                limit,
-            )
+            .run_inner(db, run_id, runtime, source, input, agent_id, network, mem_limit_mb, cpu_limit, input_blobs, capture_output, limit)
             .await;
-        beat.abort();
         if let Err(e) = outcome {
             // Err here = dokan-side failure (could not execute) — distinct from a script
             // that ran and exited nonzero, which finishes inside exec_job.
