@@ -93,23 +93,33 @@ impl Worker {
                                 job.cpu_limit,
                                 job.input_blobs.as_ref(),
                                 job.capture_output,
+                                job.timeout_secs,
                             )
                             .await;
                             // Retry ONLY genuine infra/internal failures. A run that
                             // produced an exit_code ran to completion — its nonzero is a
                             // deterministic verdict (a monitor/gate finding), not a crash;
                             // retrying would reprint findings and waste compute. Only a
-                            // NULL exit_code (couldn't execute / timeout) is transient.
-                            if let Ok(Some((status, exit_code))) =
-                                db.run_outcome(job.run_id).await
+                            // NULL exit_code (couldn't execute / timeout) is transient —
+                            // except a timeout of a script that declared its own
+                            // `timeout_secs`: its author sized that limit, so hitting it is
+                            // final (re-running a 1-hour job three times is not a retry).
+                            if let Ok(Some((status, exit_code))) = db.run_outcome(job.run_id).await
                                 && status == "failed"
-                                    && exit_code.is_none()
-                                    && attempt < MAX_ATTEMPTS
-                                {
-                                    tracing::warn!(run_id = job.run_id, attempt, "retrying (infra failure)");
-                                    metrics::counter!("dokan_runs_retried_total").increment(1);
-                                    let _ = db.requeue(job.run_id).await;
-                                }
+                                && exit_code.is_none()
+                                && attempt < MAX_ATTEMPTS
+                                && !(job.timeout_secs.is_some()
+                                    && db.run_error(job.run_id).await.ok().flatten().as_deref()
+                                        == Some("timeout"))
+                            {
+                                tracing::warn!(
+                                    run_id = job.run_id,
+                                    attempt,
+                                    "retrying (infra failure)"
+                                );
+                                metrics::counter!("dokan_runs_retried_total").increment(1);
+                                let _ = db.requeue(job.run_id).await;
+                            }
                         });
                     }
                     Ok(None) => {

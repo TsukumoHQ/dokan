@@ -42,6 +42,8 @@ pub struct Script {
     /// Opt-in: feed the previous run's structured result into the next run as
     /// DOKAN_INPUT.prev_result (stateful monitors on the stateless runtime).
     pub feed_prev_result: bool,
+    /// Per-script wall-clock limit (seconds); None = the executor default (300 s).
+    pub timeout_secs: Option<i64>,
     pub version: i32,
     pub created_at: DateTime<Utc>,
 }
@@ -120,6 +122,7 @@ pub struct ScriptFull {
     pub mem_limit_mb: Option<i64>,
     pub cpu_limit: Option<f64>,
     pub feed_prev_result: bool,
+    pub timeout_secs: Option<i64>,
 }
 
 /// Inventory row of the content-addressed blob store (no bytes) — for the Artifacts panel
@@ -157,6 +160,8 @@ pub struct ClaimedJob {
     /// as a content-addressed blob after exec (run artifacts — output files). Forces the
     /// one-off container path (like input files / cap overrides). false = warm path unchanged.
     pub capture_output: bool,
+    /// Per-script wall-clock limit (seconds); None = the executor default.
+    pub timeout_secs: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -189,6 +194,28 @@ pub struct Schedule {
     pub script_name: String,
     pub cron: String,
     pub input: serde_json::Value,
+    /// Agent every tick runs as (provenance, scoped secrets, quota). None = no agent (legacy).
+    pub agent_id: Option<String>,
+    /// { "<dest-name>": "<sha>" } materialized read-only at /input on every tick.
+    pub input_blobs: Option<serde_json::Value>,
+    /// Mount a writable /output and capture its files on every tick.
+    pub capture_output: bool,
+    /// Enqueue each tick with the key `schedule:<id>:<tick epoch>` (one run per tick even when
+    /// several co-located daemons tick the same schedule).
+    pub idempotency: bool,
+    /// IANA zone the cron fields are read in. None = UTC.
+    pub timezone: Option<String>,
+}
+
+/// Options a schedule carries onto every run it enqueues (mirrors run_script). Default = the
+/// legacy schedule: no agent, no files, no /output, no tick key, UTC.
+#[derive(Debug, Clone, Default)]
+pub struct ScheduleOpts {
+    pub agent_id: Option<String>,
+    pub input_blobs: Option<serde_json::Value>,
+    pub capture_output: bool,
+    pub idempotency: bool,
+    pub timezone: Option<String>,
 }
 
 /// Outcome of `delete_script`.
@@ -205,6 +232,33 @@ pub struct LogLine {
     pub seq: i64,
     pub stream: String,
     pub line: String,
+}
+
+/// Shared projection for the schedule readers (one column list, one row mapper). A macro so
+/// each query stays a `&'static str` literal via `concat!`.
+macro_rules! schedule_select {
+    () => {
+        "SELECT sc.id, sc.script_id, s.name AS script_name, sc.cron, sc.input, \
+             sc.agent_id, sc.input_blobs, sc.capture_output, sc.idempotency, sc.timezone \
+         FROM schedules sc JOIN scripts s ON s.id = sc.script_id"
+    };
+}
+
+fn schedule_from_row(r: sqlx::postgres::PgRow) -> Schedule {
+    Schedule {
+        id: r.get("id"),
+        script_id: r.get("script_id"),
+        script_name: r.get("script_name"),
+        cron: r.get("cron"),
+        input: r
+            .get::<Option<serde_json::Value>, _>("input")
+            .unwrap_or(serde_json::json!({})),
+        agent_id: r.get("agent_id"),
+        input_blobs: r.get("input_blobs"),
+        capture_output: r.get("capture_output"),
+        idempotency: r.get("idempotency"),
+        timezone: r.get("timezone"),
+    }
 }
 
 impl Db {
@@ -254,12 +308,13 @@ impl Db {
         mem_limit_mb: Option<i64>,
         cpu_limit: Option<f64>,
         feed_prev_result: bool,
+        timeout_secs: Option<i64>,
         embedding: Option<Vec<f32>>,
     ) -> Result<(i64, i32)> {
         let vec = embedding.map(pgvector::Vector::from);
         let row = sqlx::query(
-            "INSERT INTO scripts (name, runtime, source, description, created_by, network, mem_limit_mb, cpu_limit, feed_prev_result, embedding) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id, version",
+            "INSERT INTO scripts (name, runtime, source, description, created_by, network, mem_limit_mb, cpu_limit, feed_prev_result, embedding, timeout_secs) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id, version",
         )
         .bind(name)
         .bind(runtime)
@@ -271,6 +326,7 @@ impl Db {
         .bind(cpu_limit)
         .bind(feed_prev_result)
         .bind(vec)
+        .bind(timeout_secs)
         .fetch_one(&self.pool)
         .await?;
         Ok((row.get("id"), row.get("version")))
@@ -311,7 +367,7 @@ impl Db {
     pub async fn get_script(&self, id: i64) -> Result<Option<Script>> {
         let row = sqlx::query(
             "SELECT id, name, runtime, source, description, created_by, network, \
-                    mem_limit_mb, cpu_limit, feed_prev_result, version, created_at \
+                    mem_limit_mb, cpu_limit, feed_prev_result, timeout_secs, version, created_at \
              FROM scripts WHERE id = $1",
         )
         .bind(id)
@@ -328,6 +384,7 @@ impl Db {
             mem_limit_mb: r.get("mem_limit_mb"),
             cpu_limit: r.get("cpu_limit"),
             feed_prev_result: r.get("feed_prev_result"),
+            timeout_secs: r.get("timeout_secs"),
             version: r.get("version"),
             created_at: r.get("created_at"),
         }))
@@ -403,7 +460,8 @@ impl Db {
             .fetch_one(&self.pool)
             .await?;
         let rows = sqlx::query(
-            "SELECT id, name, runtime, description, network, mem_limit_mb, cpu_limit, feed_prev_result \
+            "SELECT id, name, runtime, description, network, mem_limit_mb, cpu_limit, feed_prev_result, \
+                    timeout_secs \
              FROM scripts ORDER BY id DESC LIMIT $1",
         )
         .bind(limit)
@@ -420,6 +478,7 @@ impl Db {
                 mem_limit_mb: r.get("mem_limit_mb"),
                 cpu_limit: r.get("cpu_limit"),
                 feed_prev_result: r.get("feed_prev_result"),
+                timeout_secs: r.get("timeout_secs"),
             })
             .collect();
         Ok((out, total))
@@ -521,13 +580,14 @@ impl Db {
         mem_limit_mb: Option<i64>,
         cpu_limit: Option<f64>,
         feed_prev_result: bool,
+        timeout_secs: Option<i64>,
         embedding: Option<Vec<f32>>,
     ) -> Result<i32> {
         let vec = embedding.map(pgvector::Vector::from);
         let version: i32 = sqlx::query_scalar(
             "UPDATE scripts SET runtime = $2, source = $3, description = $4, created_by = $5, \
                  network = $6, mem_limit_mb = $7, cpu_limit = $8, feed_prev_result = $9, \
-                 embedding = $10, version = version + 1 WHERE id = $1 RETURNING version",
+                 embedding = $10, timeout_secs = $11, version = version + 1 WHERE id = $1 RETURNING version",
         )
         .bind(id)
         .bind(runtime)
@@ -539,6 +599,7 @@ impl Db {
         .bind(cpu_limit)
         .bind(feed_prev_result)
         .bind(vec)
+        .bind(timeout_secs)
         .fetch_one(&self.pool)
         .await?;
         Ok(version)
@@ -562,14 +623,15 @@ impl Db {
         mem_limit_mb: Option<i64>,
         cpu_limit: Option<f64>,
         feed_prev_result: bool,
+        timeout_secs: Option<i64>,
     ) -> Result<bool> {
         let n = sqlx::query(
             "UPDATE scripts SET runtime = $2, description = $3, created_by = $4, network = $5, \
-                 mem_limit_mb = $6, cpu_limit = $7, feed_prev_result = $8 \
+                 mem_limit_mb = $6, cpu_limit = $7, feed_prev_result = $8, timeout_secs = $9 \
              WHERE id = $1 AND (runtime IS DISTINCT FROM $2 OR description IS DISTINCT FROM $3 \
                  OR created_by IS DISTINCT FROM $4 OR network IS DISTINCT FROM $5 \
                  OR mem_limit_mb IS DISTINCT FROM $6 OR cpu_limit IS DISTINCT FROM $7 \
-                 OR feed_prev_result IS DISTINCT FROM $8)",
+                 OR feed_prev_result IS DISTINCT FROM $8 OR timeout_secs IS DISTINCT FROM $9)",
         )
         .bind(id)
         .bind(runtime)
@@ -579,6 +641,7 @@ impl Db {
         .bind(mem_limit_mb)
         .bind(cpu_limit)
         .bind(feed_prev_result)
+        .bind(timeout_secs)
         .execute(&self.pool)
         .await?;
         Ok(n.rows_affected() > 0)
@@ -968,7 +1031,8 @@ impl Db {
     }
 
     /// Retention GC for the content-addressed blob store: delete blobs that NO run references
-    /// (via `input_blobs` or `output_blobs`) AND whose `last_used_at` is older than `days`.
+    /// (via `input_blobs` or `output_blobs`), that no ENABLED schedule mounts (its next tick
+    /// needs the bytes), AND whose `last_used_at` is older than `days`.
     /// The TTL guards a blob uploaded ahead of its run — `put_blob`/`get_blob` stamp
     /// `last_used_at = now()`, so a fresh upload is never reclaimed before it is attached.
     /// Run AFTER `gc_old` in a sweep so blobs orphaned by a just-deleted run become
@@ -982,7 +1046,10 @@ impl Db {
                  WHERE e.value = b.sha) \
                AND NOT EXISTS ( \
                  SELECT 1 FROM runs r, jsonb_each_text(coalesce(r.output_blobs, '{}'::jsonb)) e \
-                 WHERE e.value = b.sha)",
+                 WHERE e.value = b.sha) \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM schedules sc, jsonb_each_text(coalesce(sc.input_blobs, '{}'::jsonb)) e \
+                 WHERE sc.enabled AND e.value = b.sha)",
         )
         .bind(days * 86400.0)
         .execute(&self.pool)
@@ -1156,7 +1223,7 @@ impl Db {
                  WHERE r.status = 'pending' AND s.runtime = ANY($1) \
                  ORDER BY r.id FOR UPDATE OF r SKIP LOCKED LIMIT 1 \
              ) \
-             UPDATE runs SET status = 'running', started_at = now() \
+             UPDATE runs SET status = 'running', started_at = now(), heartbeat_at = now() \
              FROM c WHERE runs.id = c.id \
              RETURNING runs.id, runs.script_id, runs.input, runs.agent_id, runs.input_blobs, \
                  runs.capture_output, \
@@ -1165,7 +1232,8 @@ impl Db {
                  (SELECT network FROM scripts WHERE id = runs.script_id) AS network, \
                  (SELECT mem_limit_mb FROM scripts WHERE id = runs.script_id) AS mem_limit_mb, \
                  (SELECT cpu_limit FROM scripts WHERE id = runs.script_id) AS cpu_limit, \
-                 (SELECT feed_prev_result FROM scripts WHERE id = runs.script_id) AS feed_prev_result",
+                 (SELECT feed_prev_result FROM scripts WHERE id = runs.script_id) AS feed_prev_result, \
+                 (SELECT timeout_secs FROM scripts WHERE id = runs.script_id) AS timeout_secs",
         )
         .bind(caps)
         .fetch_optional(&self.pool)
@@ -1183,6 +1251,7 @@ impl Db {
             feed_prev_result: r.get("feed_prev_result"),
             input_blobs: r.get::<Option<serde_json::Value>, _>("input_blobs"),
             capture_output: r.get("capture_output"),
+            timeout_secs: r.get("timeout_secs"),
         }))
     }
 
@@ -1198,27 +1267,77 @@ impl Db {
 
     /// Requeue a failed run for retry (back to pending).
     pub async fn requeue(&self, run_id: i64) -> Result<()> {
-        sqlx::query("UPDATE runs SET status = 'pending', started_at = NULL WHERE id = $1")
+        sqlx::query("UPDATE runs SET status = 'pending', started_at = NULL, heartbeat_at = NULL WHERE id = $1")
             .bind(run_id)
             .execute(&self.pool)
             .await?;
         Ok(())
     }
 
-    /// Reclaim runs orphaned by a dead worker: still `running` past `lease_secs`, which is
-    /// set well beyond the hard job timeout — a live worker always kills + finalizes by
-    /// then, so anything still running is owner-less. Lease-based, so concurrent healthy
-    /// workers are never disturbed. `mark_attempt` already counted the attempt, so the
-    /// worker's `MAX_ATTEMPTS` cap still bounds the requeue→fail loop. Returns reclaimed n.
+    /// Reclaim runs orphaned by a dead worker: still `running` with no heartbeat for
+    /// `lease_secs`. A live executor bumps `heartbeat_at` every few seconds for as long as the
+    /// job runs (`touch_run`), so a long job (per-script timeout up to the daemon max) is never
+    /// mistaken for an orphan and handed to a second worker; a dead worker stops beating and is
+    /// reclaimed one lease later. Rows from an executor that predates the heartbeat fall back to
+    /// `started_at` (the old rule). `mark_attempt` already counted the attempt, so the worker's
+    /// `MAX_ATTEMPTS` cap still bounds the requeue→fail loop. Returns reclaimed n.
     pub async fn reap_orphan_runs(&self, lease_secs: f64) -> Result<u64> {
         let r = sqlx::query(
-            "UPDATE runs SET status = 'pending', started_at = NULL \
-             WHERE status = 'running' AND started_at < now() - make_interval(secs => $1)",
+            "UPDATE runs SET status = 'pending', started_at = NULL, heartbeat_at = NULL \
+             WHERE status = 'running' \
+               AND COALESCE(heartbeat_at, started_at) < now() - make_interval(secs => $1)",
         )
         .bind(lease_secs)
         .execute(&self.pool)
         .await?;
         Ok(r.rows_affected())
+    }
+
+    /// Lease heartbeat for a running job (see `reap_orphan_runs`). Only touches a row that is
+    /// still `running`, so a beat racing the finish/cancel never resurrects anything.
+    pub async fn touch_run(&self, run_id: i64) -> Result<()> {
+        sqlx::query("UPDATE runs SET heartbeat_at = now() WHERE id = $1 AND status = 'running'")
+            .bind(run_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// The recorded error of a run (e.g. "timeout"), if any — a retry-decision input.
+    pub async fn run_error(&self, id: i64) -> Result<Option<String>> {
+        Ok(sqlx::query_scalar("SELECT error FROM runs WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?
+            .flatten())
+    }
+
+    /// Record a scheduled tick that was refused before enqueue (agent quota/budget): a
+    /// terminal `failed` run with NULL exit and the reason as `error`, so the refusal shows up
+    /// in list_runs (outcome=error) instead of vanishing. Never started → it costs no compute
+    /// and is not retried. With `idem_key`, a second daemon refusing the same tick is a no-op.
+    pub async fn insert_refused_run(
+        &self,
+        script_id: i64,
+        input: &serde_json::Value,
+        agent_id: Option<&str>,
+        reason: &str,
+        idem_key: Option<&str>,
+    ) -> Result<Option<i64>> {
+        let id: Option<i64> = sqlx::query_scalar(
+            "INSERT INTO runs (script_id, input, status, agent_id, error, finished_at, idempotency_key) \
+             VALUES ($1, $2, 'failed', $3, $4, now(), $5) \
+             ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING \
+             RETURNING id",
+        )
+        .bind(script_id)
+        .bind(input)
+        .bind(agent_id)
+        .bind(reason)
+        .bind(idem_key)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(id)
     }
 
     /// Fail runs stuck `pending` past `max_age_secs` — never claimed (no live worker serves
@@ -1245,37 +1364,43 @@ impl Db {
         script_id: i64,
         cron: &str,
         input: &serde_json::Value,
+        opts: &ScheduleOpts,
     ) -> Result<i64> {
         let id: i64 = sqlx::query_scalar(
-            "INSERT INTO schedules (script_id, cron, input) VALUES ($1, $2, $3) RETURNING id",
+            "INSERT INTO schedules (script_id, cron, input, agent_id, input_blobs, capture_output, \
+                 idempotency, timezone) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
         )
         .bind(script_id)
         .bind(cron)
         .bind(input)
+        .bind(opts.agent_id.as_deref())
+        .bind(opts.input_blobs.as_ref())
+        .bind(opts.capture_output)
+        .bind(opts.idempotency)
+        .bind(opts.timezone.as_deref())
         .fetch_one(&self.pool)
         .await?;
         Ok(id)
     }
 
+    /// One schedule by id (enabled or not), with its run options.
+    pub async fn get_schedule(&self, id: i64) -> Result<Option<Schedule>> {
+        let row = sqlx::query(concat!(schedule_select!(), " WHERE sc.id = $1"))
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(schedule_from_row))
+    }
+
     pub async fn enabled_schedules(&self) -> Result<Vec<Schedule>> {
-        let rows = sqlx::query(
-            "SELECT sc.id, sc.script_id, s.name AS script_name, sc.cron, sc.input \
-             FROM schedules sc JOIN scripts s ON s.id = sc.script_id \
-             WHERE sc.enabled = true ORDER BY sc.id",
-        )
+        let rows = sqlx::query(concat!(
+            schedule_select!(),
+            " WHERE sc.enabled = true ORDER BY sc.id"
+        ))
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| Schedule {
-                id: r.get("id"),
-                script_id: r.get("script_id"),
-                script_name: r.get("script_name"),
-                cron: r.get("cron"),
-                input: r.get::<Option<serde_json::Value>, _>("input")
-                    .unwrap_or(serde_json::json!({})),
-            })
-            .collect())
+        Ok(rows.into_iter().map(schedule_from_row).collect())
     }
 
     /// Enable/disable a schedule. Returns rows affected (0 = not found).
@@ -1289,24 +1414,13 @@ impl Db {
     }
 
     pub async fn list_schedules(&self) -> Result<Vec<Schedule>> {
-        let rows = sqlx::query(
-            "SELECT sc.id, sc.script_id, s.name AS script_name, sc.cron, sc.input \
-             FROM schedules sc JOIN scripts s ON s.id = sc.script_id \
-             WHERE sc.enabled = true ORDER BY sc.id DESC LIMIT 50",
-        )
+        let rows = sqlx::query(concat!(
+            schedule_select!(),
+            " WHERE sc.enabled = true ORDER BY sc.id DESC LIMIT 50"
+        ))
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| Schedule {
-                id: r.get("id"),
-                script_id: r.get("script_id"),
-                script_name: r.get("script_name"),
-                cron: r.get("cron"),
-                input: r.get::<Option<serde_json::Value>, _>("input")
-                    .unwrap_or(serde_json::json!({})),
-            })
-            .collect())
+        Ok(rows.into_iter().map(schedule_from_row).collect())
     }
 
     /// status -> count, for token-frugal `list_runs` aggregation.

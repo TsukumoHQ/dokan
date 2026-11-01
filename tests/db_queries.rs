@@ -17,7 +17,19 @@ async fn gc_old_deletes_terminal_runs_and_logs() -> anyhow::Result<()> {
 
     // A script + a finished run + a log line.
     let (sid, _v) = db
-        .insert_script("gc-test", "bash", "echo hi", Some("gc coverage"), None, true, None, None, false, None)
+        .insert_script(
+            "gc-test",
+            "bash",
+            "echo hi",
+            Some("gc coverage"),
+            None,
+            true,
+            None,
+            None,
+            false,
+            None,
+            None,
+        )
         .await?;
     let run_id = db.insert_run(sid, &serde_json::json!({}), None).await?;
     db.append_log(run_id, 0, "stdout", "a line").await?;
@@ -37,7 +49,9 @@ async fn webhook_insert_find_delete_roundtrip() -> anyhow::Result<()> {
     db.migrate().await?;
 
     let (sid, _v) = db
-        .insert_script("wh-db", "bash", "echo hi", None, None, true, None, None, false, None)
+        .insert_script(
+            "wh-db", "bash", "echo hi", None, None, true, None, None, false, None, None,
+        )
         .await?;
     let token = dokan::crypto::random_token();
     let id = db.insert_webhook(&token, "script", sid, Some("agent-x")).await?;
@@ -59,8 +73,16 @@ async fn webhook_insert_find_delete_roundtrip() -> anyhow::Result<()> {
 async fn list_scripts_enumerates_catalog() -> anyhow::Result<()> {
     let db = Db::connect(&db_url()).await?;
     db.migrate().await?;
-    let (a, _) = db.insert_script("cat-a", "bash", "echo a", None, None, true, None, None, false, None).await?;
-    let (b, _) = db.insert_script("cat-b", "python", "print(1)", None, None, true, None, None, false, None).await?;
+    let (a, _) = db
+        .insert_script(
+            "cat-a", "bash", "echo a", None, None, true, None, None, false, None, None,
+        )
+        .await?;
+    let (b, _) = db
+        .insert_script(
+            "cat-b", "python", "print(1)", None, None, true, None, None, false, None, None,
+        )
+        .await?;
 
     let (rows, total) = db.list_scripts(500).await?;
     assert!(total >= 2, "catalog counts all scripts");
@@ -73,7 +95,11 @@ async fn list_scripts_enumerates_catalog() -> anyhow::Result<()> {
 async fn fail_stale_pending_retires_zombies_but_spares_fresh() -> anyhow::Result<()> {
     let db = Db::connect(&db_url()).await?;
     db.migrate().await?;
-    let (sid, _) = db.insert_script("zombie", "bash", "echo z", None, None, true, None, None, false, None).await?;
+    let (sid, _) = db
+        .insert_script(
+            "zombie", "bash", "echo z", None, None, true, None, None, false, None, None,
+        )
+        .await?;
 
     // A fresh pending run is NOT retired by a generous timeout.
     let keep = db.insert_run(sid, &serde_json::json!({}), None).await?;
@@ -95,7 +121,9 @@ async fn last_result_feeds_next_run() -> anyhow::Result<()> {
 
     // A stateful monitor: feed_prev_result = true.
     let (sid, _v) = db
-        .insert_script("monitor", "bash", "echo hi", None, None, true, None, None, true, None)
+        .insert_script(
+            "monitor", "bash", "echo hi", None, None, true, None, None, true, None, None,
+        )
         .await?;
 
     // Run #1 emits a structured result {"state":"A"}.
@@ -125,7 +153,9 @@ async fn gc_old_keeps_fresh_terminal_runs() -> anyhow::Result<()> {
     db.migrate().await?;
 
     let (sid, _v) = db
-        .insert_script("gc-keep", "bash", "echo hi", None, None, true, None, None, false, None)
+        .insert_script(
+            "gc-keep", "bash", "echo hi", None, None, true, None, None, false, None, None,
+        )
         .await?;
     let run_id = db.insert_run(sid, &serde_json::json!({}), None).await?;
     db.finish_run(run_id, "succeeded", Some(0), None).await?;
@@ -183,7 +213,19 @@ async fn run_with_input_file_validates_and_persists_blobs() -> anyhow::Result<()
     let (sha, _) = db.put_blob(b"note body").await?;
     assert!(db.blob_exists(&sha).await?, "the file handle validates before a run is created");
     let (sid, _) = db
-        .insert_script("input-file-run", "bash", "cat /input/note.txt", None, None, true, None, None, false, None)
+        .insert_script(
+            "input-file-run",
+            "bash",
+            "cat /input/note.txt",
+            None,
+            None,
+            true,
+            None,
+            None,
+            false,
+            None,
+            None,
+        )
         .await?;
     let input_blobs = serde_json::json!({ "note.txt": sha });
     let run_id = db
@@ -212,7 +254,9 @@ async fn insert_run_idempotent_collapses_to_one_run() -> anyhow::Result<()> {
     db.migrate().await?;
 
     let (sid, _) = db
-        .insert_script("idem-run", "bash", "echo hi", None, None, true, None, None, false, None)
+        .insert_script(
+            "idem-run", "bash", "echo hi", None, None, true, None, None, false, None, None,
+        )
         .await?;
     let key = format!("idem-test-{}", dokan::crypto::random_token());
 
@@ -244,7 +288,19 @@ async fn insert_flow_run_idempotent_collapses_and_builds_steps_once() -> anyhow:
 
     // A real script id — flow_steps.script_id has an FK to scripts(id).
     let (script_id, _v) = db
-        .insert_script("idem-flow-step", "bash", "echo hi", None, None, true, None, None, false, None)
+        .insert_script(
+            "idem-flow-step",
+            "bash",
+            "echo hi",
+            None,
+            None,
+            true,
+            None,
+            None,
+            false,
+            None,
+            None,
+        )
         .await?;
     let spec = serde_json::json!({"steps": [{"id": "a", "script_id": script_id, "input": {}}]});
     let flow_id: i64 = sqlx::query_scalar("INSERT INTO flows (name, spec) VALUES ($1, $2) RETURNING id")
@@ -293,7 +349,19 @@ async fn gc_blobs_reclaims_only_orphaned_and_aged() -> anyhow::Result<()> {
 
     // Reference one blob from a run's input_blobs map.
     let (sid, _) = db
-        .insert_script("gc-blob-ref", "bash", "echo hi", None, None, true, None, None, false, None)
+        .insert_script(
+            "gc-blob-ref",
+            "bash",
+            "echo hi",
+            None,
+            None,
+            true,
+            None,
+            None,
+            false,
+            None,
+            None,
+        )
         .await?;
     let input_blobs = serde_json::json!({ "note.txt": referenced });
     db.insert_run_with_blobs(sid, &serde_json::json!({}), None, Some(&input_blobs), false).await?;
@@ -332,7 +400,9 @@ async fn idempotency_partial_unique_indexes_enforce_dedup_at_db_level() -> anyho
     // Behavioral proof on runs: a RAW duplicate insert (bypassing the app's ON CONFLICT) is
     // rejected by uq_runs_idempotency — so even a buggy/foreign writer can't create a dup.
     let (sid, _) = db
-        .insert_script("idem-idx", "bash", "echo hi", None, None, true, None, None, false, None)
+        .insert_script(
+            "idem-idx", "bash", "echo hi", None, None, true, None, None, false, None, None,
+        )
         .await?;
     let key = format!("idem-idx-{}", dokan::crypto::random_token());
     let (_id, created) = db
@@ -357,7 +427,9 @@ async fn flow_step_pagination_and_map_aggregation() -> anyhow::Result<()> {
     let db = Db::connect(&db_url()).await?;
     db.migrate().await?;
     let (sid, _) = db
-        .insert_script("flow-pg", "bash", "echo hi", None, None, true, None, None, false, None)
+        .insert_script(
+            "flow-pg", "bash", "echo hi", None, None, true, None, None, false, None, None,
+        )
         .await?;
     let spec = serde_json::json!({"steps": [
         {"id":"a","script_id": sid, "input": {}},
@@ -421,7 +493,9 @@ async fn gc_logs_reclaims_aged_logs_keeps_runs() -> anyhow::Result<()> {
     let db = Db::connect(&db_url()).await?;
     db.migrate().await?;
     let (sid, _) = db
-        .insert_script("gc-logs", "bash", "echo hi", None, None, true, None, None, false, None)
+        .insert_script(
+            "gc-logs", "bash", "echo hi", None, None, true, None, None, false, None, None,
+        )
         .await?;
     let run_id = db.insert_run(sid, &serde_json::json!({}), None).await?;
     db.finish_run(run_id, "succeeded", Some(0), None).await?;
@@ -448,7 +522,19 @@ async fn cancel_is_authoritative_over_a_racing_finish() -> anyhow::Result<()> {
     let db = Db::connect(&db_url()).await?;
     db.migrate().await?;
     let (sid, _) = db
-        .insert_script("cancel-race", "bash", "echo hi", None, None, true, None, None, false, None)
+        .insert_script(
+            "cancel-race",
+            "bash",
+            "echo hi",
+            None,
+            None,
+            true,
+            None,
+            None,
+            false,
+            None,
+            None,
+        )
         .await?;
 
     // Run A: cancel, then the killed exec tries to finish it failed → must STAY canceled.
@@ -477,7 +563,19 @@ async fn script_secrets_allowlist_round_trips_to_run() -> anyhow::Result<()> {
     let db = Db::connect(&db_url()).await?;
     db.migrate().await?;
     let (sid, _) = db
-        .insert_script("gap2-allow", "bash", "echo hi", None, None, true, None, None, false, None)
+        .insert_script(
+            "gap2-allow",
+            "bash",
+            "echo hi",
+            None,
+            None,
+            true,
+            None,
+            None,
+            false,
+            None,
+            None,
+        )
         .await?;
     // Default: no allowlist → back-compat (all secrets).
     let run0 = db.insert_run(sid, &serde_json::json!({}), None).await?;
@@ -491,5 +589,272 @@ async fn script_secrets_allowlist_round_trips_to_run() -> anyhow::Result<()> {
     db.set_script_secrets(sid, None).await?;
     let run2 = db.insert_run(sid, &serde_json::json!({}), None).await?;
     assert_eq!(db.run_secrets_allowlist(run2).await?, None, "cleared → no restriction");
+    Ok(())
+}
+
+#[tokio::test]
+async fn reaper_spares_a_live_long_run_and_reclaims_a_dead_one() -> anyhow::Result<()> {
+    // v0.5.0: the run lease is a heartbeat, not started_at — a job started an hour ago that is
+    // still beating must NOT be handed to a second worker; one whose heartbeat stopped must.
+    let db = Db::connect(&db_url()).await?;
+    db.migrate().await?;
+    // Unroutable runtime: no test daemon's worker will ever claim these rows.
+    let (sid, _) = db
+        .insert_script(
+            "lease-test",
+            "lease-none",
+            "true",
+            None,
+            None,
+            true,
+            None,
+            None,
+            false,
+            Some(3600),
+            None,
+        )
+        .await?;
+    let live = db.insert_run(sid, &serde_json::json!({}), None).await?;
+    let dead = db.insert_run(sid, &serde_json::json!({}), None).await?;
+    let legacy = db.insert_run(sid, &serde_json::json!({}), None).await?;
+    sqlx::query(
+        "UPDATE runs SET status = 'running', started_at = now() - interval '1 hour', \
+             heartbeat_at = CASE WHEN id = $1 THEN now() - interval '1 hour' \
+                                 WHEN id = $2 THEN NULL END \
+         WHERE id IN ($1, $2, $3)",
+    )
+    .bind(dead)
+    .bind(legacy)
+    .bind(live)
+    .execute(&db.pool)
+    .await?;
+    // The live job beats (touch_run is what the executor calls every RUN_HEARTBEAT_SECS).
+    db.touch_run(live).await?;
+
+    db.reap_orphan_runs(dokan::exec::RUN_LEASE_SECS as f64)
+        .await?;
+    assert_eq!(
+        db.run_status(live).await?.as_deref(),
+        Some("running"),
+        "live long run kept"
+    );
+    assert_eq!(
+        db.run_status(dead).await?.as_deref(),
+        Some("pending"),
+        "dead run reclaimed"
+    );
+    assert_eq!(
+        db.run_status(legacy).await?.as_deref(),
+        Some("pending"),
+        "no heartbeat → started_at rule"
+    );
+
+    // A beat never resurrects a row that is no longer running.
+    db.finish_run(live, "succeeded", Some(0), None).await?;
+    db.touch_run(live).await?;
+    assert_eq!(db.run_status(live).await?.as_deref(), Some("succeeded"));
+    for id in [dead, legacy] {
+        db.finish_run(id, "failed", None, Some("test cleanup"))
+            .await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn script_timeout_round_trips_through_claim() -> anyhow::Result<()> {
+    let db = Db::connect(&db_url()).await?;
+    db.migrate().await?;
+    let rt = format!("tmo-{}", dokan::crypto::random_token());
+    let (sid, _) = db
+        .insert_script(
+            "tmo",
+            &rt,
+            "true",
+            None,
+            None,
+            true,
+            None,
+            None,
+            false,
+            Some(1800),
+            None,
+        )
+        .await?;
+    assert_eq!(db.get_script(sid).await?.unwrap().timeout_secs, Some(1800));
+    let run = db.insert_run(sid, &serde_json::json!({}), None).await?;
+    let job = db
+        .claim_run(std::slice::from_ref(&rt))
+        .await?
+        .expect("claimed");
+    assert_eq!(job.run_id, run);
+    assert_eq!(
+        job.timeout_secs,
+        Some(1800),
+        "claim carries the script's limit"
+    );
+    // An upsert that omits it re-asserts the default (same rule as mem_limit_mb).
+    assert!(
+        db.update_script_meta(sid, &rt, None, None, true, None, None, false, None)
+            .await?
+    );
+    assert_eq!(db.get_script(sid).await?.unwrap().timeout_secs, None);
+    db.finish_run(run, "succeeded", Some(0), None).await?;
+    Ok(())
+}
+
+fn sched(id: i64, script_id: i64, agent: Option<&str>, idem: bool) -> dokan::db::Schedule {
+    dokan::db::Schedule {
+        id,
+        script_id,
+        script_name: "s".into(),
+        cron: "0 30 7 * * *".into(),
+        input: serde_json::json!({"k": 1}),
+        agent_id: agent.map(String::from),
+        input_blobs: None,
+        capture_output: false,
+        idempotency: idem,
+        timezone: Some("Europe/Zurich".into()),
+    }
+}
+
+#[tokio::test]
+async fn schedule_options_round_trip_and_idempotent_tick() -> anyhow::Result<()> {
+    let db = Db::connect(&db_url()).await?;
+    db.migrate().await?;
+    let tag = dokan::crypto::random_token();
+    let (sha, _) = db.put_blob(format!("sched-code-{tag}").as_bytes()).await?;
+    let (sid, _) = db
+        .insert_script(
+            "sched-opts",
+            "sched-none",
+            "true",
+            None,
+            None,
+            true,
+            None,
+            None,
+            false,
+            None,
+            None,
+        )
+        .await?;
+    let opts = dokan::db::ScheduleOpts {
+        agent_id: Some(format!("agent-{tag}")),
+        input_blobs: Some(serde_json::json!({ "code.tar.gz": sha })),
+        capture_output: true,
+        idempotency: true,
+        timezone: Some("Europe/Zurich".into()),
+    };
+    let id = db
+        .insert_schedule(
+            sid,
+            "0 30 7 * * *",
+            &serde_json::json!({"envoi": true}),
+            &opts,
+        )
+        .await?;
+    let s = db.get_schedule(id).await?.expect("stored");
+    assert_eq!(s.agent_id, opts.agent_id);
+    assert_eq!(s.input_blobs, opts.input_blobs);
+    assert!(s.capture_output && s.idempotency);
+    assert_eq!(s.timezone.as_deref(), Some("Europe/Zurich"));
+
+    // Two daemons ticking the same second enqueue ONE run carrying every option.
+    let a = dokan::cron::enqueue_tick(&db, &s, 1_900_000_000)
+        .await
+        .expect("first tick enqueues");
+    assert_eq!(
+        dokan::cron::enqueue_tick(&db, &s, 1_900_000_000).await,
+        None,
+        "same tick deduped"
+    );
+    let b = dokan::cron::enqueue_tick(&db, &s, 1_900_086_400)
+        .await
+        .expect("next tick enqueues");
+    assert_ne!(a, b);
+    let (_, input, blobs, agent, capture) = db.run_reproduce_inputs(a).await?.unwrap();
+    assert_eq!(input, serde_json::json!({"envoi": true}));
+    assert_eq!(blobs, opts.input_blobs);
+    assert_eq!(agent, opts.agent_id);
+    assert!(capture);
+
+    // A blob mounted by an ENABLED schedule survives the blob GC even with no run left.
+    sqlx::query("DELETE FROM runs WHERE id IN ($1, $2)")
+        .bind(a)
+        .bind(b)
+        .execute(&db.pool)
+        .await?;
+    sqlx::query("UPDATE blobs SET last_used_at = now() - interval '10 days' WHERE sha = $1")
+        .bind(&sha)
+        .execute(&db.pool)
+        .await?;
+    db.gc_blobs(1.0).await?;
+    assert!(db.blob_exists(&sha).await?, "schedule-mounted blob kept");
+    db.set_schedule_enabled(id, false).await?;
+    db.gc_blobs(1.0).await?;
+    assert!(
+        !db.blob_exists(&sha).await?,
+        "reclaimed once the schedule is disabled"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn schedule_tick_respects_agent_quota() -> anyhow::Result<()> {
+    // A schedule carrying an agent_id gets no more than run_script would: at the in-flight cap,
+    // the tick is refused and recorded as a never-started failed run with the reason.
+    let db = Db::connect(&db_url()).await?;
+    db.migrate().await?;
+    let agent = format!("quota-{}", dokan::crypto::random_token());
+    let (sid, _) = db
+        .insert_script(
+            "sched-quota",
+            "quota-none",
+            "true",
+            None,
+            None,
+            true,
+            None,
+            None,
+            false,
+            None,
+            None,
+        )
+        .await?;
+    let mut filler = vec![];
+    for _ in 0..dokan::quota::AGENT_MAX_CONCURRENT {
+        filler.push(
+            db.insert_run(sid, &serde_json::json!({}), Some(&agent))
+                .await?,
+        );
+    }
+    let s = sched(0, sid, Some(&agent), false);
+    assert_eq!(
+        dokan::cron::enqueue_tick(&db, &s, 1_900_000_000).await,
+        None,
+        "tick refused"
+    );
+    let refused: (String, Option<String>, Option<i32>) = sqlx::query_as(
+        "SELECT status, error, exit_code FROM runs WHERE agent_id = $1 AND error IS NOT NULL",
+    )
+    .bind(&agent)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(refused.0, "failed");
+    assert!(refused.1.unwrap().starts_with("quota_exceeded"));
+    assert_eq!(refused.2, None);
+
+    // Below the cap the same tick goes through.
+    db.finish_run(filler[0], "failed", None, Some("test cleanup"))
+        .await?;
+    assert!(
+        dokan::cron::enqueue_tick(&db, &s, 1_900_000_001)
+            .await
+            .is_some()
+    );
+    sqlx::query("UPDATE runs SET status = 'failed', finished_at = now() WHERE agent_id = $1 AND status = 'pending'")
+        .bind(&agent)
+        .execute(&db.pool)
+        .await?;
     Ok(())
 }

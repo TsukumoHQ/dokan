@@ -932,6 +932,7 @@ function fetchScripts(){
       chips.push(`<span class="chip ${s.network?'on':'off'}">${INET}network ${s.network?'on':'off'}</span>`);
       if(s.mem_limit_mb!=null) chips.push(`<span class="chip">mem ${s.mem_limit_mb} MiB</span>`);
       if(s.cpu_limit!=null) chips.push(`<span class="chip">cpu ${s.cpu_limit}</span>`);
+      if(s.timeout_secs!=null) chips.push(`<span class="chip">timeout ${s.timeout_secs} s</span>`);
       if(s.feed_prev_result) chips.push(`<span class="chip on">feed_prev_result</span>`);
       return `<div class=scard><div class=top><span class=nm>${esc(s.name)}</span>`
         +`<span class=rt>${esc(s.runtime)}</span><span class=id>#${s.id}</span></div>`
@@ -948,8 +949,8 @@ function fetchSchedules(){
     if(!list.length){ $('schedRows').innerHTML='<tr><td colspan=4><div class=empty><div class=big>No schedules</div><div>Cron a script over MCP to see it here.</div></div></td></tr>'; return; }
     $('schedRows').innerHTML=list.map(s=>
       `<tr><td><span class=sname>${esc(s.script_name||('script '+s.script_id))}</span></td>`
-      +`<td class=run style="color:var(--accent)">${esc(s.cron)}</td>`
-      +`<td class=when>${esc(cronHint(s.cron))}</td>`
+      +`<td class=run style="color:var(--accent)">${esc(s.cron)}${s.timezone?' <span class=when>'+esc(s.timezone)+'</span>':''}</td>`
+      +`<td class=when title="${esc(s.next_fire||'')}">${esc(s.next_fire?new Date(s.next_fire).toLocaleString():cronHint(s.cron))}</td>`
       +`<td class="exit tnum">#${s.script_id}</td></tr>`).join('');
   }).catch(()=>{});
 }
@@ -1268,28 +1269,36 @@ async fn list_secrets(State(s): State<AppState>) -> impl IntoResponse {
 
 async fn list_schedules(State(s): State<AppState>) -> impl IntoResponse {
     let rows = s.db.list_schedules().await.unwrap_or_default();
+    let now = chrono::Utc::now();
     let items: Vec<_> = rows
         .iter()
-        .map(|sc| json!({
-            "schedule_id": sc.id, "script_id": sc.script_id,
-            "script_name": sc.script_name, "cron": sc.cron,
-        }))
+        .map(|sc| {
+            json!({
+                "schedule_id": sc.id, "script_id": sc.script_id,
+                "script_name": sc.script_name, "cron": sc.cron,
+                "timezone": sc.timezone, "agent_id": sc.agent_id,
+                "next_fire": crate::cron::schedule_next_fire(sc, now).map(|t| t.to_rfc3339()),
+            })
+        })
         .collect();
     Json(json!({"schedules": items}))
 }
 
 /// Script catalog with runtime-policy flags — drives the Scripts panel's flag chips
-/// (network on/off, mem/cpu overrides, feed_prev_result). Bodiless.
+/// (network on/off, mem/cpu/timeout overrides, feed_prev_result). Bodiless.
 async fn list_scripts(State(s): State<AppState>, Query(q): Query<ListQ>) -> impl IntoResponse {
     let limit = q.limit.unwrap_or(200).clamp(1, 500);
     let (rows, _total) = s.db.list_scripts_full(limit).await.unwrap_or_default();
     let scripts: Vec<_> = rows
         .iter()
-        .map(|sc| json!({
-            "id": sc.id, "name": sc.name, "runtime": sc.runtime, "desc": sc.description,
-            "network": sc.network, "mem_limit_mb": sc.mem_limit_mb,
-            "cpu_limit": sc.cpu_limit, "feed_prev_result": sc.feed_prev_result,
-        }))
+        .map(|sc| {
+            json!({
+                "id": sc.id, "name": sc.name, "runtime": sc.runtime, "desc": sc.description,
+                "network": sc.network, "mem_limit_mb": sc.mem_limit_mb,
+                "cpu_limit": sc.cpu_limit, "feed_prev_result": sc.feed_prev_result,
+                "timeout_secs": sc.timeout_secs,
+            })
+        })
         .collect();
     Json(json!({"scripts": scripts}))
 }

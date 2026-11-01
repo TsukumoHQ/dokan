@@ -278,3 +278,28 @@ ALTER TABLE runs ADD COLUMN IF NOT EXISTS output_blobs JSONB;  -- { "<relative-n
 -- back-compat (all of the agent's + global secrets, today's behavior). When set, only these names
 -- are injected (env + the tmpfs /run/secrets files). Additive; pairs with the tmpfs delivery.
 ALTER TABLE scripts ADD COLUMN IF NOT EXISTS secrets_allowlist TEXT[];
+
+-- Long jobs (v0.5.0): per-script wall-clock limit. NULL = the executor default (300 s, unchanged
+-- behavior). Bounded by the daemon's --max-timeout-secs (DOKAN_MAX_TIMEOUT_SECS, default 3600) at
+-- upload time and again at exec time.
+ALTER TABLE scripts ADD COLUMN IF NOT EXISTS timeout_secs BIGINT;
+-- Run lease heartbeat (v0.5.0): the executor bumps heartbeat_at while a job runs, and the orphan
+-- reaper reclaims a `running` row only when COALESCE(heartbeat_at, started_at) is older than the
+-- lease. A long job that is still alive is therefore never handed to a second worker; a dead
+-- worker stops beating and its run is reclaimed as before. NULL (older executors) = started_at.
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMPTZ;
+
+-- Scheduled runs carry the same options as run_script (v0.5.0). All nullable / default-off, so an
+-- existing schedule keeps its behavior: no agent, no files, no /output, no tick key, UTC.
+--   agent_id       — provenance + the agent's scoped secrets + its quota, checked at EVERY tick.
+--   input_blobs    — { "<dest-name>": "<sha>" } materialized read-only at /input on each tick.
+--   capture_output — mount a writable /output and capture its files on each tick.
+--   idempotency    — each tick enqueues with the key schedule:<id>:<tick epoch>, so co-located
+--                    daemons that share this database enqueue one run per tick, not one each.
+--   timezone       — IANA zone name (e.g. Europe/Zurich); the cron fields are wall-clock time in
+--                    that zone, DST-aware. NULL = UTC (the historical behavior).
+ALTER TABLE schedules ADD COLUMN IF NOT EXISTS agent_id       TEXT;
+ALTER TABLE schedules ADD COLUMN IF NOT EXISTS input_blobs    JSONB;
+ALTER TABLE schedules ADD COLUMN IF NOT EXISTS capture_output BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE schedules ADD COLUMN IF NOT EXISTS idempotency    BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE schedules ADD COLUMN IF NOT EXISTS timezone       TEXT;
