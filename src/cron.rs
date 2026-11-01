@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Timelike, Utc};
 use chrono_tz::Tz;
 use tokio_cron_scheduler::{Job, JobScheduler};
 use uuid::Uuid;
@@ -59,6 +59,8 @@ pub fn next_fire(
     tz: Option<Tz>,
     after: DateTime<Utc>,
 ) -> Option<DateTime<Utc>> {
+    // croner keeps the sub-second part of `after`; cron fields are whole seconds.
+    let after = after.with_nanosecond(0).unwrap_or(after);
     match tz {
         Some(tz) => cron
             .find_next_occurrence(&after.with_timezone(&tz), false)
@@ -306,6 +308,17 @@ mod tests {
 
     fn zurich() -> Option<Tz> {
         Some(parse_timezone("Europe/Zurich").unwrap())
+    }
+
+    #[test]
+    fn next_fire_is_on_a_whole_second() {
+        let c = parse_cron("0 30 7 * * *").unwrap();
+        let after = utc(2026, 1, 10, 0, 0) + chrono::Duration::milliseconds(498);
+        assert_eq!(next_fire(&c, None, after), Some(utc(2026, 1, 10, 7, 30)));
+        assert_eq!(
+            next_fire(&c, zurich(), after),
+            Some(utc(2026, 1, 10, 6, 30))
+        );
     }
 
     #[test]
