@@ -9,7 +9,7 @@ services:
       POSTGRES_PASSWORD: dokan
       POSTGRES_DB: dokan
     ports:
-      - "5499:5432"
+      - "127.0.0.1:5499:5432"
     volumes:
       - dokan_pg:/var/lib/postgresql/data
     healthcheck:
